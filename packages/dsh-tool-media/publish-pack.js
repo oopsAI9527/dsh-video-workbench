@@ -7,6 +7,7 @@ import {
   resolveBinaries,
   runCommandRedirected,
 } from '../shared/index.js'
+import { recordPackCover, resolvePackCover, writePackCoverPng } from './cover-studio.js'
 
 function sanitizeSlug(raw) {
   return String(raw || 'dsh-video')
@@ -19,7 +20,8 @@ function sanitizeSlug(raw) {
 /**
  * Generate a complete platform-ready Publishing Package (`publish/<platform>-pack/`):
  * - Final MP4 copy
- * - Extracted crisp `cover.png`
+ * - `cover.png`: the cover chosen in the Studio (发布包导出 → 封面: auto / a picked frame / an AI cover / with title);
+ *   default = the best automatic frame of the film (no black, fade, transition or blurry frame — cover-studio.js)
  * - `snapshot-3x3.png` verification contact sheet (if present)
  * - `qa_report.json` (if present)
  * - `meta.md` with platform-ready titles, captions, hashtags, & AI legal compliance declaration
@@ -49,16 +51,51 @@ export async function exportPublishPack({
   const packMp4 = join(packDir, `${slug}.mp4`)
   copyFileSync(finalMp4, packMp4)
 
-  // Extract cover image cleanly around ~18% into the video so intro settle has finished
+  // Cover: the choice from 发布包导出 → 封面 (cover-studio.js; default = the best automatic frame). A custom mp4Path, or
+  // a failure there, falls back to one frame at ~18 % of the film (the old behaviour).
   const coverPng = join(packDir, 'cover.png')
   const durSec = Math.max(1.5, Number(script?.totalDurationSec) || 6)
-  const coverAt = Math.min(durSec * 0.4, Math.max(0.6, durSec * 0.18))
-  const { ffmpeg } = resolveBinaries()
-  await runCommandRedirected(
-    ffmpeg,
-    ['-y', '-ss', coverAt.toFixed(2), '-i', finalMp4, '-frames:v', '1', '-q:v', '2', coverPng],
-    { timeoutMs: 20_000 },
-  ).catch(() => {})
+  let cover = null
+  if (resolve(finalMp4) === resolve(join(absDir, 'output', 'final.mp4'))) {
+    try {
+      const chosen = await resolvePackCover(absDir)
+      await writePackCoverPng(chosen.abs, coverPng)
+      cover = {
+        mode: chosen.mode,
+        source: chosen.rel,
+        timeSec: Number.isFinite(chosen.timeSec) ? chosen.timeSec : null,
+        aspect: chosen.aspect || '',
+        refreshed: Boolean(chosen.refreshed),
+        fallbackFrom: chosen.fallbackFrom || '',
+      }
+      try {
+        recordPackCover(absDir, targetPlatform, { ...chosen, packFile: coverPng })
+      } catch {}
+    } catch (err) {
+      cover = { mode: 'legacy', error: String(err?.message || err).slice(0, 300) }
+    }
+  }
+  if (!cover || cover.mode === 'legacy') {
+    const coverAt = Math.min(durSec * 0.4, Math.max(0.6, durSec * 0.18))
+    const { ffmpeg } = resolveBinaries()
+    await runCommandRedirected(
+      ffmpeg,
+      ['-y', '-ss', coverAt.toFixed(2), '-i', finalMp4, '-frames:v', '1', '-q:v', '2', coverPng],
+      { timeoutMs: 20_000 },
+    ).catch(() => {})
+    cover = { ...(cover || {}), mode: 'legacy', timeSec: Number(coverAt.toFixed(2)) }
+  }
+  const secText = (t) => (Number.isFinite(t) ? `（第 ${t.toFixed(2)} 秒）` : '')
+  const coverWhat =
+    cover.mode === 'frame'
+      ? `选用的视频画面${secText(cover.timeSec)}`
+      : cover.mode === 'ai'
+        ? `AI 生成封面${cover.aspect ? `（${cover.aspect}）` : ''}`
+        : cover.mode === 'title'
+          ? '加了标题的封面'
+          : cover.mode === 'auto'
+            ? `自动挑选的最佳画面${secText(cover.timeSec)}`
+            : '高清建议封面图'
 
   const snapSrc = existsSync(join(absDir, 'output', 'snapshot-3x3.png'))
     ? join(absDir, 'output', 'snapshot-3x3.png')
@@ -127,7 +164,7 @@ export async function exportPublishPack({
     ``,
     `## 4. 包含文件清单`,
     `- \`${slug}.mp4\` (${(statSync(packMp4).size / 1048576).toFixed(2)} MB)`,
-    existsSync(coverPng) ? `- \`cover.png\` (高清建议封面图)` : '',
+    existsSync(coverPng) ? `- \`cover.png\` (${coverWhat})` : '',
     packSnap ? `- \`snapshot-3x3.png\` (3×3 分镜抽帧验收墙)` : '',
     existsSync(qaSrc) ? `- \`qa_report.json\` (成片自动化质检报告)` : '',
     ``,
@@ -155,6 +192,7 @@ export async function exportPublishPack({
       `${titleBase} · 帧级动态视觉实测`,
     ],
     hashtags,
+    cover: existsSync(coverPng) ? cover : null,
     complianceNotice: notice.endNoticeBody,
     metaMarkdown: metaMd,
   }

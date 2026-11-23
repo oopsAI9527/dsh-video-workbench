@@ -12,9 +12,11 @@ import {
   writeFileSync,
   writeSync,
 } from 'node:fs'
-import { dirname, extname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import {
   createAbortError,
+  ffmpegAmixNoRescale,
+  ffmpegPadTo,
   loadEnv,
   probeAudioDuration,
   readScriptJson,
@@ -26,6 +28,7 @@ import {
   writeScriptJson,
 } from '../shared/index.js'
 import { cloneRecordedVoice, executeGenerateSpeech } from '../dsh-tool-local-tts/index.js'
+import { IMAGE_EXT_RX, LipsyncUnavailableError, resolveLipsyncConfig, runLipsync } from './lipsync-engine.js'
 
 export const AVATAR_TEMPLATES = [
   {
@@ -129,7 +132,7 @@ export async function probeVideoStream(filePath, signal) {
     ffprobe,
     [
       '-v', 'error',
-      '-show_entries', 'format=duration:stream=codec_name,codec_type,width,height,pix_fmt',
+      '-show_entries', 'format=duration:stream=codec_name,codec_type,width,height,pix_fmt:stream_tags=alpha_mode',
       '-of', 'json',
       filePath,
     ],
@@ -142,13 +145,15 @@ export async function probeVideoStream(filePath, signal) {
   const v = (parsed.streams || []).find((s) => s.codec_type === 'video') || {}
   const a = (parsed.streams || []).find((s) => s.codec_type === 'audio')
   const pixFmt = String(v.pix_fmt || '')
+  // VP8/VP9 WebM keeps alpha in a side channel: ffprobe's native decoder reports yuv420p plus `alpha_mode=1`
+  const alphaTag = String(v.tags?.alpha_mode ?? v.tags?.ALPHA_MODE ?? '').trim() === '1'
   return {
     durationSec: Number(Number(parsed?.format?.duration || 0).toFixed(3)),
     width: Number(v.width || 0),
     height: Number(v.height || 0),
     codec: String(v.codec_name || ''),
-    pixFmt,
-    hasAlpha: pixFmt.includes('yuva') || pixFmt.includes('rgba') || pixFmt.includes('argb'),
+    pixFmt: alphaTag && pixFmt === 'yuv420p' ? 'yuva420p' : pixFmt,
+    hasAlpha: alphaTag || pixFmt.includes('yuva') || pixFmt.includes('rgba') || pixFmt.includes('argb'),
     hasAudio: Boolean(a),
   }
 }
@@ -275,7 +280,7 @@ async function invokeRemoteAvatarEndpoint({
     }
     const data = await resp.json()
     if (data.videoBase64) {
-      const clean = String(data.videoBase64).replace(/^data:[^;]+;base64,/, '')
+      const clean = String(data.videoBase64).replace(/^data:.*?;base64,/, '')
       mkdirSync(dirname(outRawPath), { recursive: true })
       writeFileSync(outRawPath, Buffer.from(clean, 'base64'))
       return { ok: true, rawPath: outRawPath, providerUsed: data.provider || provider }
@@ -594,6 +599,28 @@ async function renderAiPresenterToAlphaWebm({
  * Convert a human video or portrait image (plus optional chromakey color) into a clean
  * yuva420p transparent WebM presenter overlay synchronized to exact target audio duration.
  */
+/**
+ * Face-aware PiP framing: scale the source to cover the overlay box, zoom gently when the face is small and
+ * place the lip-sync face box (normalised cx/cy/w from the engine) slightly above the box centre.
+ * Returns an ffmpeg `scale,crop` chain or '' when it cannot be computed.
+ */
+export function computeFaceFraming({ srcW, srcH, width, height, focus, targetFaceFrac = 0.36, maxZoom = 1.8 }) {
+  if (!focus || !(srcW > 0) || !(srcH > 0)) return ''
+  const cx = Number(focus.cx)
+  const cy = Number(focus.cy)
+  const fw = Number(focus.w)
+  if (![cx, cy, fw].every((v) => Number.isFinite(v) && v > 0 && v < 1.5)) return ''
+  const cover = Math.max(width / srcW, height / srcH)
+  const faceFrac = (fw * srcW * cover) / width
+  const zoom = Math.max(1, Math.min(maxZoom, targetFaceFrac / Math.max(0.05, faceFrac)))
+  const s = cover * zoom
+  const sw = Math.max(width, Math.round((srcW * s) / 2) * 2)
+  const sh = Math.max(height, Math.round((srcH * s) / 2) * 2)
+  const x = Math.round(Math.min(Math.max(cx * sw - width / 2, 0), sw - width))
+  const y = Math.round(Math.min(Math.max(cy * sh - height * 0.52, 0), sh - height))
+  return `scale=${sw}:${sh},crop=${width}:${height}:${x}:${y}`
+}
+
 async function compositeClonedHumanToAlphaWebm({
   sourcePath,
   durationSec,
@@ -601,6 +628,7 @@ async function compositeClonedHumanToAlphaWebm({
   width = 480,
   height = 540,
   chromaKeyColor = '',
+  focus = null,
   outWebmPath,
   signal,
 }) {
@@ -611,9 +639,14 @@ async function compositeClonedHumanToAlphaWebm({
   mkdirSync(dirname(outWebmPath), { recursive: true })
   await buildSquircleAlphaMaskPng(ffmpeg, width, height, maskPng, signal)
 
+  let framing = ''
+  if (focus && !isImage) {
+    const meta = await probeVideoStream(sourcePath, signal).catch(() => null)
+    framing = computeFaceFraming({ srcW: meta?.width, srcH: meta?.height, width, height, focus })
+  }
   const baseFilter = isImage
     ? `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},zoompan=z='1+0.04*sin(on*0.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=${fps}`
-    : `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},eq=contrast=1.06:saturation=1.08`
+    : `${framing || `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`},eq=contrast=1.06:saturation=1.08`
 
   const inputs = isImage
     ? ['-loop', '1', '-t', String(durationSec), '-i', sourcePath]
@@ -651,9 +684,71 @@ async function compositeClonedHumanToAlphaWebm({
 }
 
 /**
+ * Normalise the `lipSync` option: 'auto' (default: use the configured engine, fall back quietly),
+ * 'on' (strict: fail instead of falling back) or 'off'.
+ */
+export function normalizeLipSyncMode(raw) {
+  if (raw === true) return 'on'
+  if (raw === false) return 'off'
+  const txt = String(raw ?? 'auto').trim().toLowerCase()
+  if (['on', 'true', '1', 'yes', 'strict', 'required', '开启', '强制'].includes(txt)) return 'on'
+  if (['off', 'false', '0', 'no', 'none', 'disabled', '关闭'].includes(txt)) return 'off'
+  return 'auto'
+}
+
+/**
+ * Build a dry narration track that sits exactly where `mixVideoAudio()` places each scene voice inside
+ * `master-audio.wav` (scene.startSec + voiceLeadSec), padded to the whole timeline. Lip-syncing against this
+ * track keeps the mouth in sync with the final render, because the avatar overlay plays from frame 0.
+ */
+export async function buildTimelineAlignedVoiceWav({ absDir, script, outWav, signal }) {
+  const events = []
+  for (const scene of script?.scenes || []) {
+    const masteredAbs = scene.masteredAudioFile
+      ? isAbsolute(scene.masteredAudioFile) ? scene.masteredAudioFile : resolve(absDir, scene.masteredAudioFile)
+      : ''
+    const rel = masteredAbs && existsSync(masteredAbs) ? scene.masteredAudioFile : scene.audioFile
+    if (!rel) continue
+    const abs = isAbsolute(rel) ? rel : resolve(absDir, rel)
+    if (!existsSync(abs)) continue
+    const leadSec = Number.isFinite(Number(scene.voiceLeadSec)) ? Number(scene.voiceLeadSec) : 0.3
+    events.push({ path: abs, delayMs: Math.max(0, Math.round((Number(scene.startSec || 0) + leadSec) * 1000)) })
+  }
+  if (events.length === 0) return null
+  let endSec = Number(script?.totalDurationSec) || 0
+  for (const ev of events) {
+    const meta = await probeAudioDuration(ev.path).catch(() => ({ durationSec: 0 }))
+    ev.durationSec = Number(meta.durationSec) || 0
+    endSec = Math.max(endSec, ev.delayMs / 1000 + ev.durationSec)
+  }
+  const { ffmpeg } = resolveBinaries()
+  mkdirSync(dirname(outWav), { recursive: true })
+  const inputs = events.flatMap((ev) => ['-i', ev.path])
+  // Mono 24 kHz chains, each padded to the full length (keeps amix's scale constant on builds without `normalize=0`).
+  // Older FFmpeg (the npm-bundled fallback) has neither `adelay all` nor `apad whole_dur`: for mono, one delay value is the
+  // same as `all=1`, and whole_len (samples) is the same as whole_dur.
+  const pad = ffmpegPadTo(endSec, 24000)
+  const chains = events.map(
+    (ev, i) => `[${i}:a]aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono,adelay=${ev.delayMs},${pad}[v${i}]`,
+  )
+  const mixIn = events.map((_, i) => `[v${i}]`).join('')
+  const filter = `${chains.join(';')};${mixIn}${ffmpegAmixNoRescale(ffmpeg, events.length, { duration: 'longest', dropoutTransition: 0 })},${pad},atrim=0:${endSec.toFixed(3)}[out]`
+  const res = await runCommandRedirected(
+    ffmpeg,
+    ['-y', ...inputs, '-filter_complex', filter, '-map', '[out]', '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le', outWav],
+    { timeoutMs: 120_000, signal },
+  )
+  if (res.code !== 0 || !existsSync(outWav)) {
+    throw new Error(`时间线对齐口播音轨生成失败: ${res.stderr.slice(-300)}`)
+  }
+  return { path: outWav, durationSec: Number(endSec.toFixed(3)), events: events.map((e) => ({ ...e, path: relative(absDir, e.path).replace(/\\/g, '/') })) }
+}
+
+/**
  * Main entrypoint (`generate_avatar` Cordis tool & API handler):
- * Generates either a Cloned Human Digital Presenter or Pure AI Digital Presenter
- * as a transparent `yuva420p` `.webm` clip and writes `avatarClip` & `avatarLayout` into `script.json`.
+ * Generates either a Cloned Human Digital Presenter (real lip-sync via the pluggable engine layer when available)
+ * or a Pure AI Digital Presenter as a transparent `yuva420p` `.webm` clip and writes `avatarClip` & `avatarLayout`
+ * into `script.json`.
  */
 export async function executeGenerateAvatar(options = {}) {
   loadEnv()
@@ -672,9 +767,10 @@ export async function executeGenerateAvatar(options = {}) {
     presetId = 'cyber-anchor',
     chromaKeyColor = '',
     fps = 30,
-    width = 480,
-    height = 540,
     allowPlaceholder = false,
+    lipSync = 'auto', // 'auto' | 'on' | 'off'
+    lipsyncEngine = '', // override AVATAR_LIPSYNC_ENGINE for this call
+    alignToTimeline = 'auto', // 'auto' | true | false
     signal,
     onProgress,
   } = options
@@ -684,8 +780,12 @@ export async function executeGenerateAvatar(options = {}) {
 
   const absDir = resolve(projectDir)
   const layout = resolveSafeAvatarLayout(avatarLayout)
+  // Fullscreen talking heads need more pixels than the 480x540 PiP card (same 8:9 aspect)
+  const width = Number(options.width) > 0 ? Number(options.width) : layout === 'fullscreen' ? 960 : 480
+  const height = Number(options.height) > 0 ? Number(options.height) : layout === 'fullscreen' ? 1080 : 540
   const cfg = getAvatarProviderSummary()
   const scriptObj = existsSync(join(absDir, 'script.json')) ? readScriptJson(absDir).data : null
+  const lipSyncMode = normalizeLipSyncMode(lipSync)
 
   onProgress?.({ stage: 'avatar-prep', progress: 10, message: '1/4 正在准备数字人驱动音轨与声纹...' })
 
@@ -706,6 +806,38 @@ export async function executeGenerateAvatar(options = {}) {
   let drivingWav = audioPath
     ? (isAbsolute(audioPath) ? audioPath : resolve(absDir, audioPath))
     : ''
+
+  // Timeline alignment: a project-wide overlay plays from frame 0, so drive the mouth with the narration exactly
+  // where master-audio.wav places it (also replaces the pipeline's gap-less concatenated dry vocal).
+  let alignedInfo = null
+  const sceneAudioAbs = (scriptObj?.scenes || [])
+    .flatMap((s) => [s.masteredAudioFile, s.audioFile])
+    .filter(Boolean)
+    .map((p) => resolve(isAbsolute(p) ? p : resolve(absDir, p)).toLowerCase())
+  const replaceableDrivers = new Set([
+    ...sceneAudioAbs,
+    resolve(absDir, 'output', 'avatar', 'driving-vocal.wav').toLowerCase(),
+    resolve(absDir, 'output', 'master-audio.wav').toLowerCase(),
+  ])
+  const alignWanted =
+    alignToTimeline === true ||
+    String(alignToTimeline).toLowerCase() === 'true' ||
+    (String(alignToTimeline).toLowerCase() === 'auto' && (!drivingWav || replaceableDrivers.has(resolve(drivingWav).toLowerCase())))
+  if (!sceneId && scriptObj && sceneAudioAbs.length > 0 && alignWanted && String(alignToTimeline).toLowerCase() !== 'false') {
+    try {
+      alignedInfo = await buildTimelineAlignedVoiceWav({
+        absDir,
+        script: scriptObj,
+        outWav: join(absDir, 'output', 'avatar', 'driving-timeline.wav'),
+        signal,
+      })
+      if (alignedInfo?.path) drivingWav = alignedInfo.path
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err
+      alignedInfo = null
+    }
+  }
+
   if (!drivingWav || !existsSync(drivingWav)) {
     const combinedNarration =
       String(narrationText || '').trim() ||
@@ -746,7 +878,7 @@ export async function executeGenerateAvatar(options = {}) {
   let providerUsed = 'local-ffmpeg-composite'
   let usedRemoteFile = ''
 
-  // Step 2: Optional external MuseTalk / LatentSync / HTTP endpoint invocation
+  // Step 2a: Optional legacy external HTTP avatar endpoint (avatar-config.json / AVATAR_ENDPOINT)
   if (cfg.endpoint && cfg.provider !== 'local-composite') {
     onProgress?.({ stage: 'avatar-infer', progress: 38, message: `2/4 正在调用数字人接口 (${cfg.provider}) 对口型...` })
     try {
@@ -778,6 +910,77 @@ export async function executeGenerateAvatar(options = {}) {
 
   if (signal?.aborted) throw createAbortError()
 
+  // Step 2b: Pluggable lip-sync engine (local MuseTalk / LatentSync / CLI / fal.ai) for cloned-human mode
+  const lipInfo = {
+    requested: lipSyncMode,
+    engine: '',
+    ok: false,
+    fallbackReason: '',
+    alignedToTimeline: Boolean(alignedInfo),
+    drivingAudio: relative(absDir, drivingWav).replace(/\\/g, '/'),
+  }
+  let lipSyncedPath = ''
+  let lipFocus = null
+  if (avatarMode === 'cloned-human' && rawBase && existsSync(rawBase) && !usedRemoteFile) {
+    if (lipSyncMode === 'off') {
+      lipInfo.fallbackReason = '已按请求关闭唇形同步 (lipSync=off)'
+    } else {
+      const lipCfg = resolveLipsyncConfig(lipsyncEngine ? { engine: lipsyncEngine } : {})
+      lipInfo.engine = lipCfg.engine
+      const lipOutRel = `output/avatar/${sceneId ? `${sceneId}-` : ''}avatar-lipsync.mp4`
+      const lipOutAbs = join(absDir, lipOutRel)
+      onProgress?.({ stage: 'avatar-lipsync', progress: 30, message: `2/4 正在启动唇形同步引擎 (${lipCfg.engine})...` })
+      try {
+        const res = await runLipsync({
+          sourcePath: rawBase,
+          audioPath: drivingWav,
+          outputPath: lipOutAbs,
+          engine: lipsyncEngine,
+          isImage: IMAGE_EXT_RX.test(rawBase),
+          signal,
+          logFile: join(absDir, 'output', 'avatar', 'lipsync-last.log'),
+          onProgress: (p) =>
+            onProgress?.({
+              stage: 'avatar-lipsync',
+              progress: Math.max(30, Math.min(70, 30 + Math.round((Number(p.pct) || 0) * 0.4))),
+              message: `2/4 唇形同步：${p.message || ''}`,
+            }),
+        })
+        lipSyncedPath = res.outputPath
+        lipFocus = res.metrics?.faceBox || null
+        providerUsed = `lipsync-${res.engine}`
+        Object.assign(lipInfo, {
+          ok: true,
+          engine: res.engine,
+          videoPath: lipOutRel,
+          wallSec: res.wallSec,
+          audioSec: res.audioSec,
+          outputDurationSec: res.outputDurationSec,
+          durationDeltaMs: res.durationDeltaMs,
+          inputKind: res.inputKind,
+          rtf: res.metrics?.rtf ?? (res.audioSec ? Number((res.wallSec / res.audioSec).toFixed(3)) : null),
+          fps: res.metrics?.fps ?? null,
+          frames: res.metrics?.frames ?? null,
+          faceFrames: res.metrics?.faceFrames ?? null,
+          sourceFrames: res.metrics?.sourceFrames ?? null,
+          peakVramAllocatedMb: res.metrics?.peakVramAllocatedMb ?? null,
+          timings: res.metrics?.timings || null,
+          stoppedTtsForVram: Boolean(res.vram?.stoppedTts),
+        })
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err
+        const reason = err instanceof LipsyncUnavailableError ? err.message : `引擎运行失败：${String(err?.message || err).slice(0, 300)}`
+        if (lipSyncMode === 'on') {
+          throw new Error(`唇形同步失败（lipSync=on 不回退）：${reason}`)
+        }
+        lipInfo.fallbackReason = reason
+        onProgress?.({ stage: 'avatar-fallback', progress: 60, message: `唇形同步不可用，回退为无口型合成：${reason.slice(0, 120)}` })
+      }
+    }
+  }
+
+  if (signal?.aborted) throw createAbortError()
+
   // Step 3: Encode verified yuva420p transparent WebM
   const targetFps = Number(scriptObj?.fps || fps || 30)
   if (usedRemoteFile) {
@@ -794,18 +997,23 @@ export async function executeGenerateAvatar(options = {}) {
     })
     try { unlinkSync(usedRemoteFile) } catch {}
   } else if (avatarMode === 'cloned-human' && rawBase && existsSync(rawBase)) {
-    onProgress?.({ stage: 'avatar-alpha', progress: 64, message: '3/4 正在合成克隆真人数字人 yuva420p 透明通道贴片...' })
+    onProgress?.({
+      stage: 'avatar-alpha',
+      progress: 74,
+      message: lipSyncedPath ? '3/4 正在把口型同步结果合成为 yuva420p 透明通道叠层...' : '3/4 正在合成克隆真人数字人 yuva420p 透明通道贴片...',
+    })
     await compositeClonedHumanToAlphaWebm({
-      sourcePath: rawBase,
+      sourcePath: lipSyncedPath || rawBase,
       durationSec,
       fps: targetFps,
       width,
       height,
       chromaKeyColor,
+      focus: lipFocus,
       outWebmPath: outAbs,
       signal,
     })
-    providerUsed = 'local-cloned-human-compositor'
+    if (!lipSyncedPath) providerUsed = 'local-cloned-human-compositor'
   } else {
     onProgress?.({ stage: 'avatar-alpha', progress: 55, message: '3/4 正在渲染 AI 数字人（口型波形锁定 + yuva420p 透明通道）...' })
     const rmsEnv = await extractAudioRmsEnvelope(drivingWav, targetFps, durationSec, signal)
@@ -825,12 +1033,15 @@ export async function executeGenerateAvatar(options = {}) {
   onProgress?.({ stage: 'avatar-verify', progress: 95, message: '4/4 正在核验透明通道规格并写入 script.json...' })
   const streamMeta = await probeVideoStream(outAbs, signal)
 
-  const isNeuralLipSync = Boolean(usedRemoteFile)
-  const visualNotice = isNeuralLipSync
+  const isNeuralLipSync = Boolean(usedRemoteFile) || Boolean(lipSyncedPath)
+  const engineLabel = lipInfo.engine && lipInfo.engine.startsWith('cloud-') ? `云端 ${lipInfo.engine.slice(6)}` : lipInfo.engine === 'musetalk' ? '本地 MuseTalk 1.5' : lipInfo.engine
+  const visualNotice = usedRemoteFile
     ? `已通过外部数字人接口 (${providerUsed}) 生成真人口型同步叠层`
-    : avatarMode === 'cloned-human'
-      ? '当前未配置外部 MuseTalk / LatentSync 接口，已自动采用本地画中画轮廓与克隆声音同步叠层'
-      : '已通过本地 AI 声波驱动虚拟播报人像生成透明通道叠层'
+    : lipSyncedPath
+      ? `已通过 ${engineLabel} 生成真人口型同步叠层（${durationSec.toFixed(1)}s 口播，耗时 ${lipInfo.wallSec}s${lipInfo.alignedToTimeline ? '，已对齐成片时间线' : ''}）`
+      : avatarMode === 'cloned-human'
+        ? `未生成口型同步（${lipInfo.fallbackReason || '未配置唇形引擎'}），已回退为克隆真人画中画叠层 + 克隆声音`
+        : '已通过本地 AI 声波驱动虚拟播报人像生成透明通道叠层'
 
   const clipMeta = {
     path: outRel,
@@ -847,6 +1058,7 @@ export async function executeGenerateAvatar(options = {}) {
     visualNotice,
     providerUsed,
     sourceBasePath: rawBase || '',
+    lipSync: avatarMode === 'cloned-human' ? lipInfo : undefined,
     updatedAt: new Date().toISOString(),
   }
 
@@ -872,6 +1084,7 @@ export async function executeGenerateAvatar(options = {}) {
     avatarClip: clipMeta,
     avatarLayout: layout,
     isNeuralLipSync,
+    lipSync: clipMeta.lipSync || null,
     visualNotice,
     streamMeta,
   }

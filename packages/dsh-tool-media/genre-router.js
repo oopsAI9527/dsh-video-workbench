@@ -6,6 +6,34 @@
  * always free to invent new visuals (genre `other` / custom) — profiles are guidance, never a cage.
  */
 
+// Historical content cues. Only multi-character words count: single characters such as 汉 / 明 / 宋 / 楚 / 唐 / 秦 also
+// appear in 汉堡, 说明, 宋体, 清楚, 唐老鸭, 秦岭… and used to route coffee-shop or product videos into battle-epic rules.
+const HISTORY_STRONG_CUES =
+  '历史|古代|古时候|古人|朝代|王朝|皇朝|帝国|战国|春秋|先秦|秦朝|秦国|秦军|秦始皇|始皇帝|大秦|汉朝|汉代|西汉|东汉|大汉|汉武帝|汉军|汉王|楚汉|楚国|楚军|楚王|西楚|霸王|项羽|刘邦|韩信|三国|魏蜀吴|蜀汉|曹操|诸葛亮|唐朝|唐代|大唐|盛唐|李世民|宋朝|宋代|北宋|南宋|元朝|明朝|明代|大明|清朝|清代|大清|晚清|隋朝|晋朝|五代十国|商周|夏商|古装|古风|武侠|演义|战役|冠军侯|霍去病|卫青|封狼居胥|文物|考古|甲骨文|青铜器|丝绸之路|古罗马|罗马帝国|古希腊|中世纪|十字军|维京|法老|拿破仑|二战|一战|抗战|史诗战争|historical|ancient|dynasty|medieval|roman empire|pharaoh|viking|samurai'
+const HISTORY_WEAK_CUES = '将军|帝王|皇帝|君王|诸侯|宰相|丞相|宫廷|江湖|侠客|兵法|骑士|城池|攻城|铁骑|emperor|knight|warlord'
+const HISTORY_STRONG_RX = new RegExp(HISTORY_STRONG_CUES, 'i')
+const HISTORY_WEAK_RX_G = new RegExp(HISTORY_WEAK_CUES, 'gi')
+
+/**
+ * True when the text is clearly about history / ancient times: one strong cue (a dynasty, a historical figure,
+ * 历史 / 古代 / 古装…) or two weak ones (将军 + 攻城…). Fairy-tale words alone (皇帝, 公主) do not qualify.
+ */
+export function isHistoricalContent(text = '') {
+  const s = String(text || '')
+  if (!s) return false
+  if (HISTORY_STRONG_RX.test(s)) return true
+  const weak = s.match(HISTORY_WEAK_RX_G)
+  return Boolean(weak && new Set(weak).size >= 2)
+}
+
+/** Epic battle treatment (war drums, steel clashes, slash wipes) only for history films and history-themed MVs. */
+export function isEpicCombatContext({ genre = '', text = '' } = {}) {
+  const g = String(genre || '').toLowerCase()
+  if (g === 'history-theater') return true
+  if (g === 'mv-lyric') return isHistoricalContent(text)
+  return false
+}
+
 export const GENRE_PROFILES = [
   {
     id: 'code-animation',
@@ -31,8 +59,8 @@ export const GENRE_PROFILES = [
     id: 'stickman-story',
     label: '火柴人 / 角色故事动画',
     detect: /火柴人|简笔画|角色|卡通|漫画|小人|故事动画|剧情|搞笑|段子|寓言|童话/i,
-    visualLanguage: '干净的手绘/简笔画风：用 SVG 或 Canvas 绘制火柴人骨骼（关节层级 + 弹簧/IK 关键帧），场景用简笔背景、拟声字、对话气泡、速度线。',
-    techniques: ['SVG/Canvas 骨骼关键帧动画', '关节层级 + spring 回弹', '对话气泡与拟声字', '场景推拉与速度线', '表情/道具切换'],
+    visualLanguage: '角色故事动画：人物画风跟着故事走——火柴人可直接用人物库 Figure style="stick"，卡通、绘本、Q版等画风自己设计角色（同一角色全片统一）；做跑跳、指点、对话等关节动作，场景用简笔背景、拟声字、对话气泡、速度线。',
+    techniques: ['火柴人用 Figure style="stick"，其它画风自己设计角色', 'script 动作序列与关节动画', '对话气泡与拟声字', '场景推拉与速度线', '道具切换'],
     pacing: '随剧情起伏，动作镜头短（1.5~3s），对白镜头 3~5s',
     voice: '生动有戏、情绪起伏明显的故事讲述音色，可按角色切换',
     style: 'warm',
@@ -40,10 +68,10 @@ export const GENRE_PROFILES = [
   {
     id: 'history-theater',
     label: '历史剧场 / 史诗卡点动画',
-    detect: /历史|古代|朝代|战役|将军|帝王|楚汉|三国|汉|唐|宋|秦|霍去病|卫青|项羽|秦始皇|人物传|演义|文物|古风|武侠|冠军侯|封狼居胥/i,
-    visualLanguage: '高燃逆光剪影动画 + 血金红黑史诗对比：每幕必须有动态动画人物主体（逆光铠甲英雄/披风帝王/冲锋铁骑战马/城墙大军与飘扬战旗），配合高燃斩击月牙刀光与冲击波环（SlashBurstOverlay）、红黑发光疆域攻占地图（StrategicMapStage）、立体竹简与朱砂印章（Bamboo Slips / CalligraphyColumnPanel）、火星烟尘与鼓点震屏；严禁退化成只有几条空山脉线条的静态宣纸 PPT！',
-    techniques: ['HeroWarriorFigure 逆光披风人物与武器挥砍', '冲锋骑兵群/战车与飘扬战旗阵', 'SlashBurstOverlay 月牙斩击+冲击波环+竖向光柱', 'StrategicMapStage 红黑攻占路线地图+印章落锤', '立体竹简/功绩牌匾与纵排书法大字', '鼓点镜头震动+闪白/斜劈转场'],
-    pacing: '纯音乐高燃卡点 34~52 镜（常规 2~4 拍约 1.5~3s，高潮突降点 0.5~1 拍连切）；配音解说则张弛有度',
+    detect: new RegExp(`${HISTORY_STRONG_CUES}|${HISTORY_WEAK_CUES}|人物传`, 'i'),
+    visualLanguage: '史诗动画：每幕都有活的动画人物主体（用人物库 Figure / Horse / Troop，或按要求的画风自己画，做出将领、帝王、骑兵、军阵的真实动作：挥戟、策马、回首、拱手、跪坐、举杯），配合斩击光与冲击波（SlashBurstOverlay）、疆域攻占地图（StrategicMapStage）、竹简与书法印章（CalligraphyColumnPanel）、火星烟尘与鼓点运镜；没有特别要求时，逆光剪影 + 轮廓光 + 披风盔缨点缀色很出效果（用户要求国风插画、Q版、水墨等其它画风时照用户的）；严禁退化成只有几条空山脉线条的静态宣纸 PPT！',
+    techniques: ['Figure / Horse / Troop 人物、战马与军阵（或自绘角色）', 'SlashBurstOverlay 斩击光+冲击波环', 'StrategicMapStage 攻占路线地图+印章落锤', '竹简/牌匾与纵排书法大字', '鼓点镜头推拉+斜劈转场'],
+    pacing: '纯音乐高燃卡点快切（常规 2~4 拍约 1.5~3s，高潮突降点 0.5~1 拍连切，镜头数按目标时长换算）；配音解说则张弛有度',
     voice: '纯音乐卡点优先免 TTS；需解说时选用富有张力、史诗浑厚的中年男声',
     style: 'cinematic',
   },

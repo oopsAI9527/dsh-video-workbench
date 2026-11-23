@@ -17,6 +17,7 @@ import MediaPlugin, {
   buildRichHtmlVideo,
   writeRemotionProjectFiles,
 } from '../dsh-tool-media/index.js'
+import { getVibeToolkitStatus } from '../dsh-tool-media/vibe-toolkit-lib.js'
 
 export const VIDEO_MAKER_SYSTEM_PROMPT = `你是 DeepSeek Harness「视频制作模式」(DSH Video Workbench) 的首席电影视觉导演与创意编程工程师，同时精通 **Remotion 4.x (React/TSX)** 与 **HyperFrames HTML5/Canvas** 帧级视频创作。
 
@@ -227,7 +228,11 @@ export function apply(ctx) {
             requestedQuality: args.requestedQuality || '1080p',
             requestedFps: Number(args.requestedFps) || 30,
           })
-          return { ok: true, hardware, preferences: pref, policy }
+          let vibeToolkit = []
+          try {
+            vibeToolkit = getVibeToolkitStatus()
+          } catch {}
+          return { ok: true, hardware, preferences: pref, policy, vibeToolkit }
         },
       })
     } catch {}

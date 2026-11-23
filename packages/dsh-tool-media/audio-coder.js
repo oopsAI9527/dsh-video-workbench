@@ -1,10 +1,13 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import vm from 'node:vm'
-import { createAbortError, resolveBinaries, runCommandRedirected } from '../shared/index.js'
+import { createAbortError, resolveBinaries, resolveStyleKey, runCommandRedirected } from '../shared/index.js'
 import { executeGenerateSpeech } from '../dsh-tool-local-tts/index.js'
 import { DSP_SR, encodeStereoWav } from './audio-dsp.js'
 import { callLlmChat, extractJsonFromLlmText, getSafeLlmConfigSummary } from './llm-client.js'
+import { detectSuperCollider, renderSuperColliderNrt } from './supercollider-bridge.js'
+import { isAudibleAudio, measureLoudnessStats } from './audio-synth.js'
+import { isBillingError } from './cloud-ledger.js'
 
 const FORBIDDEN_AUDIO_CODE_PATTERNS = [
   { rx: /\brequire\s*\(/, reason: '禁止使用 require()' },
@@ -201,6 +204,75 @@ export function buildAudioCoderPromptPackage({
   return { system, user }
 }
 
+/**
+ * System prompt for the optional SuperCollider engine (Vibecoding tool #6). The model must answer with JSON
+ * { "scd": "<SuperCollider code that assigns ~score>", "bpm": n, "summary": "..." } and use NRT-safe code only.
+ */
+export function buildSuperColliderBgmSystemPrompt({ bpm = 112, durationSec = 12, mood = 'cinematic' } = {}) {
+  const beatSec = 60 / Math.max(40, Math.min(220, Number(bpm) || 112))
+  return [
+    '你是 SuperCollider 资深声音设计师兼作曲家。请为短视频编写一段可离线 NRT 渲染的完整配乐 Score。',
+    '只返回 JSON：{"scd": "<SuperCollider 代码>", "bpm": 数字, "summary": "一句话中文说明"}。',
+    '硬性规则：',
+    "1. 代码必须把 ~score 赋值为 OSC 消息数组：先用 [0.0, ['/d_recv', SynthDef(\\name, {...}).asBytes]] 注册全部 SynthDef，再用 [时间秒, ['/s_new', \\name, 节点ID, 0, 0, \\参数, 值...]] 排布音符，必要时用 '/n_set' 和 '/n_free'。",
+    '2. 禁止 s.boot、Server、File、SoundFile、Pipe、unixCmd、systemCmd、load、write、thisProcess、Platform、Routine/fork 等任何访问系统、文件或实时服务器的代码；只允许 UGen 合成与数组计算。',
+    `3. 总时长 ${Number(durationSec).toFixed(2)} 秒，BPM ${Number(bpm) || 112}（每拍 ${beatSec.toFixed(4)} 秒），所有音符时间严格落在拍点或半拍/四分之一拍上；情绪 ${mood}。`,
+    '4. 编配要有前奏、推进、高潮与收尾；鼓组（kick/snare/hat）与低音锁拍；所有 SynthDef 用 doneAction: 2 自动释放；输出到总线 0（立体声，Pan2），整体峰值不超过 0.8，避免削波。',
+    '5. 代码结构保持简单：可以先用 var 或 ~环境变量 定义 SynthDef 与音符表，最后一行必须把完整数组赋给 ~score；整体响度目标约 -16 LUFS（不要把音量压得过低，系统会再做精确响度校准）。',
+    '6. 不要输出 Markdown 代码块，不要解释，只输出 JSON。',
+  ].join('\n')
+}
+
+/** Bring an AI-rendered music bed to a sane level (linear gain + gentle limiter); returns the measured LUFS. */
+async function normalizeBgmLoudness(wavFile, targetLufs = -16) {
+  try {
+    const { ffmpeg } = resolveBinaries()
+    const st = await measureLoudnessStats(ffmpeg, wavFile)
+    if (!Number.isFinite(st.lufs)) return null
+    const gainDb = Math.max(-20, Math.min(30, targetLufs - st.lufs))
+    if (Math.abs(gainDb) < 0.5) return st.lufs
+    const tmp = wavFile.replace(/\.wav$/i, '.norm.wav')
+    const res = await runCommandRedirected(
+      ffmpeg,
+      ['-y', '-i', wavFile, '-af', `volume=${gainDb.toFixed(2)}dB,alimiter=limit=0.89:level=disabled`, '-ar', '48000', '-c:a', 'pcm_s16le', tmp],
+      { timeoutMs: 120_000 },
+    )
+    if (res.code === 0 && existsSync(tmp)) {
+      try {
+        unlinkSync(wavFile)
+      } catch {}
+      renameSync(tmp, wavFile)
+      return Number((st.lufs + gainDb).toFixed(1))
+    }
+  } catch {}
+  return null
+}
+
+/** The JS DSP composer gets one corrective retry (see generateAiCodedBgmTrack). */
+export const AI_BGM_MAX_ATTEMPTS = 2
+
+/**
+ * False only when the WAV is missing or MEASURED silent (a broken score can render digital silence); an FFmpeg build
+ * that cannot measure keeps the previous behaviour (the render is accepted).
+ */
+export async function isAudibleMusicBed(wavFile) {
+  if (!wavFile || !existsSync(wavFile)) return false
+  const { ffmpeg } = resolveBinaries()
+  return (await isAudibleAudio(ffmpeg, wavFile)) !== false
+}
+
+function unlinkQuiet(file) {
+  try {
+    if (file && existsSync(file)) unlinkSync(file)
+  } catch {}
+}
+
+/** Move a validated render into place (the final name only ever holds a finished, audible track). */
+function replaceWithRender(tmpFile, finalFile) {
+  unlinkQuiet(finalFile)
+  renameSync(tmpFile, finalFile)
+}
+
 function parseJsonFromLlmText(rawText) {
   const cleaned = String(rawText || '').trim()
   try {
@@ -225,6 +297,22 @@ function parseJsonFromLlmText(rawText) {
 /**
  * Invoke LLM to author `audio/ai_bgm_synth.js`, sandbox-validate & synthesize `audio/bgm-llm.wav`.
  */
+/** The base preset of a project whose style was decided by 「AI 自由匹配」 or a 「我的风格预设」 ('' for a plain preset / unknown). */
+function projectDecidedStyle(absDir, parsed) {
+  let sc = parsed
+  if (!sc) {
+    try {
+      sc = JSON.parse(readFileSync(join(absDir, 'script.json'), 'utf8'))
+    } catch {
+      return ''
+    }
+  }
+  if (!sc || typeof sc !== 'object' || !sc.style) return ''
+  if (sc.styleMode === 'auto' && sc.styleAuto && sc.styleAuto.style === sc.style && sc.styleAuto.by !== 'pending') return resolveStyleKey(sc.style)
+  if (sc.styleMode === 'user' && sc.styleProfile && sc.styleProfile.base === sc.style) return resolveStyleKey(sc.style)
+  return ''
+}
+
 export async function generateAiCodedBgmTrack({
   projectDir,
   script,
@@ -236,11 +324,96 @@ export async function generateAiCodedBgmTrack({
   const absDir = resolve(projectDir)
   const durationSec = Math.max(3, Number(script?.totalDurationSec) || 12)
   const bpm = Number(script?.audioSpec?.bpm || script?.bgm?.bpm || 112)
-  const mood = script?.audioSpec?.mood || script?.style || 'tech'
+  // an AI 自由匹配 / 我的风格预设 project: the style decided in the plan call (saved in script.json) wins over a style the
+  // caller resolved before planning
+  const decidedStyle = projectDecidedStyle(absDir)
+  const mood = decidedStyle || script?.audioSpec?.mood || script?.style || 'tech'
   const beats = Array.isArray(script?.bgm?.beats) ? script.bgm.beats : []
+  // a custom visual style (AI-designed / 我的风格预设) tells the composer its music mood; `mood` itself stays the key the
+  // generated synth code receives at runtime
+  const styleMoodWords = String(script?.styleProfile?.bgmMood || '').slice(0, 24)
+  const topicForMusic = `${script?.title || script?.topic || ''}${styleMoodWords ? `（配乐气质：${styleMoodWords}）` : ''}`
+
+  // Vibecoding tool #6 — SuperCollider: when the user's machine has `sclang` (and the engine is not forced to
+  // 'js'), the LLM writes a SuperCollider NRT score that is rendered offline. Any failure falls back to the
+  // deterministic JS DSP path below, so a video never depends on SuperCollider being installed.
+  const engineWanted = String(process.env.DSH_AUDIO_ENGINE || script?.audioSpec?.engine || 'auto').toLowerCase()
+  let scFallbackReason = ''
+  if (engineWanted !== 'js' && detectSuperCollider().available) {
+    // render beside the final name: only an audible, finished render ever becomes audio/bgm-llm.wav (a failed or
+    // silent render left there was mixed as "the BGM" and the film had no music)
+    const scTmp = join(absDir, 'audio', 'bgm-llm.sc-render.wav')
+    try {
+      const scRes = await callLlmChatFn({
+        system: buildSuperColliderBgmSystemPrompt({ bpm, durationSec, mood }),
+        messages: [
+          {
+            role: 'user',
+            content: JSON.stringify({
+              topic: topicForMusic,
+              mood,
+              bpm,
+              durationSec: Number(durationSec.toFixed(2)),
+              downbeatsSec: beats
+                .map((b) => (typeof b === 'number' ? { time: b } : b))
+                .filter((b) => b?.strong)
+                .slice(0, 64)
+                .map((b) => Number(Number(b.time).toFixed(3))),
+            }),
+          },
+        ],
+        temperature: 0.4,
+        maxTokens: 3600,
+        responseFormat: 'json',
+      })
+      const scParsed = parseJsonFromLlmText(scRes?.text || '')
+      const body = String(scParsed?.scd || scParsed?.files?.['audio/ai_bgm.scd'] || '').trim()
+      if (body) {
+        const wavFile = join(absDir, 'audio', 'bgm-llm.wav')
+        const scdFile = join(absDir, 'audio', 'ai_bgm.scd')
+        mkdirSync(dirname(scdFile), { recursive: true })
+        writeFileSync(scdFile, body, 'utf8')
+        const rendered = await renderSuperColliderNrt({ body, outWav: scTmp, durationSec: durationSec + 0.5 })
+        if (rendered.ok && !(await isAudibleMusicBed(scTmp))) {
+          rendered.ok = false
+          rendered.reason = 'silent'
+        }
+        if (!rendered.ok) {
+          unlinkQuiet(scTmp)
+          scFallbackReason =
+            rendered.reason === 'silent'
+              ? 'SuperCollider 渲染结果是静音，已改用内置 JS DSP 合成器'
+              : `SuperCollider 渲染失败 (${rendered.reason || 'unknown'})，已改用内置 JS DSP 合成器`
+        }
+        if (rendered.ok) {
+          replaceWithRender(scTmp, wavFile)
+          const measured = await normalizeBgmLoudness(wavFile, -16)
+          return {
+            ok: true,
+            bgmMode: 'llm-coded',
+            engine: 'supercollider',
+            scriptPath: scdFile,
+            relScriptPath: 'audio/ai_bgm.scd',
+            wavPath: wavFile,
+            relWavPath: 'audio/bgm-llm.wav',
+            summary: scParsed?.summary || 'AI 大模型编写的 SuperCollider 配乐已离线渲染 (NRT)',
+            bpm: Number(scParsed?.bpm) || bpm,
+            lufs: measured,
+          }
+        }
+      } else {
+        scFallbackReason = 'SuperCollider 乐谱为空，已改用内置 JS DSP 合成器'
+      }
+    } catch (err) {
+      unlinkQuiet(scTmp)
+      // a balance problem or a cancelled run stops here; anything else falls through to the JS DSP synthesizer
+      if (isBillingError(err) || err?.name === 'AbortError') throw err
+      scFallbackReason = `SuperCollider 配乐生成异常 (${String(err?.message || err).slice(0, 120)})，已改用内置 JS DSP 合成器`
+    }
+  }
 
   const { system, user } = buildAudioCoderPromptPackage({
-    topic: script?.title || script?.topic || '',
+    topic: topicForMusic,
     mood,
     bpm,
     durationSec,
@@ -248,46 +421,73 @@ export async function generateAiCodedBgmTrack({
     scenes: script?.scenes || [],
   })
 
-  const res = await callLlmChatFn({
-    system,
-    messages: [{ role: 'user', content: user }],
-    temperature: 0.45,
-    maxTokens: 3600,
-    responseFormat: 'json',
-  })
-
-  const parsed = parseJsonFromLlmText(res?.text || '')
-  const code = parsed?.files?.['audio/ai_bgm_synth.js'] || parsed?.code || ''
-  if (!code) {
-    throw new Error('LLM 未返回 audio/ai_bgm_synth.js 合成代码')
-  }
-
   const scriptFile = join(absDir, 'audio', 'ai_bgm_synth.js')
   const wavFile = join(absDir, 'audio', 'bgm-llm.wav')
+  const jsTmp = join(absDir, 'audio', 'bgm-llm.js-render.wav')
   mkdirSync(dirname(scriptFile), { recursive: true })
-  writeFileSync(scriptFile, code, 'utf8')
 
-  const execRes = executeAiAudioSynthScript({
-    code,
-    outWavPath: wavFile,
-    durationSec,
-    bpm: Number(parsed?.bpm) || bpm,
-    beats,
-    mood,
-  })
-
-  return {
-    ok: true,
-    bgmMode: 'llm-coded',
-    scriptPath: scriptFile,
-    relScriptPath: 'audio/ai_bgm_synth.js',
-    wavPath: execRes.wavPath,
-    relWavPath: 'audio/bgm-llm.wav',
-    summary: parsed?.summary || 'AI 大模型实时编写的纯数学 DSP 配乐已渲染',
-    rmsDb: execRes.rmsDb,
-    bpm: Number(parsed?.bpm) || bpm,
-    code,
+  // One retry when the reply is unusable (not JSON / no code / a formula that renders silence or throws): the model is
+  // told what was wrong. Transport, rate-limit and billing errors are not retried here (callLlmChat already retries).
+  const messages = [{ role: 'user', content: user }]
+  let lastErr = null
+  for (let attempt = 1; attempt <= AI_BGM_MAX_ATTEMPTS; attempt++) {
+    const res = await callLlmChatFn({
+      system,
+      messages,
+      temperature: attempt === 1 ? 0.45 : 0.3,
+      maxTokens: attempt === 1 ? 3600 : 4800,
+      responseFormat: 'json',
+    })
+    const rawText = String(res?.text || '')
+    try {
+      const parsed = parseJsonFromLlmText(rawText)
+      const code = parsed?.files?.['audio/ai_bgm_synth.js'] || parsed?.code || ''
+      if (!code) throw new Error('LLM 未返回 audio/ai_bgm_synth.js 合成代码')
+      writeFileSync(scriptFile, code, 'utf8')
+      // throws on a silent waveform (peak < 1e-4) or a sandbox violation
+      const execRes = executeAiAudioSynthScript({
+        code,
+        outWavPath: jsTmp,
+        durationSec,
+        bpm: Number(parsed?.bpm) || bpm,
+        beats,
+        mood,
+      })
+      replaceWithRender(jsTmp, wavFile)
+      const notes = [scFallbackReason, attempt > 1 ? `首次结果不可用（${String(lastErr?.message || '').slice(0, 80)}），第 ${attempt} 次生成成功` : ''].filter(Boolean)
+      return {
+        ok: true,
+        bgmMode: 'llm-coded',
+        scriptPath: scriptFile,
+        relScriptPath: 'audio/ai_bgm_synth.js',
+        wavPath: wavFile,
+        relWavPath: 'audio/bgm-llm.wav',
+        summary: parsed?.summary || 'AI 大模型实时编写的纯数学 DSP 配乐已渲染',
+        rmsDb: execRes.rmsDb,
+        bpm: Number(parsed?.bpm) || bpm,
+        code,
+        engine: 'js-dsp',
+        attempts: attempt,
+        engineNote: notes.length ? notes.join('；') : undefined,
+      }
+    } catch (err) {
+      unlinkQuiet(jsTmp)
+      if (isBillingError(err) || err?.name === 'AbortError') throw err
+      lastErr = err
+      // keep the unusable reply for diagnosis (bounded)
+      try {
+        writeFileSync(join(absDir, 'audio', `ai_bgm_failed-${attempt}.txt`), `${String(err?.message || err)}\n\n${rawText.slice(0, 20_000)}`, 'utf8')
+      } catch {}
+      if (attempt < AI_BGM_MAX_ATTEMPTS) {
+        messages.push({ role: 'assistant', content: rawText.slice(0, 1500) || '（空回复）' })
+        messages.push({
+          role: 'user',
+          content: `上一次的结果不可用：${String(err?.message || err).slice(0, 200)}。请重新输出：只输出一个 JSON 对象（不要 Markdown 代码块、不要任何解释），字段 files["audio/ai_bgm_synth.js"] 为完整、可运行的 synthesizeBgm 函数代码（控制在 120 行以内），必须产生全程可听见的配乐（不能是静音）。`,
+        })
+      }
+    }
   }
+  throw lastErr || new Error('AI 配乐生成失败')
 }
 
 /**
@@ -381,7 +581,7 @@ export async function synthesizeTtsEngineAudioCue({
 export async function generateAiCodedSfxCues({
   projectDir,
   cues = ['whoosh', 'hit', 'riser', 'chime'],
-  style = 'tech',
+  style = '',
   llmOverride = {},
   fetchImpl,
   signal,
@@ -390,6 +590,14 @@ export async function generateAiCodedSfxCues({
   const absDir = resolve(projectDir)
   const sfxDir = join(absDir, 'audio', 'sfx')
   mkdirSync(sfxDir, { recursive: true })
+  // 'auto' (AI 自由匹配) / 'user:<id>' → the project's base preset, plus the custom style's name for the sound designer
+  let projectScript = null
+  try {
+    projectScript = JSON.parse(readFileSync(join(absDir, 'script.json'), 'utf8'))
+  } catch {}
+  const styleKey = projectDecidedStyle(absDir, projectScript) || resolveStyleKey(style, projectScript)
+  const prof = projectScript?.styleProfile
+  const styleForPrompt = prof?.name ? `${styleKey}（${String(prof.name).slice(0, 20)}${prof.bgmMood ? ` · ${String(prof.bgmMood).slice(0, 24)}` : ''}）` : styleKey
 
   const summary = getSafeLlmConfigSummary()
   if (!llmOverride?.baseUrl && !summary.configured) {
@@ -406,7 +614,7 @@ export async function generateAiCodedSfxCues({
 
   const user = JSON.stringify({
     task: '为转场与重击节点生成具有电影冲击力的代码合成音效',
-    style,
+    style: styleForPrompt,
     cues: targetCues,
   })
 

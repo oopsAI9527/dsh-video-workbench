@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import {
   alignSubtitlesToSpeechAudio,
+  ffmpegAmixNoRescale,
   normalizeNumeralsForDisplay,
   probeAudioDuration,
   readScriptJson,
@@ -176,7 +177,7 @@ async function applyFfmpegVocalChain(ffmpeg, srcWav, dstWav, spec) {
     filterComplex =
       `[0:a]${fullChain.join(',')},asplit=2[vd][vr];` +
       `[vr]aecho=0.8:0.72:26|46:${spec.reverbWet}|${wet2}[vr_wet];` +
-      `[vd][vr_wet]amix=inputs=2:normalize=0:weights=${dryWeight}|1,` +
+      `[vd][vr_wet]${ffmpegAmixNoRescale(ffmpeg, 2, { duration: 'longest', weights: [dryWeight, 1] })},` +
       `${loudnormChain}[v_master]`
   } else {
     filterComplex = `[0:a]${fullChain.join(',')},${loudnormChain}[v_master]`

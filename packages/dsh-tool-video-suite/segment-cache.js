@@ -178,7 +178,8 @@ export async function renderHtmlSegmentsWithCache({
   // Mux master audio track onto merged silent video cleanly
   const muxArgs = ['-y', '-i', silentMerged]
   if (audioWavPath && existsSync(audioWavPath)) {
-    muxArgs.push('-i', audioWavPath, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-shortest')
+    // 320 kbit/s like the Remotion mux (192 kbit/s AAC overshoot pushed the true peak over -1 dBTP)
+    muxArgs.push('-i', audioWavPath, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '320k', '-ar', '48000', '-ac', '2', '-shortest')
   } else {
     muxArgs.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest')
   }

@@ -4,6 +4,7 @@ import https from 'node:https'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { loadEnv, resolveEnvPath } from '../shared/index.js'
+import { isBillingError } from './cloud-ledger.js'
 
 /**
  * Node built-in http/https POST helper used when `timeoutMs > 240_000` so long-running
@@ -40,9 +41,11 @@ function postJsonLongTimeout(endpoint, headers, bodyStr, timeoutMs, signal) {
         res.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8')
           const status = res.statusCode || 0
+          const rawHeaders = res.headers || {}
           done(resolvePromise, {
             ok: status >= 200 && status < 300,
             status,
+            headers: { get: (k) => rawHeaders[String(k).toLowerCase()] ?? null },
             text: async () => text,
           })
         })
@@ -365,6 +368,46 @@ function parseProvidersFromCordisPatch(patchPath) {
   return providers
 }
 
+/**
+ * DSH's own default-model setting — the `agent-default-model` entry of cordis.patch.yml (written by DSH's model
+ * picker / settings): `{ provider, model }`, empty strings when DSH has no such entry.
+ */
+function readDshAgentDefaultModel(patchPath) {
+  const none = { provider: '', model: '' }
+  try {
+    if (!existsSync(patchPath)) return none
+    let inBlock = false
+    let inConfig = false
+    let provider = ''
+    let model = ''
+    for (const rawLine of readFileSync(patchPath, 'utf8').split(/\r?\n/)) {
+      if (/^- id:/.test(rawLine)) {
+        if (inBlock) break
+        inBlock = /^- id:\s*["']?agent-default-model["']?\s*$/.test(rawLine)
+        inConfig = false
+        continue
+      }
+      if (!inBlock) continue
+      if (/^  config:\s*$/.test(rawLine)) {
+        inConfig = true
+        continue
+      }
+      if (/^  \S/.test(rawLine)) {
+        inConfig = false
+        continue
+      }
+      if (!inConfig) continue
+      const p = /^    provider:\s*(.+?)\s*$/.exec(rawLine)
+      if (p) provider = stripYamlScalar(p[1])
+      const m = /^    model:\s*(.+?)\s*$/.exec(rawLine)
+      if (m) model = stripYamlScalar(m[1])
+    }
+    return { provider, model }
+  } catch {
+    return none
+  }
+}
+
 function readLatestDshActiveSelection(dshHome) {
   const sessDir = join(dshHome, 'storages', 'session_projcache', 'sessions')
   if (!existsSync(sessDir)) return { provider: '', model: '' }
@@ -401,7 +444,10 @@ function loadDshClientDiscoveryInternal(dshHomeOverride = '') {
 
   const refs = parseCredentialsRefs(credPath)
   const rawProviders = parseProvidersFromCordisPatch(patchPath)
-  const activeSelection = readLatestDshActiveSelection(dshHome)
+  // DSH's own default-model setting; the latest session cache only for DSH versions without that setting
+  const configuredDefault = readDshAgentDefaultModel(patchPath)
+  const activeSelection =
+    configuredDefault.provider || configuredDefault.model ? configuredDefault : readLatestDshActiveSelection(dshHome)
 
   const providers = rawProviders.map((p) => {
     const resolvedKey =
@@ -462,6 +508,90 @@ export function discoverDshClientConfig(dshHomeOverride = '') {
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Host agent. The plugin runs inside DSH (Cordis plugin), as the MCP server of another agent (Claude Code, Codex,
+// opencode, OpenClaw, Hermes, pi, WorkBuddy, Antigravity, Gemini CLI, Cursor …) or as a standalone web studio.
+// `DSH_VIDEO_HOST_AGENT` names it: the MCP server sets it from the client's `initialize` info, the DSH plugin entry sets
+// 'dsh', a studio started by an agent inherits it, and users may set it themselves.
+const HOST_AGENTS = [
+  { id: 'dsh', match: /(^|[^a-z])dsh([^a-z]|$)|deepseek[\s_-]*harness/i, label: 'DeepSeek Harness（DSH）', prefer: ['deepseek', 'anthropic', 'openai', 'openrouter', 'gemini'] },
+  { id: 'claude-code', match: /claude/i, label: 'Claude Code', prefer: ['anthropic', 'openrouter', 'openai', 'deepseek', 'gemini'] },
+  { id: 'codex', match: /codex/i, label: 'OpenAI Codex', prefer: ['openai', 'openrouter', 'anthropic', 'deepseek', 'gemini'] },
+  { id: 'antigravity', match: /antigravity/i, label: 'Antigravity', prefer: ['gemini', 'openrouter', 'anthropic', 'openai', 'deepseek'] },
+  { id: 'gemini-cli', match: /gemini/i, label: 'Gemini CLI', prefer: ['gemini', 'openrouter', 'anthropic', 'openai', 'deepseek'] },
+  { id: 'opencode', match: /opencode/i, label: 'opencode' },
+  { id: 'openclaw', match: /openclaw/i, label: 'OpenClaw' },
+  { id: 'hermes', match: /hermes/i, label: 'Hermes' },
+  { id: 'workbuddy', match: /work\s*buddy|codebuddy/i, label: 'WorkBuddy' },
+  { id: 'pi', match: /^pi([^a-z]|$)|pi[\s_-]*coding/i, label: 'pi' },
+  { id: 'cursor', match: /cursor/i, label: 'Cursor' },
+  { id: 'windsurf', match: /windsurf|codeium/i, label: 'Windsurf' },
+  { id: 'cline', match: /cline|roo[\s_-]*code/i, label: 'Cline' },
+  { id: 'vscode', match: /visual studio code|vscode|copilot/i, label: 'VS Code / Copilot' },
+]
+const DEFAULT_ENV_PREFERENCE = ['anthropic', 'openai', 'openrouter', 'deepseek', 'gemini']
+
+/** The agent hosting this process: { id, name, label, version }; id '' = standalone studio / unknown. */
+export function getHostAgentInfo() {
+  const raw = String(process.env.DSH_VIDEO_HOST_AGENT || '').trim()
+  if (!raw) return { id: '', name: '', label: '', version: '' }
+  const hit = HOST_AGENTS.find((h) => h.match.test(raw))
+  return {
+    id: hit ? hit.id : raw.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'agent',
+    name: raw.slice(0, 80),
+    label: hit ? hit.label : raw.slice(0, 40),
+    version: String(process.env.DSH_VIDEO_HOST_AGENT_VERSION || '').trim().slice(0, 40),
+  }
+}
+
+// Model APIs an agent's environment commonly exposes to the tools it starts. ONLY plain API keys the user exported
+// for this process are used — never another app's login / subscription tokens (e.g. CLAUDE_CODE_OAUTH_TOKEN) and never
+// its credential files: using those outside the app that issued them is not allowed.
+const HOST_ENV_PROVIDERS = [
+  { provider: 'anthropic', keyVars: ['ANTHROPIC_API_KEY'], baseVars: ['ANTHROPIC_BASE_URL'], modelVars: ['ANTHROPIC_MODEL'] },
+  { provider: 'openai', keyVars: ['OPENAI_API_KEY'], baseVars: ['OPENAI_BASE_URL', 'OPENAI_API_BASE'], modelVars: ['OPENAI_MODEL'] },
+  { provider: 'deepseek', keyVars: ['DEEPSEEK_API_KEY'], baseVars: ['DEEPSEEK_BASE_URL'], modelVars: ['DEEPSEEK_MODEL'] },
+  { provider: 'gemini', keyVars: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'], baseVars: ['GEMINI_BASE_URL'], modelVars: ['GEMINI_MODEL'] },
+  { provider: 'openrouter', keyVars: ['OPENROUTER_API_KEY'], baseVars: ['OPENROUTER_BASE_URL'], modelVars: ['OPENROUTER_MODEL'] },
+]
+
+function discoverHostEnvInternal(host = getHostAgentInfo()) {
+  const order = HOST_AGENTS.find((h) => h.id === host.id)?.prefer || DEFAULT_ENV_PREFERENCE
+  const env = (name) => String(process.env[name] || '').trim()
+  const found = []
+  for (const p of HOST_ENV_PROVIDERS) {
+    const keyVar = p.keyVars.find((v) => env(v))
+    if (!keyVar) continue
+    const tpl = LLM_PROVIDER_TEMPLATES[p.provider] || LLM_PROVIDER_TEMPLATES.custom
+    const baseVar = p.baseVars.find((v) => env(v)) || ''
+    const modelVar = p.modelVars.find((v) => env(v)) || ''
+    // ANTHROPIC_BASE_URL is an Anthropic-compatible gateway; an OPENAI_BASE_URL relay usually speaks chat completions
+    const format =
+      p.provider === 'anthropic' ? 'anthropic-messages' : p.provider === 'openai' && baseVar ? 'openai-completions' : tpl.defaultFormat
+    found.push({
+      provider: p.provider,
+      label: tpl.label,
+      keyVar,
+      baseVar,
+      modelVar,
+      baseUrl: (baseVar ? env(baseVar) : tpl.defaultBaseUrl || '').replace(/\/+$/, ''),
+      model: modelVar ? env(modelVar) : tpl.suggestedModels?.[0] || '',
+      format,
+      _secretKey: env(keyVar),
+    })
+  }
+  const rank = (prov) => {
+    const i = order.indexOf(prov)
+    return i < 0 ? order.length : i
+  }
+  return found.sort((a, b) => rank(a.provider) - rank(b.provider))
+}
+
+/** Public view of the model APIs found in this process's environment (never the key values). */
+export function discoverHostEnvLlm() {
+  return discoverHostEnvInternal().map(({ _secretKey, ...rest }) => ({ ...rest, maskedKey: maskSecretKey(_secretKey) }))
+}
+
 function readStoredConfigFile() {
   const cfgPath = getLlmConfigPath()
   if (!existsSync(cfgPath)) return {}
@@ -474,10 +604,13 @@ function readStoredConfigFile() {
 }
 
 /**
- * Resolve effective LLM configuration:
- * - Defaults to `mode: 'follow-dsh'` (automatically tracking active DSH client model/gateway/protocol/key)
- * - Supports switching to any DSH provider/model OR configuring an independent custom provider/model/protocol
- * - Allows per-call explicit overrides (e.g. from test suites or one-off calls)
+ * Resolve the effective LLM configuration. Modes:
+ * - `auto` (default) — follow the agent that hosts the plugin: inside DSH (or the standalone studio) the active DSH
+ *   channel; inside another agent the model API its environment exposes (ANTHROPIC_API_KEY / OPENAI_API_KEY / …,
+ *   preferring the provider that matches the agent); then the plugin's own custom fields; then a local DSH install.
+ * - `follow-dsh` — a DSH channel the user picked explicitly (or DSH's active one).
+ * - `custom` — the plugin's own provider / URL / key / model.
+ * Per-call overrides (tests, one-off calls) win over the stored file.
  */
 export function resolveLlmConfig(override = {}) {
   loadEnv()
@@ -491,13 +624,25 @@ export function resolveLlmConfig(override = {}) {
       (hasExplicitUrlOrKeyOverride ? 'custom' : undefined) ??
       fileCfg.mode ??
       process.env.LLM_MODE ??
-      (envForcesCustom ? 'custom' : 'follow-dsh'),
+      (envForcesCustom ? 'custom' : 'auto'),
   )
     .trim()
     .toLowerCase()
-
-  if (mode !== 'custom' && mode !== 'follow-dsh') {
-    mode = 'follow-dsh'
+  // Before v0.6.0 'follow-dsh' WAS the automatic default. A stored follow-dsh that only tracked DSH's active channel
+  // (no channel / model / protocol picked) now follows whichever agent hosts the plugin.
+  if (
+    mode === 'follow-dsh' &&
+    override.mode === undefined &&
+    !fileCfg.configVersion &&
+    String(fileCfg.mode || '').toLowerCase() === 'follow-dsh' &&
+    (!fileCfg.dshProviderId || fileCfg.dshProviderId === 'active') &&
+    !String(fileCfg.model || '').trim() &&
+    (!fileCfg.format || fileCfg.format === 'auto')
+  ) {
+    mode = 'auto'
+  }
+  if (mode !== 'custom' && mode !== 'follow-dsh' && mode !== 'auto') {
+    mode = 'auto'
   }
 
   const maxRepairRounds = Math.max(
@@ -514,91 +659,128 @@ export function resolveLlmConfig(override = {}) {
     1024,
     Number(override.maxTokens ?? fileCfg.maxTokens ?? 16000) || 16000,
   )
+  const common = { maxRepairRounds, temperature, maxTokens }
 
-  if (mode === 'follow-dsh') {
+  // DSH channel: the explicit one (follow-dsh) or DSH's active selection (auto)
+  const fromDsh = ({ followActive = false } = {}) => {
     const dsh = loadDshClientDiscoveryInternal(override.dshHomeDir || '')
-    const requestedDshProvId = String(
-      override.dshProviderId ?? fileCfg.dshProviderId ?? '',
-    ).trim()
-
-    let pickedProv =
+    const requestedDshProvId = followActive ? '' : String(override.dshProviderId ?? fileCfg.dshProviderId ?? '').trim()
+    const pickedProv =
       (requestedDshProvId && requestedDshProvId !== 'active'
         ? dsh.providers.find((p) => p.id === requestedDshProvId)
         : null) || dsh.defaultProvider
+    if (!pickedProv) return null
+    const requestedModel = String(override.model ?? (followActive ? '' : fileCfg.model) ?? '').trim()
+    const useModel =
+      requestedModel ||
+      (pickedProv.id === dsh.defaultProvider?.id ? dsh.defaultModel : '') ||
+      pickedProv.models?.[0]?.id ||
+      ''
+    const formatOverride = String(override.format ?? (followActive ? '' : fileCfg.format) ?? '').trim()
+    const effFormat =
+      formatOverride && formatOverride !== 'auto'
+        ? normalizeProtocolFormat(formatOverride)
+        : pickedProv.api || 'openai-completions'
+    return {
+      mode: 'follow-dsh',
+      sourceLabel:
+        !requestedDshProvId || requestedDshProvId === 'active'
+          ? `跟随 DSH 默认 (${pickedProv.displayName})`
+          : `DSH 通道 (${pickedProv.displayName})`,
+      dshProviderId: pickedProv.id,
+      dshChannelName: pickedProv.displayName,
+      provider: pickedProv.id,
+      format: effFormat,
+      baseUrl: pickedProv.baseURL,
+      apiKey: pickedProv._secretKey || '',
+      model: useModel,
+      ...common,
+    }
+  }
 
-    if (pickedProv) {
-      const requestedModel = String(override.model ?? fileCfg.model ?? '').trim()
-      const useModel =
-        requestedModel ||
-        (pickedProv.id === dsh.defaultProvider?.id ? dsh.defaultModel : '') ||
-        pickedProv.models?.[0]?.id ||
-        ''
+  const fromCustom = () => {
+    const provider =
+      String(override.provider ?? fileCfg.provider ?? process.env.LLM_PROVIDER ?? 'custom').trim() ||
+      'custom'
+    const template = LLM_PROVIDER_TEMPLATES[provider] || LLM_PROVIDER_TEMPLATES.custom
+    const formatRaw = String(
+      override.format ?? fileCfg.format ?? process.env.LLM_FORMAT ?? template.defaultFormat ?? 'auto',
+    ).toLowerCase()
+    const format = VALID_FORMATS.has(formatRaw) ? normalizeProtocolFormat(formatRaw) : 'auto'
+    const baseUrl = String(
+      override.baseUrl ?? fileCfg.baseUrl ?? process.env.LLM_BASE_URL ?? template.defaultBaseUrl ?? '',
+    )
+      .trim()
+      .replace(/\/+$/, '')
+    const rawOverrideKey = override.apiKey !== undefined ? String(override.apiKey).trim() : undefined
+    const apiKey =
+      rawOverrideKey && rawOverrideKey !== 'KEEP_EXISTING' && !rawOverrideKey.includes('****')
+        ? rawOverrideKey
+        : String(fileCfg.apiKey ?? process.env.LLM_API_KEY ?? '').trim()
+    const model = String(
+      override.model ?? fileCfg.model ?? process.env.LLM_MODEL ?? '',
+    ).trim()
+    return {
+      mode: 'custom',
+      sourceLabel: template.label || '插件自定义模型',
+      dshProviderId: '',
+      provider,
+      format,
+      baseUrl,
+      apiKey,
+      model,
+      ...common,
+    }
+  }
 
-      const formatOverride = String(override.format ?? fileCfg.format ?? '').trim()
-      const effFormat =
-        formatOverride && formatOverride !== 'auto'
-          ? normalizeProtocolFormat(formatOverride)
-          : pickedProv.api || 'openai-completions'
-
+  if (mode === 'auto') {
+    const host = getHostAgentInfo()
+    const dshFirst = !host.id || host.id === 'dsh'
+    const agentName = host.label || '当前智能体'
+    if (dshFirst) {
+      const d = fromDsh({ followActive: true })
+      if (d) return { ...d, mode: 'auto', resolvedBy: 'dsh', host, sourceLabel: `跟随 DSH（${d.dshChannelName}）` }
+    }
+    const envHit = discoverHostEnvInternal(host)[0]
+    if (envHit) {
       return {
-        mode: 'follow-dsh',
-        sourceLabel:
-          !requestedDshProvId || requestedDshProvId === 'active'
-            ? `跟随 DSH 默认 (${pickedProv.displayName})`
-            : `DSH 通道 (${pickedProv.displayName})`,
-        dshProviderId: pickedProv.id,
-        provider: pickedProv.id,
-        format: effFormat,
-        baseUrl: pickedProv.baseURL,
-        apiKey: pickedProv._secretKey || '',
-        model: useModel,
-        maxRepairRounds,
-        temperature,
-        maxTokens,
+        mode: 'auto',
+        resolvedBy: 'host-env',
+        host,
+        sourceLabel: `跟随 ${agentName}（${envHit.keyVar}）`,
+        hostEnvVar: envHit.keyVar,
+        dshProviderId: '',
+        provider: envHit.provider,
+        format: envHit.format,
+        baseUrl: envHit.baseUrl,
+        apiKey: envHit._secretKey,
+        model: String(override.model ?? '').trim() || envHit.model,
+        ...common,
       }
     }
+    const c = fromCustom()
+    if (c.baseUrl && c.model) {
+      return { ...c, mode: 'auto', resolvedBy: 'custom', host, sourceLabel: `自定义模型（${agentName} 没有可共享的模型配置）` }
+    }
+    if (!dshFirst) {
+      const d = fromDsh({ followActive: true })
+      if (d) return { ...d, mode: 'auto', resolvedBy: 'dsh', host, sourceLabel: `跟随本机 DSH（${d.dshChannelName}）` }
+    }
+    return {
+      ...c,
+      mode: 'auto',
+      resolvedBy: 'none',
+      host,
+      sourceLabel: host.id && host.id !== 'dsh' ? `${agentName} 没有可共享的模型配置` : '未配置大模型',
+    }
+  }
+
+  if (mode === 'follow-dsh') {
+    const d = fromDsh()
+    if (d) return { ...d, resolvedBy: 'dsh', host: getHostAgentInfo() }
     // If DSH directory is absent on this machine, fall cleanly to custom fields below
   }
-
-  const provider =
-    String(override.provider ?? fileCfg.provider ?? process.env.LLM_PROVIDER ?? 'custom').trim() ||
-    'custom'
-  const template = LLM_PROVIDER_TEMPLATES[provider] || LLM_PROVIDER_TEMPLATES.custom
-
-  const formatRaw = String(
-    override.format ?? fileCfg.format ?? process.env.LLM_FORMAT ?? template.defaultFormat ?? 'auto',
-  ).toLowerCase()
-  const format = VALID_FORMATS.has(formatRaw) ? normalizeProtocolFormat(formatRaw) : 'auto'
-
-  const baseUrl = String(
-    override.baseUrl ?? fileCfg.baseUrl ?? process.env.LLM_BASE_URL ?? template.defaultBaseUrl ?? '',
-  )
-    .trim()
-    .replace(/\/+$/, '')
-
-  const rawOverrideKey = override.apiKey !== undefined ? String(override.apiKey).trim() : undefined
-  const apiKey =
-    rawOverrideKey && rawOverrideKey !== 'KEEP_EXISTING' && !rawOverrideKey.includes('****')
-      ? rawOverrideKey
-      : String(fileCfg.apiKey ?? process.env.LLM_API_KEY ?? '').trim()
-
-  const model = String(
-    override.model ?? fileCfg.model ?? process.env.LLM_MODEL ?? '',
-  ).trim()
-
-  return {
-    mode: 'custom',
-    sourceLabel: template.label || '插件自定义模型',
-    dshProviderId: '',
-    provider,
-    format,
-    baseUrl,
-    apiKey,
-    model,
-    maxRepairRounds,
-    temperature,
-    maxTokens,
-  }
+  return { ...fromCustom(), resolvedBy: 'custom', host: getHostAgentInfo() }
 }
 
 export function getSafeLlmConfigSummary(dshHomeOverride = '') {
@@ -614,6 +796,11 @@ export function getSafeLlmConfigSummary(dshHomeOverride = '') {
     mode: cfg.mode,
     sourceLabel: cfg.sourceLabel,
     dshProviderId: fileCfg.dshProviderId || (cfg.mode === 'follow-dsh' ? 'active' : ''),
+    resolvedBy: cfg.resolvedBy || '',
+    host: cfg.host || getHostAgentInfo(),
+    hostEnv: discoverHostEnvLlm(),
+    hostEnvVar: cfg.hostEnvVar || '',
+    storedMode: String(fileCfg.mode || ''),
     provider: cfg.provider,
     format: cfg.format,
     detectedProtocol: detectWireProtocol(cfg),
@@ -637,9 +824,9 @@ export function saveLlmConfig(patch = {}) {
   mkdirSync(dirname(cfgPath), { recursive: true })
   const existing = readStoredConfigFile()
   const nextMode =
-    patch.mode === 'custom' || patch.mode === 'follow-dsh'
+    patch.mode === 'custom' || patch.mode === 'follow-dsh' || patch.mode === 'auto'
       ? patch.mode
-      : existing.mode || 'follow-dsh'
+      : existing.mode || 'auto'
 
   let nextApiKey = existing.apiKey || ''
   if (patch.clearApiKey === true) {
@@ -663,15 +850,19 @@ export function saveLlmConfig(patch = {}) {
     provider: String(patch.provider ?? existing.provider ?? 'custom').trim() || 'custom',
     format: nextFormat,
     baseUrl:
-      nextMode === 'follow-dsh'
-        ? existing.baseUrl || ''
-        : String(patch.baseUrl ?? existing.baseUrl ?? '').trim().replace(/\/+$/, ''),
-    // Never write DSH client keys into plugin config when following DSH
-    apiKey: nextMode === 'follow-dsh' ? existing.apiKey || '' : nextApiKey,
+      nextMode === 'custom'
+        ? String(patch.baseUrl ?? existing.baseUrl ?? '').trim().replace(/\/+$/, '')
+        : existing.baseUrl || '',
+    // Never write DSH client keys or the host agent's environment keys into the plugin config when following them;
+    // the plugin's own (custom) key is kept for when the user switches back
+    apiKey: nextMode === 'custom' ? nextApiKey : existing.apiKey || '',
+    // auto follows the host's model; a model picked in custom / follow-dsh is kept for those modes
     model:
-      patch.model !== undefined
-        ? String(patch.model).trim()
-        : existing.model || '',
+      nextMode === 'auto'
+        ? existing.model || ''
+        : patch.model !== undefined
+          ? String(patch.model).trim()
+          : existing.model || '',
     maxRepairRounds: Math.max(
       1,
       Math.min(5, Number(patch.maxRepairRounds ?? existing.maxRepairRounds ?? 3) || 3),
@@ -680,6 +871,8 @@ export function saveLlmConfig(patch = {}) {
       ? Number(patch.temperature ?? existing.temperature)
       : 0.45,
     maxTokens: Math.max(1024, Number(patch.maxTokens ?? existing.maxTokens ?? 16000) || 16000),
+    // v2 = the mode is the user's explicit choice (pre-v0.6 files stored 'follow-dsh' as the automatic default)
+    configVersion: 2,
     updatedAt: new Date().toISOString(),
   }
 
@@ -969,7 +1162,32 @@ async function readResponseTextSafe(res) {
   return await res.text()
 }
 
+/** Milliseconds a server asked us to wait (`retry-after-ms`, `Retry-After` seconds or HTTP date), 0 when absent. */
+export function parseRetryAfterMs(res) {
+  try {
+    const h = res?.headers
+    const get = (k) => {
+      if (!h) return ''
+      if (typeof h.get === 'function') return h.get(k) || ''
+      return h[k] || h[String(k).toLowerCase()] || ''
+    }
+    const ms = Number(get('retry-after-ms'))
+    if (Number.isFinite(ms) && ms > 0) return Math.round(ms)
+    const raw = String(get('retry-after') || '').trim()
+    if (!raw) return 0
+    const sec = Number(raw)
+    if (Number.isFinite(sec) && sec >= 0) return Math.round(sec * 1000)
+    const at = Date.parse(raw)
+    return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0
+  } catch {
+    return 0
+  }
+}
+
 function isTransientLlmError(err, status = 0, timeoutMs = 0) {
+  // Balance / quota failures (402, OpenAI 429 insufficient_quota, "余额不足" ...) are never retried
+  // (the HTTP status is part of the error message: "返回错误 (402): ...")
+  if (isBillingError(err)) return false
   if ([429, 502, 503, 504, 524].includes(status)) return true
   const msg = String(err?.message || err || '').toLowerCase()
   const code = String(err?.code || err?.cause?.code || '').toLowerCase()
@@ -999,6 +1217,7 @@ function isTransientLlmError(err, status = 0, timeoutMs = 0) {
  * Includes incremental stream reading + transient relay/network retries.
  */
 export async function callLlmChat({
+  onRetry,
   messages = [],
   system = '',
   temperature,
@@ -1046,7 +1265,7 @@ export async function callLlmChat({
           parts.push({
             type: 'image',
             mimeType: String(item.mimeType || 'image/jpeg'),
-            base64: String(item.base64).replace(/^data:[^;]+;base64,/, ''),
+            base64: String(item.base64).replace(/^data:.*?;base64,/, ''),
           })
         } else if (item.type === 'image_url' && item.image_url?.url) {
           const urlStr = String(item.image_url.url)
@@ -1173,11 +1392,63 @@ export async function callLlmChat({
     }
   }
 
-  const maxAttempts = fetchImpl === globalThis.fetch ? 3 : 2
-  const baseBackoffMs = fetchImpl === globalThis.fetch ? 1500 : 30
+  const realNetwork = fetchImpl === globalThis.fetch
+  const maxAttempts = realNetwork ? 3 : 2
+  const baseBackoffMs = realNetwork ? 1500 : 30
+  // Genuine rate limits (HTTP 429 that is not a balance / quota error): honour Retry-After (capped), otherwise back off
+  // 5 → 10 → 20 → 30 s, within a total wait budget per call. Relays commonly limit per minute, so 1.5 s + 3 s was
+  // never enough and a whole storyboard fell back to the rule engine.
+  const RATE_BACKOFF_MS = realNetwork ? [5000, 10000, 20000, 30000, 30000] : [30, 30]
+  const RATE_MAX_RETRIES = realNetwork ? 5 : 1
+  const RATE_WAIT_BUDGET_MS = realNetwork ? 90_000 : 1000
+  const RATE_MIN_WAIT_MS = realNetwork ? 2000 : 0
+  const RATE_MAX_WAIT_MS = realNetwork ? 60_000 : 60
   let lastErr = null
+  let transientRetries = 0
+  let rateRetries = 0
+  let rateWaitedMs = 0
+  const abortErr = () => signal?.reason || Object.assign(new Error('Request aborted'), { name: 'AbortError' })
+  const sleepAbortable = (ms) =>
+    new Promise((resolveSleep, rejectSleep) => {
+      if (signal?.aborted) return rejectSleep(abortErr())
+      const onAbortSleep = () => {
+        clearTimeout(t)
+        rejectSleep(abortErr())
+      }
+      const t = setTimeout(() => {
+        signal?.removeEventListener?.('abort', onAbortSleep)
+        resolveSleep()
+      }, Math.max(0, ms))
+      signal?.addEventListener?.('abort', onAbortSleep, { once: true })
+    })
+  // decide whether (and how long) to wait before the next attempt; null = give up
+  const planRetry = (err, status, res, tmo = 0) => {
+    if (status === 429 && !isBillingError(err)) {
+      const hinted = parseRetryAfterMs(res)
+      const backoff = RATE_BACKOFF_MS[Math.min(rateRetries, RATE_BACKOFF_MS.length - 1)]
+      const waitMs = Math.max(RATE_MIN_WAIT_MS, Math.min(RATE_MAX_WAIT_MS, hinted || backoff))
+      if (rateRetries < RATE_MAX_RETRIES && rateWaitedMs + waitMs <= RATE_WAIT_BUDGET_MS) {
+        rateRetries++
+        rateWaitedMs += waitMs
+        return { waitMs, reason: 'rate-limit' }
+      }
+      return null
+    }
+    if (transientRetries < maxAttempts - 1 && isTransientLlmError(err, status, tmo)) {
+      transientRetries++
+      const hinted = status === 503 ? Math.min(realNetwork ? 30_000 : 60, parseRetryAfterMs(res)) : 0
+      return { waitMs: Math.max(baseBackoffMs * transientRetries, hinted), reason: 'transient' }
+    }
+    return null
+  }
+  const waitBeforeRetry = async (plan, attemptNo, status, err) => {
+    try {
+      onRetry?.({ attempt: attemptNo, waitMs: plan.waitMs, status, reason: plan.reason, message: String(err?.message || err || '').slice(0, 300) })
+    } catch {}
+    await sleepAbortable(plan.waitMs)
+  }
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     if (signal?.aborted) {
       throw signal.reason || Object.assign(new Error('Request aborted'), { name: 'AbortError' })
     }
@@ -1214,11 +1485,14 @@ export async function callLlmChat({
           rawText.slice(0, 300) ||
           `HTTP ${res.status}`
         const httpErr = new Error(`大模型接口 (${protocol}) 返回错误 (${res.status}): ${msg}`)
-        if (attempt < maxAttempts && isTransientLlmError(httpErr, resStatus)) {
+        httpErr.status = res.status
+        const plan = planRetry(httpErr, resStatus, res)
+        if (plan) {
           lastErr = httpErr
-          await new Promise((r) => setTimeout(r, baseBackoffMs * attempt))
+          await waitBeforeRetry(plan, attempt, resStatus, httpErr)
           continue
         }
+        httpErr.retryDecided = true
         throw httpErr
       }
 
@@ -1227,11 +1501,13 @@ export async function callLlmChat({
         const emptyErr = parsed.streamError
           ? new Error(`大模型接口 (${protocol}) 返回错误: ${parsed.streamError}`)
           : new Error('大模型返回内容为空，请检查模型 ID、协议类型或额度限制。')
-        if (attempt < maxAttempts && parsed.streamError && isTransientLlmError(emptyErr, resStatus)) {
+        const plan = parsed.streamError ? planRetry(emptyErr, resStatus, res) : null
+        if (plan) {
           lastErr = emptyErr
-          await new Promise((r) => setTimeout(r, baseBackoffMs * attempt))
+          await waitBeforeRetry(plan, attempt, resStatus, emptyErr)
           continue
         }
+        emptyErr.retryDecided = true
         throw emptyErr
       }
 
@@ -1246,8 +1522,10 @@ export async function callLlmChat({
     } catch (err) {
       lastErr = err
       if (err?.name === 'AbortError' || signal?.aborted) throw err
-      if (attempt < maxAttempts && isTransientLlmError(err, resStatus, timeoutMs)) {
-        await new Promise((r) => setTimeout(r, baseBackoffMs * attempt))
+      if (err?.retryDecided) throw err
+      const plan = planRetry(err, resStatus, null, timeoutMs)
+      if (plan) {
+        await waitBeforeRetry(plan, attempt, resStatus, err)
         continue
       }
       throw err

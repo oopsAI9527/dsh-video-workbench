@@ -16,6 +16,7 @@ import {
   PRIMARY_SANS_STACK,
   resolveSafeZoneSpec,
 } from '../shared/index.js'
+import { scheduleFlashBudget } from './flash-budget.js'
 
 const PALETTES = {
   tech: {
@@ -119,25 +120,78 @@ function escapeHtml(str) {
 /**
  * Balance long titles into evenly-proportioned lines so we NEVER wrap 1-char orphans!
  */
-function formatBalancedTitle(rawTitle, maxLineChars = 11) {
+/** Unbreakable title units: Latin words / numbers stay whole (e.g. "AI", "2026", "340%"); CJK chars are single units. */
+export function tokenizeTitleUnits(txt) {
+  return String(txt || '').match(/[A-Za-z0-9][\w.+%#&'’\/-]*|\s+|./gsu) || []
+}
+
+/** Approximate rendered width in CJK-character units (full-width = 1, Latin/digits ≈ 0.56, space ≈ 0.3). */
+function titleUnitWidth(unit) {
+  let w = 0
+  for (const ch of unit) w += /[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF\u3000-\u303F]/u.test(ch) ? 1 : /\s/.test(ch) ? 0.3 : 0.56
+  return w
+}
+
+/** Word boundaries (UTF-16 offsets) from Intl.Segmenter, or null when unavailable. */
+function titleWordBoundaries(txt) {
+  try {
+    if (typeof Intl === 'undefined' || typeof Intl.Segmenter !== 'function') return null
+    const set = new Set()
+    for (const seg of new Intl.Segmenter('zh', { granularity: 'word' }).segment(txt)) set.add(seg.index + seg.segment.length)
+    return set
+  } catch {
+    return null
+  }
+}
+
+export function formatBalancedTitle(rawTitle, maxLineChars = 11) {
   const txt = String(rawTitle || '').trim()
   if (!txt) return ['']
   if (txt.includes('\n')) return txt.split('\n').map((s) => s.trim()).filter(Boolean)
-  if (txt.length <= maxLineChars) return [txt]
+  const units = tokenizeTitleUnits(txt)
+  const total = units.reduce((a, u) => a + titleUnitWidth(u), 0)
+  if (total <= maxLineChars) return [txt]
   const colonIdx = txt.search(/[：:]/)
   if (colonIdx > 2 && colonIdx < txt.length - 3) {
     return [txt.slice(0, colonIdx + 1).trim(), txt.slice(colonIdx + 1).trim()]
   }
-  const mid = Math.ceil(txt.length / 2)
-  return [txt.slice(0, mid).trim(), txt.slice(mid).trim()]
+  // Balanced split at a unit boundary (never inside a Latin word / number). Comma / space breaks beat an exact-middle
+  // cut, cutting inside a dictionary word is penalised, line 1 never ends with an opening bracket and line 2 never
+  // starts with closing punctuation.
+  const wordBounds = titleWordBoundaries(txt)
+  let best = -1
+  let bestScore = Infinity
+  let acc = 0
+  let charPos = 0
+  for (let i = 0; i < units.length - 1; i++) {
+    acc += titleUnitWidth(units[i])
+    charPos += units[i].length
+    const cur = units[i]
+    const next = units[i + 1]
+    if (/^[，。、！？；：,.!?;:）)》」』】%]/u.test(next)) continue
+    if (/[（(《「『【“‘]$/u.test(cur)) continue
+    let score = Math.abs(acc - total / 2)
+    const overflow = Math.max(acc, total - acc) - maxLineChars
+    if (overflow > 0) score += overflow * 1.5
+    if (/[，、,；;·—]$/u.test(cur)) score -= Math.max(0.9, total * 0.18)
+    else if (/^\s+$/.test(cur) || /^\s+$/.test(next)) score -= Math.max(0.6, total * 0.08)
+    else if (wordBounds && !wordBounds.has(charPos)) score += 1.2
+    if (score < bestScore) {
+      bestScore = score
+      best = i
+    }
+  }
+  if (best < 0) return [txt]
+  return [units.slice(0, best + 1).join('').trim(), units.slice(best + 1).join('').trim()].filter(Boolean)
 }
 
 function buildCharSpansHtml(lines, cls = 'k-ch') {
+  const charSpan = (ch) => `<span class="${cls}">${ch === ' ' ? '&nbsp;' : escapeHtml(ch)}</span>`
   return lines
     .map(
       (line) =>
-        `<div class="k-line-row">${[...line]
-          .map((ch) => `<span class="${cls}">${ch === ' ' ? '&nbsp;' : escapeHtml(ch)}</span>`)
+        `<div class="k-line-row">${tokenizeTitleUnits(line)
+          .map((u) => ([...u].length > 1 && /^[A-Za-z0-9]/.test(u) ? `<span class="k-word">${[...u].map(charSpan).join('')}</span>` : [...u].map(charSpan).join('')))
           .join('')}</div>`,
     )
     .join('')
@@ -746,6 +800,63 @@ function renderSceneTemplateHtml(scene, idx, total, theme) {
   return `<template class="scene-template" data-scene-id="${escapeHtml(scene.id)}" data-layout="${escapeHtml(layout)}"><div class="k-scene" data-scene-idx="${idx}">${contentHtml}</div></template>`
 }
 
+const HTML_HEAVY_IMPACT_LAYOUTS = ['kinetic-impact', 'radial-climax', '3d-stage-opener', 'mosaic-pulse-wall', 'narrative-diorama']
+const HTML_COMBAT_TEXT_RE = /斩|杀|破|战|冲|马|骑|箭|刀|剑|枪|锋|交锋|突袭|决战|单于|匈奴/
+
+/**
+ * Flash candidates of the HTML runtime (mirrors renderTransitions / the #fx-strobe block of the runtime below):
+ *   tx:i       the white flash at the cut into shot i (every kind but iris-circle / block-wipe) + the cut strobe
+ *   clash:i:e  the white frame of a weapon clash / heavy impact
+ *   beat:k     the strobe on strong beat k inside a combat-titled shot without an action plan
+ */
+export function planHtmlFlashBudget({ timeline = [], beats = [], fps = 30, script = null } = {}) {
+  const candidates = []
+  const cutFrames = []
+  const camIntFixed = Number(script?.audioProfile?.cameraBeatIntensity)
+  const sec = (s) => Math.max(1, Math.round(s * fps))
+  timeline.forEach((tl, i) => {
+    const camInt = Number.isFinite(camIntFixed)
+      ? camIntFixed
+      : HTML_HEAVY_IMPACT_LAYOUTS.includes(tl.layout) || script?.narrationMode === 'subtitle-mv'
+        ? 0.95
+        : 0.25
+    const hasActionMeta = Boolean(tl.actionMode)
+    if (i > 0) {
+      cutFrames.push(tl.startFrame)
+      const kind = tl.transition || 'iris-circle'
+      let lead = 0
+      let len = 0
+      if (kind === 'light-wipe') {
+        lead = sec(0.18)
+        len = sec(0.18) + 1
+      } else if (kind === 'glitch-cut') {
+        lead = 2
+        len = 3
+      } else if (kind !== 'iris-circle' && kind !== 'block-wipe') {
+        lead = 1
+        len = sec(0.22) + 1
+      }
+      const cutStrobe = tl.actionMode !== 'clean' && camInt >= 0.65 && !hasActionMeta
+      if (cutStrobe) len = Math.max(len, sec(0.24) + 1)
+      if (len > 0) {
+        candidates.push({ key: 'tx:' + i, frame: tl.startFrame, lead, len, prio: kind === 'flash-cut' ? 4 : 2, coversCut: tl.startFrame })
+      }
+    }
+    ;(tl.actionEvents || []).forEach((ev, e) => {
+      const k = String(ev.kind || '')
+      if (!(k.startsWith('metal_clash') || k === 'heavy_impact')) return
+      candidates.push({ key: 'clash:' + i + ':' + e, frame: tl.startFrame + Math.round(Number(ev.frame) || 0), len: 3, prio: k === 'metal_clash_heavy' || k === 'heavy_impact' ? 5 : 3 })
+    })
+    if (!hasActionMeta && camInt >= 0.7 && HTML_COMBAT_TEXT_RE.test(String(tl.title || '') + ' ' + String(tl.narration || ''))) {
+      beats.forEach((b, k) => {
+        const bf = Math.ceil((Number(b?.time) || 0) * fps)
+        if (b?.strong && bf >= tl.startFrame && bf < tl.endFrame) candidates.push({ key: 'beat:' + k, frame: bf, len: 2, prio: 1 })
+      })
+    }
+  })
+  return scheduleFlashBudget({ fps, candidates, cutFrames })
+}
+
 export function buildRichHtmlVideo(script) {
   const theme = { ...resolvePalette(script), brandMark: script?.brandMark || '' }
   const scenes = Array.isArray(script?.scenes) ? script.scenes : []
@@ -758,6 +869,10 @@ export function buildRichHtmlVideo(script) {
   const bundledFontFaceCss = buildBundledFontFaceCss('fonts')
   const landScale = width > height ? Math.max(0.42, Math.min(2.2, width / 1920)) : 1
   const lp = (n) => Math.max(1, Math.round(n * landScale))
+  // Room the bottom subtitle pill needs (bottom offset + one line + padding + margin): content must stay above it
+  const subFontPx = width < height ? 44 : Math.max(36, lp(script?.subtitleStyle === 'cinematic' || script?.narrationMode === 'subtitle-mv' ? 50 : 40))
+  const subBottomPx = Number(script?.subtitleBottomPx) || safeZone.subtitleBottomPx
+  const subReservePx = subBottomPx + Math.round(subFontPx * 1.28) + lp(20) + lp(22)
 
   const THREE_PRESET_CYCLE = [
     'orbital-core',
@@ -788,6 +903,11 @@ export function buildRichHtmlVideo(script) {
       durFrames,
       durSec: durFrames / fps,
       narration: s.narration || '',
+      title: s.title || '',
+      accentWords: Array.isArray(s.accentWords) ? s.accentWords : [],
+      cameraKeyframes: Array.isArray(s.cameraKeyframes) ? s.cameraKeyframes : [],
+      actionMode: String(s.actionMode || ''),
+      actionEvents: Array.isArray(s.actionEvents) ? s.actionEvents.map((e) => ({ frame: Number(e.frame) || 0, kind: String(e.kind || ''), intensity: Number(e.intensity) || 0.9 })) : [],
       subtitles: Array.isArray(s.subtitles) ? s.subtitles : [],
       counterTarget: Number(s.counterTarget) || 96,
       workflowSteps: Array.isArray(s.workflowSteps) ? s.workflowSteps : Array.isArray(script?.workflowSteps) ? script.workflowSteps : [],
@@ -800,6 +920,17 @@ export function buildRichHtmlVideo(script) {
   })
 
   const totalFrames = Math.max(30, Number(script?.totalDurationInFrames) || cursorFrame || 300)
+
+  // Photosensitivity guard: every full-screen flash the runtime can draw is scheduled here (shared flash budget:
+  // ≥ 0.5 s apart, ≤ 7 luminance steps per second, heavy clashes first); dropped ones are marked for the runtime.
+  const flashPlan = planHtmlFlashBudget({ timeline, beats, fps, script })
+  const payloadBeats = beats.map((b, k) => (flashPlan.dropped['beat:' + k] ? { ...b, noFlash: true } : b))
+  timeline.forEach((tl, i) => {
+    if (flashPlan.dropped['tx:' + i]) tl.noFlashIn = true
+    tl.actionEvents.forEach((ev, e) => {
+      if (flashPlan.dropped['clash:' + i + ':' + e]) ev.noFlash = true
+    })
+  })
   const templatesHtml = scenes.map((s, idx) => renderSceneTemplateHtml(s, idx, scenes.length, theme)).join('\n  ')
 
   const payloadJson = JSON.stringify({
@@ -813,12 +944,15 @@ export function buildRichHtmlVideo(script) {
     accent: theme.accent,
     accent2: theme.accent2,
     gold: theme.gold,
-    beats,
+    beats: payloadBeats,
+    narrationMode: script?.narrationMode || 'tts',
+    audioProfile: script?.audioProfile || null,
     visual3dMode: script?.visual3dMode || 'auto',
     avatarClip: script?.avatarClip || null,
     avatarLayout: script?.avatarLayout || 'pip-br',
     timeline,
-  })
+    // inlined into a <script>: `<` escaped so subtitle / narration text such as `</script>` cannot end the element
+  }).replace(/</g, '\\u003c')
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -862,7 +996,7 @@ export function buildRichHtmlVideo(script) {
     .layer { position: absolute; inset: 0; pointer-events: none; }
     canvas.layer { width: 100%; height: 100%; }
 
-    #scene-slots { position: absolute; inset: 0; overflow: hidden; }
+    #scene-slots { position: absolute; inset: 0; overflow: hidden; transform-origin: left center; }
     .k-scene { position: absolute; inset: 0; overflow: hidden; display: none; }
     .k-scene.active { display: block; }
 
@@ -924,7 +1058,7 @@ export function buildRichHtmlVideo(script) {
     /* Split Stage & Showcase Frames */
     .k-split-grid {
       position: relative; z-index: 4; width: 100%; height: 100%;
-      padding: ${lp(82)}px ${lp(105)}px ${Math.max(lp(164), (Number(script?.subtitleBottomPx) || safeZone.subtitleBottomPx) + lp(72))}px; display: flex; align-items: center; justify-content: space-between; gap: ${lp(52)}px;
+      padding: ${lp(82)}px ${lp(105)}px ${Math.max(lp(164), subReservePx)}px; display: flex; align-items: center; justify-content: space-between; gap: ${lp(52)}px;
     }
     .k-split-grid.k-reverse { flex-direction: row-reverse; }
     .k-left-col {
@@ -936,7 +1070,7 @@ export function buildRichHtmlVideo(script) {
 
     .k-center-stage {
       position: relative; z-index: 4; width: 100%; height: 100%;
-      padding: ${lp(84)}px ${lp(115)}px ${Math.max(lp(168), (Number(script?.subtitleBottomPx) || safeZone.subtitleBottomPx) + lp(72))}px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: ${lp(84)}px ${lp(115)}px ${Math.max(lp(168), subReservePx)}px; display: flex; flex-direction: column; align-items: center; justify-content: center;
       text-align: center; gap: ${lp(24)}px;
     }
 
@@ -955,6 +1089,7 @@ export function buildRichHtmlVideo(script) {
     .k-headline-md { font-size: ${lp(76)}px; }
     .k-headline-sm { font-size: ${lp(62)}px; }
     .k-line-row { display: block; }
+    .k-word { display: inline-block; white-space: nowrap; }
     .k-ch {
       display: inline-block;
       background: ${theme.titleGrad}; -webkit-background-clip: text; background-clip: text;
@@ -1062,8 +1197,12 @@ export function buildRichHtmlVideo(script) {
       background: linear-gradient(180deg, rgba(5,6,8,0.08) 0%, rgba(5,6,8,0.22) 48%, rgba(5,6,8,0.92) 100%);
     }
     .k-mosaic-overlay {
-      position: absolute; left: ${lp(96)}px; right: ${lp(96)}px; bottom: ${Math.max(lp(192), (Number(script?.subtitleBottomPx) || safeZone.subtitleBottomPx) + lp(78))}px; z-index: 6;
+      position: absolute; left: ${lp(96)}px; right: auto; max-width: calc(100% - ${lp(192)}px); bottom: ${Math.max(lp(192), subReservePx + lp(8))}px; z-index: 6;
       display: flex; align-items: flex-end; gap: ${lp(34)}px;
+      padding: ${lp(18)}px ${lp(32)}px ${lp(20)}px ${lp(20)}px; border-radius: ${lp(20)}px;
+      background: linear-gradient(100deg, rgba(5,7,11,0.92) 0%, rgba(5,7,11,0.78) 100%);
+      border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+      backdrop-filter: blur(${lp(12)}px); -webkit-backdrop-filter: blur(${lp(12)}px);
     }
     .k-counter-badge {
       display: flex; flex-direction: column; padding: ${lp(14)}px ${lp(24)}px; border-radius: ${lp(12)}px;
@@ -1129,12 +1268,18 @@ export function buildRichHtmlVideo(script) {
       display: flex; justify-content: center; pointer-events: none; z-index: 25;
     }
     #sub-pill {
-      padding: ${lp(8)}px ${lp(26)}px; border-radius: ${lp(10)}px;
-      background: rgba(5,7,11,0.78);
-      border: 1px solid rgba(255,255,255,0.14);
-      font-family: var(--font-sans); font-size: ${width < height ? 28 : Math.max(20, lp(32))}px; font-weight: 700; line-height: 1.35;
-      color: #FFFFFF; max-width: ${Math.round(width * 0.84)}px; text-align: center; white-space: ${width < height ? 'normal' : 'nowrap'};
-      text-shadow: 0 2px 8px rgba(0,0,0,0.92);
+      padding: ${lp(10)}px ${lp(30)}px; border-radius: ${lp(12)}px;
+      background: ${script?.subtitleStyle === 'cinematic' || script?.narrationMode === 'subtitle-mv' ? 'transparent' : 'rgba(5,7,11,0.82)'};
+      border: ${script?.subtitleStyle === 'cinematic' || script?.narrationMode === 'subtitle-mv' ? 'none' : '1.5px solid rgba(255,255,255,0.18)'};
+      font-family: ${script?.subtitleStyle === 'cinematic' || script?.narrationMode === 'subtitle-mv' ? 'var(--font-serif, var(--font-sans))' : 'var(--font-sans)'};
+      font-size: ${width < height ? 44 : Math.max(36, lp(script?.subtitleStyle === 'cinematic' || script?.narrationMode === 'subtitle-mv' ? 50 : 40))}px;
+      font-weight: 900; line-height: 1.28; letter-spacing: 0.04em;
+      color: #FFFDF7; max-width: ${Math.round(width * 0.90)}px; text-align: center; white-space: ${width < height ? 'normal' : 'nowrap'};
+      -webkit-text-stroke: 1.4px rgba(0,0,0,0.86); paint-order: stroke fill;
+      text-shadow: 0 4px 12px rgba(0,0,0,0.98), 0 0 8px rgba(0,0,0,0.95);
+    }
+    #fx-strobe {
+      position: absolute; inset: 0; pointer-events: none; z-index: 22; opacity: 0; mix-blend-mode: screen;
     }
     #progress-line {
       position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
@@ -1189,11 +1334,11 @@ export function buildRichHtmlVideo(script) {
     /* Portrait Responsive Adaptation (${width}x${height}) */
     .k-split-grid, .k-split-grid.k-reverse {
       flex-direction: column; justify-content: center; gap: 28px;
-      padding: ${Math.max(84, safeZone.safePaddingPx.top)}px ${Math.max(44, safeZone.safePaddingPx.right)}px ${Math.max(190, safeZone.subtitleBottomPx + 80)}px ${Math.max(44, safeZone.safePaddingPx.left)}px;
+      padding: ${Math.max(84, safeZone.safePaddingPx.top)}px ${Math.max(44, safeZone.safePaddingPx.right)}px ${Math.max(190, subReservePx)}px ${Math.max(44, safeZone.safePaddingPx.left)}px;
     }
     .k-left-col { width: 100%; align-items: center; text-align: center; }
     .k-right-col { width: 100%; }
-    .k-center-stage { padding: ${Math.max(84, safeZone.safePaddingPx.top)}px ${Math.max(44, safeZone.safePaddingPx.right)}px ${Math.max(190, safeZone.subtitleBottomPx + 80)}px ${Math.max(44, safeZone.safePaddingPx.left)}px; gap: 22px; }
+    .k-center-stage { padding: ${Math.max(84, safeZone.safePaddingPx.top)}px ${Math.max(44, safeZone.safePaddingPx.right)}px ${Math.max(190, subReservePx)}px ${Math.max(44, safeZone.safePaddingPx.left)}px; gap: 22px; }
     .k-headline { font-size: 58px; }
     .k-headline-lg { font-size: 66px; }
     .k-headline-md { font-size: 50px; }
@@ -1205,7 +1350,7 @@ export function buildRichHtmlVideo(script) {
       width: ${Math.round(width * 0.88)}px; height: ${Math.round(height * 0.52)}px;
       grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, 1fr); gap: 14px;
     }
-    .k-mosaic-overlay { left: 40px; right: 40px; bottom: ${Math.max(180, safeZone.subtitleBottomPx + 70)}px; flex-direction: column; align-items: flex-start; gap: 14px; }
+    .k-mosaic-overlay { left: 40px; right: 40px; max-width: none; bottom: ${Math.max(180, subReservePx + 8)}px; flex-direction: column; align-items: flex-start; gap: 14px; }
     .k-cnt-num { font-size: 52px; }
     .k-compare-row { flex-direction: column; gap: 20px; }
     .k-cmp-card { max-width: 100%; width: 100%; padding: 28px 24px; }
@@ -1231,7 +1376,7 @@ export function buildRichHtmlVideo(script) {
     /* Product Showcase Windows, Focus Camera, Fan Opener, Workflow, A/B Wipe, Dashboard & Trio */
     .k-app-stage {
       position: absolute; inset: 0; z-index: 4;
-      padding: ${lp(86)}px ${lp(68)}px ${Math.max(lp(158), (Number(script?.subtitleBottomPx) || safeZone.subtitleBottomPx) + lp(68))}px;
+      padding: ${lp(86)}px ${lp(68)}px ${Math.max(lp(158), subReservePx)}px;
       display: flex; flex-direction: column; align-items: center; justify-content: center; gap: ${lp(16)}px;
     }
     .k-fan-stage { gap: ${lp(18)}px; }
@@ -1453,6 +1598,7 @@ export function buildRichHtmlVideo(script) {
     <div id="glc" class="layer"></div>
     <canvas id="trc" class="layer" width="${width}" height="${height}"></canvas>
     <div id="flash" class="layer"></div>
+    <div id="fx-strobe" class="layer"></div>
     <div id="chrome-hud" class="layer">
       <div id="c-tl" class="k-corner"></div>
       <div id="c-tr" class="k-corner"></div>
@@ -1483,6 +1629,52 @@ export function buildRichHtmlVideo(script) {
     const glcEl = document.getElementById('glc');
     const flashEl = document.getElementById('flash');
     const subPill = document.getElementById('sub-pill');
+    const subWrap = document.getElementById('sub-wrap');
+    let subFitBase = null;
+    let subFitFonts = '';
+    function fitSubtitlePill() {
+      if (!subPill || !subWrap) return;
+      if (!subFitBase) {
+        const cs0 = getComputedStyle(subPill);
+        const fs0 = parseFloat(cs0.fontSize) || 40;
+        subFitBase = {
+          font: fs0,
+          white: cs0.whiteSpace,
+          lineH: (parseFloat(cs0.lineHeight) || fs0 * 1.28) / fs0,
+          padV: (parseFloat(cs0.paddingTop) || 0) + (parseFloat(cs0.paddingBottom) || 0),
+          bottom: parseFloat(getComputedStyle(subWrap).bottom) || 0,
+        };
+      }
+      const b = subFitBase;
+      const laneW = subWrap.clientWidth - (parseFloat(getComputedStyle(subWrap).paddingLeft) || 0) - (parseFloat(getComputedStyle(subWrap).paddingRight) || 0);
+      subPill.style.maxWidth = laneW > 0 ? Math.min(Math.round(CFG.width * 0.9), Math.floor(laneW)) + 'px' : '';
+      subPill.style.fontSize = b.font + 'px';
+      subPill.style.whiteSpace = b.white;
+      subPill.style.removeProperty('text-wrap');
+      subWrap.style.bottom = b.bottom + 'px';
+      const overflowX = () => subPill.scrollWidth > subPill.clientWidth + 1;
+      let font = b.font;
+      if (b.white === 'nowrap') {
+        if (!overflowX()) return;
+        const ratio = subPill.clientWidth / Math.max(1, subPill.scrollWidth);
+        if (ratio >= 0.8) {
+          font = Math.floor(b.font * ratio * 0.985);
+          subPill.style.fontSize = font + 'px';
+          if (!overflowX()) return;
+        }
+        font = Math.round(b.font * 0.86);
+        subPill.style.whiteSpace = 'normal';
+        subPill.style.setProperty('text-wrap', 'balance');
+        subPill.style.fontSize = font + 'px';
+      }
+      // at most two lines: keep shrinking (down to 62 %) until it fits
+      for (let g = 0; g < 10 && subPill.clientHeight - b.padV > font * b.lineH * 2.25 && font > b.font * 0.62; g++) {
+        font = Math.round(font * 0.94);
+        subPill.style.fontSize = font + 'px';
+      }
+      const extra = subPill.offsetHeight - (b.font * b.lineH + b.padV);
+      if (extra > 1) subWrap.style.bottom = Math.max(Math.round(CFG.height * 0.035), Math.round(b.bottom - extra)) + 'px';
+    }
     const progFill = document.getElementById('progress-fill');
     const endNoticeWrap = document.getElementById('end-notice-wrap');
 
@@ -1518,6 +1710,21 @@ export function buildRichHtmlVideo(script) {
         if (dt > 0.5) break;
         if (onlyStrong && !b.strong) continue;
         v = Math.max(v, Math.exp(-dt * 11) * (b.strong ? 1 : 0.45));
+      }
+      return v;
+    }
+
+    // strong-beat pulse for the beat strobe: beats the photosensitivity budget dropped (noFlash) do not strobe
+    function strobeBeatPulse(t) {
+      let v = 0;
+      const beats = CFG.beats || [];
+      for (let i = beats.length - 1; i >= 0; i--) {
+        const b = beats[i];
+        if (b.time > t) continue;
+        const dt = t - b.time;
+        if (dt > 0.5) break;
+        if (!b.strong || b.noFlash) continue;
+        v = Math.max(v, Math.exp(-dt * 11));
       }
       return v;
     }
@@ -1953,19 +2160,19 @@ export function buildRichHtmlVideo(script) {
           const p = pr(t, cut - d / 2, cut + d / 2);
           if (p > 0 && p < 1) {
             drawScanSweep(trc, t, cut - d / 2, d, CFG.rgbGold);
-            flashVal = Math.max(flashVal, Math.sin(p * Math.PI) * 0.45);
+            if (!sc.noFlashIn) flashVal = Math.max(flashVal, Math.sin(p * Math.PI) * 0.45);
           }
         } else if (kind === 'glitch-cut') {
           const d = 0.28;
           const x = pr(t, cut - d / 2, cut + d / 2);
           if (x > 0 && x < 1) {
             glitchVal = Math.max(glitchVal, Math.sin(x * Math.PI));
-            flashVal = Math.max(flashVal, Math.exp(-Math.abs(t - cut) * 18) * 0.45);
+            if (!sc.noFlashIn) flashVal = Math.max(flashVal, Math.exp(-Math.abs(t - cut) * 18) * 0.45);
           }
         } else {
-          // zoom-punch flash
+          // zoom-punch flash (skipped when the photosensitivity budget dropped it: sc.noFlashIn)
           const dt = t - cut;
-          if (dt >= -0.02 && dt <= 0.22) {
+          if (!sc.noFlashIn && dt >= -0.02 && dt <= 0.22) {
             flashVal = Math.max(flashVal, Math.exp(-Math.max(0, dt) * 16) * 0.55);
           }
         }
@@ -2007,12 +2214,65 @@ export function buildRichHtmlVideo(script) {
         }
       });
 
-      // Global #world camera rig: subtle beat pulse + restrained shake on impact scenes only
-      const isHeavyImpact = ['kinetic-impact', 'radial-climax', '3d-stage-opener', 'mosaic-pulse-wall'].includes(meta.layout);
-      const [shX, shY] = isHeavyImpact ? shakeAt(t, meta.startSec, 0.28, 9) : [0, 0];
-      const punch = isHeavyImpact && pr(localT, 0, 0.30) < 1 ? (1 - EZ.out(pr(localT, 0, 0.30))) * 0.032 : 0;
-      const camZoom = 1 + beatPulse(t, true) * (isHeavyImpact ? 0.010 : 0.004) + punch;
-      worldEl.style.transform = 'translate(' + shX.toFixed(1) + 'px,' + shY.toFixed(1) + 'px) scale(' + camZoom.toFixed(4) + ')';
+      // Global #world keyframe camera rig: directional pan/zoom + beat-locked combat shake + high-frequency strobe flash
+      const isHeavyImpact = ['kinetic-impact', 'radial-climax', '3d-stage-opener', 'mosaic-pulse-wall', 'narrative-diorama'].includes(meta.layout) || CFG.narrationMode === 'subtitle-mv';
+      const camInt = Number.isFinite(Number(CFG.audioProfile?.cameraBeatIntensity)) ? Number(CFG.audioProfile.cameraBeatIntensity) : (isHeavyImpact ? 0.95 : 0.25);
+      const isCombatMeta = /斩|杀|破|战|冲|马|骑|箭|刀|剑|枪|锋|交锋|突袭|决战|单于|匈奴/.test(String(meta.title || '') + ' ' + String(meta.narration || ''));
+      const hasActionMeta = Boolean(meta.actionMode);
+      const isCleanMeta = meta.actionMode === 'clean';
+      const localFrameN = f - (meta.startFrame || 0);
+      let clashShock = 0, clashFlashV = 0;
+      if (Array.isArray(meta.actionEvents)) {
+        for (const ev of meta.actionEvents) {
+          const hit = ev.kind === 'metal_clash' || ev.kind === 'metal_clash_hi' || ev.kind === 'metal_clash_heavy' || ev.kind === 'heavy_impact' || ev.kind === 'war_drum';
+          if (!hit) continue;
+          const age = localFrameN - ev.frame;
+          if (age >= 0 && age < 10) {
+            const w = ev.intensity * (ev.kind === 'metal_clash_heavy' || ev.kind === 'heavy_impact' ? 1.25 : 1);
+            clashShock = Math.max(clashShock, Math.exp(-age * 0.42) * w);
+            if (age < 3 && ev.kind !== 'war_drum' && !ev.noFlash) clashFlashV = Math.max(clashFlashV, (age === 0 ? 0.44 : age === 1 ? 0.22 : 0.08) * w);
+          }
+        }
+      }
+      const bpStrong = beatPulse(t, true);
+      const [shX, shY] = camInt > 0.05 && !isCleanMeta && !hasActionMeta ? shakeAt(t, meta.startSec, isCombatMeta ? 0.42 : 0.28, (isCombatMeta ? 18 : 10) * camInt) : [0, 0];
+      const evShakeX = clashShock * Math.sin(localFrameN * 6.9 + activeIdx * 1.7) * 14 * camInt;
+      const evShakeY = clashShock * Math.cos(localFrameN * 7.5 + activeIdx * 2.3) * 10 * camInt;
+      const beatShakeX = !hasActionMeta && camInt > 0.4 && bpStrong > 0.45 ? Math.sin(t * 78 + activeIdx) * (bpStrong - 0.45) * (isCombatMeta ? 24 : 11) * camInt : evShakeX;
+      const beatShakeY = !hasActionMeta && camInt > 0.4 && bpStrong > 0.45 ? Math.cos(t * 86 + activeIdx) * (bpStrong - 0.45) * (isCombatMeta ? 16 : 8) * camInt : evShakeY;
+      let kfX = 0, kfY = 0, kfScale = 1, kfRot = 0;
+      if (Array.isArray(meta.cameraKeyframes) && meta.cameraKeyframes.length >= 2) {
+        const sortedKf = [...meta.cameraKeyframes].sort((a, b) => Number(a.t || 0) - Number(b.t || 0));
+        let ka = sortedKf[0], kb = sortedKf[sortedKf.length - 1];
+        for (let ki = 0; ki < sortedKf.length - 1; ki++) {
+          if (p >= Number(sortedKf[ki].t || 0) && p <= Number(sortedKf[ki + 1].t || 1)) { ka = sortedKf[ki]; kb = sortedKf[ki + 1]; break; }
+        }
+        const ku = clamp((p - Number(ka.t || 0)) / Math.max(0.001, Number(kb.t || 1) - Number(ka.t || 0)));
+        const ke = ku * ku * (3 - 2 * ku);
+        kfX = lerp(Number(ka.x || 0), Number(kb.x || 0), ke);
+        kfY = lerp(Number(ka.y || 0), Number(kb.y || 0), ke);
+        kfScale = lerp(Number(ka.scale ?? 1), Number(kb.scale ?? 1), ke);
+        kfRot = lerp(Number(ka.rotate || 0), Number(kb.rotate || 0), ke);
+      } else if (camInt > 0.2) {
+        const dir = activeIdx % 4;
+        kfScale = dir % 2 === 0 ? lerp(1.0, 1.0 + 0.07 * camInt, p) : lerp(1.0 + 0.08 * camInt, 1.0, p);
+        kfX = dir === 0 ? lerp(-16 * camInt, 16 * camInt, p) : dir === 1 ? lerp(18 * camInt, -18 * camInt, p) : 0;
+        kfY = dir === 2 ? lerp(12 * camInt, -12 * camInt, p) : dir === 3 ? lerp(-12 * camInt, 12 * camInt, p) : 0;
+      }
+      const punch = camInt > 0.2 && pr(localT, 0, 0.34) < 1 ? (1 - EZ.out(pr(localT, 0, 0.34))) * (isCombatMeta ? 0.12 : 0.06) * camInt : 0;
+      const camZoom = Math.max(1, kfScale + bpStrong * (isCombatMeta ? 0.048 : 0.018) * camInt + punch);
+      const camRot = kfRot + (isCombatMeta && bpStrong > 0.5 ? Math.sin(t * 64) * 1.1 * camInt : 0);
+      worldEl.style.transform = 'translate(' + (kfX + shX + beatShakeX).toFixed(1) + 'px,' + (kfY + shY + beatShakeY).toFixed(1) + 'px) rotate(' + camRot.toFixed(2) + 'deg) scale(' + camZoom.toFixed(4) + ')';
+      const strobeEl = document.getElementById('fx-strobe');
+      if (strobeEl) {
+        // one decaying pulse per cut (a double pulse is two flashes), only when the cut's flash was kept
+        const cutStrobe = !isCleanMeta && activeIdx > 0 && camInt >= 0.65 && localT < 0.24 && !hasActionMeta && !meta.noFlashIn ? (localT < 0.07 ? 0.52 : localT < 0.13 ? 0.2 : localT < 0.19 ? 0.08 : 0.03) * camInt : 0;
+        const bpStrobe = strobeBeatPulse(t);
+        const beatStrobe = !hasActionMeta && isCombatMeta && camInt >= 0.7 && bpStrobe > 0.72 ? (bpStrobe - 0.72) * 1.15 * camInt : 0;
+        const stAlpha = Math.min(0.56, Math.max(cutStrobe, beatStrobe, clashFlashV));
+        strobeEl.style.background = isCombatMeta ? '#FFE8C2' : '#FFFFFF';
+        strobeEl.style.opacity = stAlpha.toFixed(3);
+      }
 
       // Render Background Canvas (#fxb)
       fxb.clearRect(0, 0, CFG.width, CFG.height);
@@ -2412,7 +2672,30 @@ export function buildRichHtmlVideo(script) {
       }
       if (txt) {
         subPill.style.display = 'block';
-        if (subPill.textContent !== txt) subPill.textContent = txt;
+        if (subPill.dataset.raw !== txt) {
+          subPill.dataset.raw = txt;
+          const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const crimsonRx = /(私生子|匈奴|单于|楼兰|斩首|斩杀|斩|杀过去|杀|破阵|血战|血|死|战神|战|陨落|突袭|绝杀|锋芒|交锋|伏击|重围|决战|狂奔|冲锋|最前面|王庭|铁骑)/g;
+          const goldRx = /(霍去病|冠军侯|大将军|皇后|汉武帝|卫青|大汉|封狼居胥|饮马瀚海|河西走廊|河西|祁连山|焉支山|丝绸之路|茂陵|长安|汉军|漠北|漠南|秦始皇|项羽|霸王|公元前?\d+年?|前\d+年|\d+[万千百十亿]+[余多]?[人骑里年岁战]?|\d+岁|\d+年|\d+里)/g;
+          let htmlTxt = esc(txt)
+            .replace(crimsonRx, '<span style="color:#FF3B30;text-shadow:0 0 18px rgba(255,59,48,0.65),0 3px 10px #000">$1</span>')
+            .replace(goldRx, '<span style="color:#FFD84D;text-shadow:0 0 18px rgba(255,216,77,0.58),0 3px 10px #000">$1</span>');
+          const accents = Array.isArray(meta.accentWords) ? meta.accentWords : [];
+          accents.forEach((kw, ki) => {
+            const cleanKw = esc(String(kw || '').trim());
+            if (cleanKw && !htmlTxt.includes('>' + cleanKw + '<')) {
+              const col = ki % 2 === 0 ? '#FFD84D' : '#FF3B30';
+              htmlTxt = htmlTxt.split(cleanKw).join('<span style="color:' + col + ';text-shadow:0 0 16px ' + col + '99,0 3px 10px #000">' + cleanKw + '</span>');
+            }
+          });
+          subPill.innerHTML = htmlTxt;
+          subFitFonts = '';
+        }
+        const fontsState = (document.fonts && document.fonts.status) || 'loaded';
+        if (subFitFonts !== fontsState) {
+          subFitFonts = fontsState;
+          fitSubtitlePill();
+        }
       } else {
         subPill.style.display = 'none';
       }
@@ -2427,6 +2710,36 @@ export function buildRichHtmlVideo(script) {
     const avatarVideo = document.getElementById('avatar-overlay-video');
     let loadedAvatarSrc = '';
 
+    // Landscape corner PiP: shift the subtitle lane beside the avatar and scale the scene slots into the free lane.
+    let pipLaneKey = '';
+    function applyPipLane(layout, isPortrait) {
+      const corner = layout === 'pip-br' || layout === 'pip-bl';
+      const key = corner && !isPortrait ? layout : 'none';
+      if (key === pipLaneKey) return;
+      pipLaneKey = key;
+      if (key === 'none') {
+        if (subWrap) { subWrap.style.paddingLeft = ''; subWrap.style.paddingRight = ''; }
+        if (slotsEl) slotsEl.style.transform = '';
+        subFitBase = null;
+        fitSubtitlePill();
+        return;
+      }
+      const boxW = Math.round(CFG.width * 0.22);
+      const reserve = boxW + 42 + 28;
+      const onLeft = layout === 'pip-bl';
+      if (subWrap) {
+        subWrap.style.paddingLeft = onLeft ? reserve + 'px' : '';
+        subWrap.style.paddingRight = onLeft ? '' : reserve + 'px';
+      }
+      if (slotsEl) {
+        const k = Math.max(0.7, Math.min(1, (CFG.width - reserve) / CFG.width));
+        slotsEl.style.transformOrigin = onLeft ? 'right center' : 'left center';
+        slotsEl.style.transform = 'scale(' + k.toFixed(4) + ')';
+      }
+      subFitBase = null;
+      fitSubtitlePill();
+    }
+
     async function syncAvatarOverlay(frameNum) {
       if (!avatarWrap || !avatarVideo) return;
       const item = (CFG.timeline || []).find((s) => frameNum >= s.startFrame && frameNum < s.endFrame) || (CFG.timeline || [])[0];
@@ -2434,6 +2747,7 @@ export function buildRichHtmlVideo(script) {
       const layout = item?.avatarLayout || clip?.layout || CFG.avatarLayout || 'pip-br';
       if (!clip?.path || layout === 'off') {
         avatarWrap.style.display = 'none';
+        applyPipLane('off', CFG.width < CFG.height);
         return;
       }
       const cleanRel = String(clip.path).replace(/^\\.?[\\\\/]+/, '').replace(/\\\\/g, '/');
@@ -2471,6 +2785,7 @@ export function buildRichHtmlVideo(script) {
         avatarWrap.style.left = layout === 'pip-bl' ? sidePx + 'px' : 'auto';
         avatarWrap.style.right = layout === 'pip-bl' ? 'auto' : sidePx + 'px';
       }
+      applyPipLane(layout, isPortrait);
       if (avatarVideo.readyState >= 1) {
         const dur = Number.isFinite(avatarVideo.duration) && avatarVideo.duration > 0.2 ? avatarVideo.duration : 10;
         const targetSec = (frameNum / Math.max(1, CFG.fps)) % dur;

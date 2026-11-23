@@ -898,14 +898,34 @@ export const NarrativeDioramaStage: React.FC<NarrativeDioramaStageProps> = ({ sc
   // Beat camera kick & cut shockwave shake
   const cutShakeX = localFrame < 8 ? Math.sin(localFrame * 3.7) * (8 - localFrame) * 1.6 : 0
   const cutShakeY = localFrame < 8 ? Math.cos(localFrame * 4.3) * (8 - localFrame) * 1.2 : 0
-  const actionShake = (/slash|oath|cavalry|duel/i.test(archetype) && isHitFrame) ? 11 : 0
+  // Event-driven combat VFX: when the choreographer has planned this shot (scene.actionMode), slash bursts fire
+  // ONLY on real contact frames (scene.actionEvents) and the camera shake comes from the outer event rig;
+  // clean / cavalry shots get no slash burst at all. Legacy scenes without action metadata keep the old timing.
+  const actionModeStr = String(scene?.actionMode || '')
+  const hasActionPlan = actionModeStr.length > 0
+  const contactFrames: number[] = (Array.isArray(scene?.actionEvents) ? scene.actionEvents : [])
+    .filter((ev: any) => /^(metal_clash|metal_clash_hi|metal_clash_heavy|heavy_impact)$/.test(String(ev?.kind || '')))
+    .map((ev: any) => Number(ev?.frame))
+    .filter((f: number) => Number.isFinite(f))
+  let burstProgress = progress
+  if (hasActionPlan) {
+    let lastF = -1
+    for (const f of contactFrames) if (f <= localFrame + 7 && f > lastF) lastF = f
+    // SlashBurstOverlay draws its arc over progress 0.06→0.36 and peaks the burst at 0.28: peak on the contact frame
+    burstProgress = lastF >= 0 ? 0.28 + (localFrame - lastF) / 32 : 0
+  }
+  const showBurst = !hasActionPlan || burstProgress > 0.01
+  const actionShake = !hasActionPlan && /slash|oath|cavalry|duel/i.test(archetype) && isHitFrame ? 11 : 0
   const camPanX = Math.sin(idx * 1.7 + progress * Math.PI) * 30
   const camPanY = Math.cos(idx * 2.1 + progress * Math.PI) * 10
   const camZoom = 1.02 + progress * 0.068 + pulse * 0.032 + strongPulse * 0.02
 
-  const flashAlpha = scene?.transitionKind === 'flash-cut' || scene?.transition === 'flash-cut' || /slash|cavalry/i.test(archetype)
-    ? interpolate(localFrame, [0, 5], [0.52, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
-    : interpolate(localFrame, [0, 3], [0.2, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
+  // scene.flashAllowed === false: the composition's photosensitivity budget dropped this shot's entry flash
+  const flashAlpha = scene?.flashAllowed === false
+    ? 0
+    : scene?.transitionKind === 'flash-cut' || scene?.transition === 'flash-cut' || /slash|cavalry/i.test(archetype)
+      ? interpolate(localFrame, [0, 5], [0.52, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
+      : interpolate(localFrame, [0, 3], [0.2, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
 
   const heroItems = Array.isArray(spec.plaques) && spec.plaques.length > 0
     ? spec.plaques
@@ -1090,7 +1110,7 @@ export const NarrativeDioramaStage: React.FC<NarrativeDioramaStageProps> = ({ sc
                 <polyline points="-10,-52 8,-18 -6,6" fill="none" stroke={pal.sunCore} strokeWidth={4} />
               </g>
               <HeroWarriorFigure x={620} y={845} scale={1.14} frame={localFrame} progress={progress} beatPulse={pulse} pal={pal} headwear="plume" weapon="raised-arm" />
-              <SlashBurstOverlay progress={progress} pal={pal} cx={880} cy={635} seed={3} />
+              {showBurst ? <SlashBurstOverlay progress={burstProgress} pal={pal} cx={880} cy={635} seed={3} /> : null}
             </g>
           ) : null}
 
@@ -1129,7 +1149,7 @@ export const NarrativeDioramaStage: React.FC<NarrativeDioramaStageProps> = ({ sc
                 <polygon points="248,-172 214,-178 222,-154" fill="#FFFFFF" />
                 <path d="M214,-162 Q194,-138 176,-126" fill="none" stroke={pal.crimson} strokeWidth={8} strokeLinecap="round" />
               </g>
-              <SlashBurstOverlay progress={progress} pal={pal} cx={1120} cy={560} seed={idx + 2} />
+              {showBurst ? <SlashBurstOverlay progress={burstProgress} pal={pal} cx={1120} cy={560} seed={idx + 2} /> : null}
             </g>
           ) : null}
 
@@ -1147,7 +1167,7 @@ export const NarrativeDioramaStage: React.FC<NarrativeDioramaStageProps> = ({ sc
                   </g>
                 )
               })}
-              <SlashBurstOverlay progress={progress} pal={pal} cx={1020} cy={555} seed={idx + 7} />
+              {showBurst ? <SlashBurstOverlay progress={burstProgress} pal={pal} cx={1020} cy={555} seed={idx + 7} /> : null}
             </g>
           ) : null}
 
@@ -1155,7 +1175,7 @@ export const NarrativeDioramaStage: React.FC<NarrativeDioramaStageProps> = ({ sc
             <g>
               <HeroWarriorFigure x={Math.round(470 + progress * 125)} y={855} scale={1.18} frame={localFrame} progress={progress} beatPulse={pulse} pal={pal} headwear="plume" weapon={resolvedBannerChar === '汉' ? 'spear' : 'sword'} />
               <HeroWarriorFigure x={Math.round(1450 - progress * 125)} y={855} scale={1.18} frame={localFrame} progress={progress} beatPulse={pulse} pal={pal} headwear="helmet" weapon="halberd" flip={true} />
-              <SlashBurstOverlay progress={progress} pal={pal} cx={960} cy={575} seed={9} />
+              {showBurst ? <SlashBurstOverlay progress={burstProgress} pal={pal} cx={960} cy={575} seed={9} /> : null}
             </g>
           ) : null}
 

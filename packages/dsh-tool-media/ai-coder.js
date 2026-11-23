@@ -21,6 +21,7 @@ import {
   resolveLowSpecPolicy,
   resolveTargetDurationPolicy,
   resolveVideoDimensions,
+  scriptJsonForHtml,
   splitDirectorBrief,
   stripMetaInstructions,
   toTtsText,
@@ -29,7 +30,7 @@ import {
 import { castVoicesWithLlm, executeGenerateSpeech, getActiveTtsEngineId, matchAllScenesInScript } from '../dsh-tool-local-tts/index.js'
 import { executeVideoLint, executeVideoRender, runTypecheckOnProject, scanAiGeneratedCodeSandbox } from '../dsh-tool-video-suite/index.js'
 import { importAssets, readAssets } from './asset-manager.js'
-import { buildGenreGuidance, detectGenre, resolveGenreSelection } from './genre-router.js'
+import { buildGenreGuidance, detectGenre, isHistoricalContent, resolveGenreSelection } from './genre-router.js'
 import {
   analyzeAudioBeatStructure,
   buildBeatGrid,
@@ -42,9 +43,35 @@ import { normalizeTransitionKind, runSchemaDirectorWithDegradation } from './pla
 import { masterVoiceTracks } from './voice-master.js'
 import { buildRichHtmlVideo, resolvePalette } from './html-generator.js'
 import { callLlmChat, extractJsonFromLlmText, resolveLlmConfig } from './llm-client.js'
+import { applyFigureStyleChoice, buildFigureStylePlanDirective, inferFigureStyle, resolveFigureStyleNote, writeFigureKitRemotionLib } from './figure-kit.js'
 import { writeNarrativeDioramaRemotionLib } from './narrative-diorama.js'
+import { auditToolUsage, buildToolUpgradePrompt, planSceneTools, summarizeToolAudit } from './scene-tool-plan.js'
+import { buildVisualFixRequest, buildVisualReviewRequest, isVisionUnsupportedError, parseVisualReview } from './visual-review.js'
+import { planSceneKeyframes, renderSceneKeyframes } from '../dsh-tool-video-suite/scene-keyframes.js'
 import { syncRemotionPublicAssets, writeRemotionProjectFiles } from './remotion-generator.js'
 import { buildMediaDimsMap, groundVisualAssets } from './vision-grounding.js'
+import { billingErrorFromText, createBillingSentinel, isBillingError, toBillingError } from './cloud-ledger.js'
+import { stripPlazaTemplateGuidance } from './plaza-guidance.js'
+import {
+  createProjectSnapshot,
+  diffProjectVersions,
+  listRollbackCandidates,
+  restoreProjectVersion,
+  rollbackToPreviousVersion,
+} from './project-history.js'
+import {
+  applyLockedRegistryBlock,
+  applyUserOverrides,
+  getLockedSceneIds,
+  preserveLockedSceneModules,
+  reassertLockedScenes,
+  reconcileUserEdits,
+  restoreLockedSceneSfx,
+  snapshotLockedSceneAudio,
+  summarizeEditMerge,
+  writeLockedRegistryBlock,
+} from './scene-locks.js'
+import { applyLockedHtmlStore, filterRefinePatch, prepareTargetedRefine, restoreLockedHtmlScenes, syncLockedHtmlStore } from './region-refine.js'
 import {
   buildBatchedRemotionScenesPrompt,
   buildDirectorPromptPackage,
@@ -52,6 +79,15 @@ import {
   buildRemotionCoderSkillsPrompt,
   writeShotcraftRemotionLib,
 } from './shotcraft-lib.js'
+import {
+  applyStyleDecision,
+  buildStylePlanDirective,
+  currentStyleDecision,
+  decidePlanStyle,
+  resolveStyleRequest,
+  styleMoodKey,
+  withStyleGuide,
+} from './style-presets.js'
 
 function safeRelCodePath(rawPath, engine) {
   const clean = normalize(String(rawPath || '').replace(/\\/g, '/'))
@@ -74,83 +110,87 @@ function safeRelCodePath(rawPath, engine) {
   return ''
 }
 
-export function snapshotProjectVersion(projectDir, label = 'auto') {
-  const absDir = resolve(projectDir)
-  const histRoot = join(absDir, 'history')
-  mkdirSync(histRoot, { recursive: true })
-  const stamp = `${Date.now()}-${label.replace(/[^a-z0-9_-]/gi, '')}`
-  const snapDir = join(histRoot, `v-${stamp}`)
-  mkdirSync(snapDir, { recursive: true })
-
-  for (const item of ['script.json', 'index.html', 'src', 'output/ai_build_log.json']) {
-    const src = join(absDir, item)
-    const dst = join(snapDir, item)
-    if (existsSync(src)) {
-      mkdirSync(dirname(dst), { recursive: true })
-      cpSync(src, dst, { recursive: true })
-    }
+/**
+ * Snapshot the project into the unified content-addressed history (`history/objects` +
+ * `history/versions.json`, see project-history.js). Identical states are deduplicated.
+ */
+export function snapshotProjectVersion(projectDir, label = 'auto', opts = {}) {
+  try {
+    return createProjectSnapshot(resolve(projectDir), {
+      label,
+      stage: opts.stage || label,
+      author: opts.author || 'ai',
+      kind: opts.kind || 'checkpoint',
+      note: opts.note || '',
+      runId: opts.runId || '',
+    })
+  } catch {
+    return null
   }
-  return snapDir
 }
 
+/**
+ * Versions an undo ("撤回") can step back to (newest first). Legacy `history/v-*` directory
+ * snapshots are migrated into the unified store on first access.
+ */
 export function getAiCodingHistory(projectDir) {
-  const absDir = resolve(projectDir)
-  const histRoot = join(absDir, 'history')
-  if (!existsSync(histRoot)) return []
-  return readdirSync(histRoot, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && d.name.startsWith('v-') && !d.name.endsWith('-restored'))
-    .map((d) => d.name)
-    .sort()
-    .reverse()
+  try {
+    return listRollbackCandidates(resolve(projectDir)).map((v) => v.id)
+  } catch {
+    return []
+  }
 }
 
+function refreshRemotionLibsAfterRestore(absDir, script) {
+  if (!script) return
+  syncRemotionPublicAssets(absDir, script)
+  writeShotcraftRemotionLib(absDir)
+  writeNarrativeDioramaRemotionLib(absDir)
+  writeFigureKitRemotionLib(absDir)
+}
+
+/**
+ * Undo the last AI change: restore the newest history version that differs from the working tree
+ * (a "before restore" safety snapshot is taken first, so the undo itself can be undone).
+ */
 export function rollbackAiVersion(projectDir) {
   const absDir = resolve(projectDir)
-  const list = getAiCodingHistory(absDir)
-  if (list.length === 0) {
-    return { ok: false, message: '暂无可供撤回的历史版本快照。' }
-  }
-  const latest = list[0]
-  const snapDir = join(absDir, 'history', latest)
-  for (const item of ['script.json', 'index.html', 'output/ai_build_log.json']) {
-    const src = join(snapDir, item)
-    if (existsSync(src)) {
-      const dst = join(absDir, item)
-      mkdirSync(dirname(dst), { recursive: true })
-      cpSync(src, dst, { force: true })
-    }
-  }
-  const snapSrc = join(snapDir, 'src')
-  if (existsSync(snapSrc)) {
-    const dstSrc = join(absDir, 'src')
-    if (existsSync(dstSrc)) rmSync(dstSrc, { recursive: true, force: true })
-    cpSync(snapSrc, dstSrc, { recursive: true, force: true })
-  }
-  try {
-    rmSync(snapDir, { recursive: true, force: true })
-  } catch {}
-
+  const res = rollbackToPreviousVersion(absDir, { onRestored: (script) => refreshRemotionLibsAfterRestore(absDir, script) })
+  if (!res.ok) return res
   const reloaded = existsSync(join(absDir, 'script.json')) ? readScriptJson(absDir).data : null
-  if (reloaded) {
-    syncRemotionPublicAssets(absDir, reloaded)
-    writeShotcraftRemotionLib(absDir)
-  }
   return {
     ok: true,
-    restoredSnapshot: latest,
-    remainingSnapshots: Math.max(0, list.length - 1),
+    restoredSnapshot: res.restoredSnapshot,
+    remainingSnapshots: res.remainingSnapshots,
+    restoredVersion: res.restoredVersion,
+    beforeRestoreVersion: res.beforeRestoreVersion,
+    restoredFiles: res.restoredFiles,
+    removedFiles: res.removedFiles,
+    mediaWarnings: res.mediaWarnings,
     script: reloaded,
   }
 }
 
+/**
+ * Restore an explicit history version (refreshing regenerated Remotion libs afterwards).
+ */
+export function restoreAiProjectVersion(projectDir, versionId) {
+  const absDir = resolve(projectDir)
+  return restoreProjectVersion(absDir, versionId, {
+    author: 'user',
+    onRestored: (script) => refreshRemotionLibsAfterRestore(absDir, script),
+  })
+}
+
 function injectScriptDataIntoHtml(html, scriptData) {
-  const serialized = JSON.stringify(scriptData, null, 2)
+  // replacer functions (never a replacement string: `$1` / `$'` in narration would be expanded) + `<` escaped
+  const serialized = scriptJsonForHtml(scriptData)
   const pattern = /(<script\s+id=["']dsh-script-data["']\s+type=["']application\/json["']>)([\s\S]*?)(<\/script>)/i
   if (pattern.test(html)) {
-    return html.replace(pattern, `$1\n${serialized}\n$3`)
+    return html.replace(pattern, (_m, open, _old, close) => `${open}\n${serialized}\n${close}`)
   }
   if (/<\/head>/i.test(html)) {
-    return html.replace(/<\/head>/i, `<script id="dsh-script-data" type="application/json">\n${serialized}\n</script>\n</head>`)
+    return html.replace(/<\/head>/i, () => `<script id="dsh-script-data" type="application/json">\n${serialized}\n</script>\n</head>`)
   }
   return `${html}\n<script id="dsh-script-data" type="application/json">\n${serialized}\n</script>`
 }
@@ -161,6 +201,7 @@ function writeRemotionBootstrap(projectDir) {
   mkdirSync(srcDir, { recursive: true })
   writeShotcraftRemotionLib(absDir)
   writeNarrativeDioramaRemotionLib(absDir)
+  writeFigureKitRemotionLib(absDir)
   writeFileSync(
     join(srcDir, 'index.ts'),
     `import { registerRoot } from 'remotion';\nimport { RemotionRoot } from './Root';\n\nregisterRoot(RemotionRoot);\n`,
@@ -217,6 +258,7 @@ export async function runCodeAutoRepairLoop({
   fetchImpl,
   signal,
   onProgress,
+  protectFiles,
 }) {
   let filesMap = { ...initialFiles }
   const repairHistory = []
@@ -226,6 +268,8 @@ export async function runCodeAutoRepairLoop({
 
   for (let round = 0; round <= maxRepairRounds; round++) {
     if (signal?.aborted) throw createAbortError()
+    // Re-apply locked-scene / targeted-refine file protections before every write (repairs included)
+    if (typeof protectFiles === 'function') filesMap = protectFiles({ ...filesMap }) || filesMap
     // Filter allowed paths cleanly
     const cleanMap = {}
     for (const [k, v] of Object.entries(filesMap)) {
@@ -334,7 +378,7 @@ function extractTsxFromReply(rawText, preferredPath, exportName) {
   return ''
 }
 
-function writeBatchRegistryIndex(absDir, batchInfos = []) {
+function writeBatchRegistryIndex(absDir, batchInfos = [], lockedModules = []) {
   const scenesDir = join(absDir, 'src', 'scenes')
   mkdirSync(scenesDir, { recursive: true })
   const validIds = new Set(batchInfos.map((b) => `Batch${b.pad}.tsx`))
@@ -361,7 +405,8 @@ export const CUSTOM_SCENE_MAP: Record<string, CustomSceneComp> = {
 ${spreads}
 };
 `
-  writeFileSync(join(scenesDir, 'index.ts'), indexCode, 'utf8')
+  // Locked scenes keep their pre-lock TSX (src/scenes/Locked_*.tsx) — registered last so they win
+  writeFileSync(join(scenesDir, 'index.ts'), applyLockedRegistryBlock(indexCode, lockedModules), 'utf8')
 }
 
 /**
@@ -379,6 +424,7 @@ export async function authorBatchedRemotionScenes({
   batchSize = 3,
   concurrency = 1,
   maxRepairRounds = 2,
+  visualReview = true,
   signal,
   onProgress,
 }) {
@@ -389,10 +435,38 @@ export async function authorBatchedRemotionScenes({
     return { ok: false, errors: ['scenes 为空，无法生成定制场景代码'], files: {}, repairHistory: [] }
   }
 
+  // Human edit protection: locked scenes keep their existing TSX (copied to src/scenes/Locked_*.tsx and
+  // registered last) and are never sent to the LLM. Stale Locked_ copies are cleaned up.
+  const lockedIds = getLockedSceneIds(lockedScript)
+  const lockedPreserve = preserveLockedSceneModules(absDir, lockedIds, { sceneIds: scenes.map((s) => s.id) })
+  const lockedModules = lockedPreserve.modules
+  const lockedInfo = {
+    lockedSceneIds: [...lockedIds],
+    lockedModules: lockedModules.map((m) => `src/scenes/${m.file}`),
+    lockedWithoutCustomTsx: lockedPreserve.missing,
+  }
+  const codingScenes = scenes.filter((s) => !lockedIds.has(s.id))
+  if (codingScenes.length === 0) {
+    writeBatchRegistryIndex(absDir, [], lockedModules)
+    writeRemotionProjectFiles(absDir, lockedScript, { rebuildTemplate: true, useCustomSceneRegistry: true })
+    return {
+      ok: lockedModules.length > 0,
+      allScenesLocked: true,
+      files: {},
+      repairHistory: [],
+      isolatedBatches: [],
+      batchErrors: [],
+      authoredBatchCount: lockedModules.length,
+      totalBatches: 0,
+      errors: lockedModules.length > 0 ? [] : ['全部场景均已锁定且没有自定义 TSX，保持内置模板渲染'],
+      ...lockedInfo,
+    }
+  }
+
   const size = Math.max(2, Math.min(8, Number(batchSize) || 3))
   const chunks = []
-  for (let i = 0; i < scenes.length; i += size) {
-    chunks.push(scenes.slice(i, i + size))
+  for (let i = 0; i < codingScenes.length; i += size) {
+    chunks.push(codingScenes.slice(i, i + size))
   }
 
   const batchInfos = chunks.map((batchScenes, bi) => {
@@ -416,6 +490,7 @@ export async function authorBatchedRemotionScenes({
   syncRemotionPublicAssets(absDir, lockedScript)
   writeShotcraftRemotionLib(absDir)
   writeNarrativeDioramaRemotionLib(absDir)
+  writeFigureKitRemotionLib(absDir)
 
   const manifestItems = Array.isArray(batchAssetsManifest?.items) ? batchAssetsManifest.items : []
   const buildBatchAssetCatalog = (bScenes) => {
@@ -450,14 +525,39 @@ export async function authorBatchedRemotionScenes({
 
   let completedCount = 0
   const hwBatchPolicy = resolveLowSpecPolicy({ repoRoot: REPO_ROOT })
+  // Per-shot tool plan (character rig + Vibecoding tools): must-use tools are audited after coding
+  const filmCast = Array.isArray(lockedScript.cast) ? lockedScript.cast : []
+  // the film's character style (the user's words → the director's choice → genre default); 'custom' = own design
+  const styleUserText = `${lockedScript.topic || ''} ${lockedScript.goal || ''} ${lockedScript.displayTitle || lockedScript.title || ''}`
+  const styleNotesText = `${lockedScript.genreLabel || ''} ${lockedScript.directorNotes || ''}`
+  const filmFigureStyle = inferFigureStyle({ genre: lockedScript.genre || '', current: lockedScript.figureStyle, chosen: lockedScript.figureStyleChoice, userText: styleUserText, text: styleNotesText })
+  const filmFigureNote = resolveFigureStyleNote({ style: filmFigureStyle, chosen: lockedScript.figureStyleChoice, chosenNote: lockedScript.figureStyleChoiceNote, note: lockedScript.figureStyleNote, text: `${styleUserText} ${styleNotesText}` })
+  let filmToolPlan = { perScene: {}, totals: {} }
+  try {
+    const { getVibeToolkitStatus } = await import('./vibe-toolkit-lib.js')
+    filmToolPlan = planSceneTools({
+      scenes,
+      cast: filmCast,
+      genre: lockedScript.genre || '',
+      figureStyle: filmFigureStyle,
+      status: getVibeToolkitStatus(),
+      lowSpec: Boolean(hwBatchPolicy?.lowSpecSafe || lockedScript.lowSpecSafe),
+      visual3dMode: lockedScript.visual3dMode || 'auto',
+      hasScreenshotsFor: (sc) => (Array.isArray(sc?.media) && sc.media.length > 0) || (Array.isArray(sc?.assetPaths) && sc.assetPaths.length > 0),
+    })
+  } catch {}
   const maxConc = Math.max(1, Math.min(hwBatchPolicy.batchCoderConcurrency || 3, Number(concurrency) || 3))
   let nextIdx = 0
+  let billingStopErr = null
 
   const worker = async () => {
     while (nextIdx < batchInfos.length) {
       if (signal?.aborted) throw createAbortError()
+      // A billing error (insufficient balance/quota) is never retried: stop every worker immediately
+      if (billingStopErr) throw billingStopErr
       const item = batchInfos[nextIdx++]
-      const pkg = buildBatchedRemotionScenesPrompt({
+      // + the custom style guide (AI-designed style / 我的风格预设): name, palette, typography, motion
+      const pkg = withStyleGuide(buildBatchedRemotionScenesPrompt({
         batchIndex: item.bi,
         totalBatches: batchInfos.length,
         batchScenes: item.batchScenes,
@@ -477,7 +577,15 @@ export async function authorBatchedRemotionScenes({
         assetCatalog: buildBatchAssetCatalog(item.batchScenes),
         narrationMode: lockedScript.narrationMode || 'tts',
         referenceStyle: lockedScript.referenceStyle || null,
-      })
+        visual3dMode: lockedScript.visual3dMode || 'auto',
+        cast: filmCast,
+        toolPlan: filmToolPlan,
+        allScenes: scenes,
+        figureStyle: filmFigureStyle,
+        figureStyleNote: filmFigureNote,
+        figureStyleChoice: lockedScript.figureStyleChoice,
+        figureStyleChoiceNote: lockedScript.figureStyleChoiceNote,
+      }), lockedScript)
       item.systemPrompt = pkg.system
       onProgress?.(
         'coder',
@@ -505,6 +613,10 @@ export async function authorBatchedRemotionScenes({
           lastBatchErr = `回复未提取到有效 TSX (${String(res?.text || '').length} chars)`
         } catch (err) {
           if (err?.name === 'AbortError' || signal?.aborted) throw err
+          if (isBillingError(err)) {
+            billingStopErr = billingStopErr || toBillingError(err, { scope: 'llm', provider: resolvedCfg?.model || '' })
+            throw billingStopErr
+          }
           lastBatchErr = err?.message || 'LLM 调用异常'
           if (lastBatchErr.includes('超时')) break
         }
@@ -521,7 +633,7 @@ export async function authorBatchedRemotionScenes({
           for (let hi = 0; hi < halves.length; hi++) {
             const subExport = `${item.exportName}_PART_${hi + 1}`
             const subFile = `src/scenes/Batch${item.pad}_p${hi + 1}.tsx`
-            const subPkg = buildBatchedRemotionScenesPrompt({
+            const subPkg = withStyleGuide(buildBatchedRemotionScenesPrompt({
               batchIndex: item.bi,
               totalBatches: batchInfos.length,
               batchScenes: halves[hi],
@@ -541,7 +653,15 @@ export async function authorBatchedRemotionScenes({
               assetCatalog: buildBatchAssetCatalog(halves[hi]),
               narrationMode: lockedScript.narrationMode || 'tts',
               referenceStyle: lockedScript.referenceStyle || null,
-            })
+              visual3dMode: lockedScript.visual3dMode || 'auto',
+              cast: filmCast,
+              toolPlan: filmToolPlan,
+              allScenes: scenes,
+              figureStyle: filmFigureStyle,
+              figureStyleNote: filmFigureNote,
+              figureStyleChoice: lockedScript.figureStyleChoice,
+              figureStyleChoiceNote: lockedScript.figureStyleChoiceNote,
+            }), lockedScript)
             const subRes = await invokeLlm({
               system: subPkg.system.replaceAll(item.exportName, subExport).replaceAll(item.filePath, subFile),
               messages: [{ role: 'user', content: subPkg.user.replaceAll(item.filePath, subFile) }],
@@ -561,7 +681,12 @@ export async function authorBatchedRemotionScenes({
             extracted = `import React from 'react';\n${subParts.map((p) => `import { ${p.subExport} } from '${p.relImport}';`).join('\n')}\nexport const ${item.exportName}: Record<string, React.FC<any>> = {\n${subParts.map((p) => `  ...${p.subExport},`).join('\n')}\n};\n`
             lastBatchErr = ''
           }
-        } catch {}
+        } catch (splitErr) {
+          if (isBillingError(splitErr)) {
+            billingStopErr = billingStopErr || toBillingError(splitErr, { scope: 'llm', provider: resolvedCfg?.model || '' })
+            throw billingStopErr
+          }
+        }
       }
       if (extracted) {
         item.code = extracted
@@ -585,7 +710,7 @@ export async function authorBatchedRemotionScenes({
       writeFileSync(join(absDir, info.filePath), info.code, 'utf8')
       filesMap[info.filePath] = info.code
     }
-    writeBatchRegistryIndex(absDir, batchInfos)
+    writeBatchRegistryIndex(absDir, batchInfos, lockedModules)
     filesMap['src/scenes/index.ts'] = readFileSync(join(absDir, 'src', 'scenes', 'index.ts'), 'utf8')
     writeRemotionProjectFiles(absDir, lockedScript, { rebuildTemplate: true, useCustomSceneRegistry: true })
     filesMap['src/VideoComposition.tsx'] = readFileSync(join(absDir, 'src', 'VideoComposition.tsx'), 'utf8')
@@ -598,8 +723,134 @@ export async function authorBatchedRemotionScenes({
 
   const repairHistory = []
   const isolatedBatches = []
+  let toolUpgradeDone = false
+  let toolAuditBefore = null
+  let extraRounds = 0
+  const upgradedInfos = []
+  const finalToolAudit = () => summarizeToolAudit(batchInfos.map((info) => auditToolUsage(info.code, info.batchScenes.map((sc) => sc.id), filmToolPlan)), filmToolPlan)
+  let visualReviewDone = false
+  let visualReport = null
 
-  for (let round = 0; round <= maxRepairRounds; round++) {
+  // 画面自检: render keyframes of the compiled scenes, let the multimodal model look at them batch by batch, and send
+  // the shots with a major problem back to the coder once (screenshots attached). Returns the number of batches rewritten.
+  const runVisualSelfReview = async () => {
+    const report = { reviewedScenes: 0, frameCount: 0, majorScenes: 0, fixedScenes: 0, failedBatches: 0, fixedBatches: [], scenes: {}, skipped: '' }
+    visualReport = report
+    const authored = batchInfos.filter((b) => b.code.includes('useCurrentFrame'))
+    if (!authored.length) {
+      report.skipped = '没有可检查的镜头'
+      return 0
+    }
+    const W = Number(lockedScript.width) || 1920
+    const H = Number(lockedScript.height) || 1080
+    const fps = Number(lockedScript.fps) || 30
+    const wanted = new Set(authored.flatMap((b) => b.batchScenes.map((sc) => sc.id)))
+    const keyframes = planSceneKeyframes(scenes, fps).filter((k) => wanted.has(k.sceneId))
+    onProgress?.('repair', 74, `画面自检：正在渲染 ${wanted.size} 个镜头的关键帧…`)
+    let rendered
+    try {
+      rendered = await renderSceneKeyframes({
+        projectDir: absDir,
+        keyframes,
+        scale: Math.min(1, 960 / Math.max(W, H)),
+        outDir: join(absDir, 'output', 'visual-review'),
+        signal,
+      })
+    } catch (err) {
+      if (err?.name === 'AbortError' || signal?.aborted) throw err
+      report.skipped = `关键帧渲染失败（${String(err?.message || err).slice(0, 80)}）`
+      return 0
+    }
+    if (!rendered?.ok) {
+      report.skipped = `关键帧渲染失败（${String(rendered?.reason || '未知原因').slice(0, 80)}）`
+      return 0
+    }
+    report.frameCount = rendered.frames.length
+    onProgress?.('repair', 75, `画面自检：大模型正在逐镜查看 ${report.frameCount} 张关键帧…`)
+    const reviews = []
+    let visionRejected = ''
+    let nextReview = 0
+    const reviewWorker = async () => {
+      while (nextReview < authored.length && !visionRejected) {
+        const info = authored[nextReview++]
+        const ids = info.batchScenes.map((sc) => sc.id)
+        const frames = rendered.frames.filter((f) => ids.includes(f.sceneId))
+        if (!frames.length) continue
+        const req = buildVisualReviewRequest({
+          batchScenes: info.batchScenes,
+          frames,
+          genreLabel: lockedScript.genreLabel || lockedScript.genre || '',
+          figureStyle: filmFigureStyle,
+          figureStyleNote: filmFigureNote,
+          width: W,
+          height: H,
+        })
+        try {
+          const res = await invokeLlm({ system: req.system, messages: req.messages, temperature: 0.1, maxTokens: 2600, timeoutMs: 240_000, signal })
+          const parsed = parseVisualReview(res?.text, ids)
+          if (!parsed.looked) {
+            visionRejected = visionRejected || '当前模型没有返回看图结果（可能不支持图片输入）'
+            continue
+          }
+          reviews.push({ info, review: parsed.scenes, frames })
+        } catch (err) {
+          if (err?.name === 'AbortError' || signal?.aborted) throw err
+          if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: resolvedCfg?.model || '' })
+          if (isVisionUnsupportedError(err)) visionRejected = visionRejected || '当前模型不支持图片输入'
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(2, authored.length) }, () => reviewWorker()))
+    if (!reviews.length) {
+      report.skipped = visionRejected || '看图模型没有返回结果'
+      return 0
+    }
+    for (const r of reviews) {
+      for (const [id, v] of Object.entries(r.review)) {
+        report.scenes[id] = v
+        report.reviewedScenes++
+        if (v.severity === 'major') report.majorScenes++
+      }
+    }
+    const flagged = reviews.filter((r) => Object.values(r.review).some((v) => v.severity === 'major'))
+    if (!flagged.length) return 0
+    onProgress?.('repair', 76, `画面自检：${report.majorScenes} 个镜头有明显问题，正在带截图定向返工 ${flagged.length} 个分批…`)
+    let rewritten = 0
+    let nextFix = 0
+    const fixWorker = async () => {
+      while (nextFix < flagged.length) {
+        const { info, review, frames } = flagged[nextFix++]
+        const req = buildVisualFixRequest({ filePath: info.filePath, exportName: info.exportName, code: info.code, batchScenes: info.batchScenes, review, frames, figureStyle: filmFigureStyle, figureStyleNote: filmFigureNote })
+        try {
+          const res = await invokeLlm({
+            system: info.systemPrompt,
+            messages: req.messages,
+            temperature: 0.25,
+            maxTokens: info.batchScenes.length >= 5 ? 16000 : 14000,
+            timeoutMs: 600_000,
+            signal,
+          })
+          const fixedCode = extractTsxFromReply(res?.text, info.filePath, info.exportName)
+          if (fixedCode && fixedCode.includes('useCurrentFrame')) {
+            // the code before the rewrite compiled: keep it to fall back to if the rewrite never compiles
+            info.preUpgradeCode = info.code
+            info.code = fixedCode
+            info.visualFixed = true
+            rewritten++
+            report.fixedBatches.push(info.filePath)
+            report.fixedScenes += Object.values(review).filter((v) => v.severity === 'major').length
+          }
+        } catch (err) {
+          if (err?.name === 'AbortError' || signal?.aborted) throw err
+          if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: resolvedCfg?.model || '' })
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(2, flagged.length) }, () => fixWorker()))
+    return rewritten
+  }
+
+  for (let round = 0; round <= maxRepairRounds + extraRounds; round++) {
     if (signal?.aborted) throw createAbortError()
     const currentFiles = persistAllAndBuildComp()
     const sandbox = scanAiGeneratedCodeSandbox(currentFiles, { engine: 'remotion', hasMasterAudio })
@@ -621,6 +872,53 @@ export async function authorBatchedRemotionScenes({
     })
 
     const batchErrors = batchInfos.filter((b) => b.error).map((b) => `${b.filePath}: ${b.error}`)
+    if (allErrors.length === 0 && !toolUpgradeDone) {
+      toolUpgradeDone = true
+      const audits = batchInfos.map((info) => ({ info, audit: auditToolUsage(info.code, info.batchScenes.map((sc) => sc.id), filmToolPlan) }))
+      toolAuditBefore = summarizeToolAudit(audits.map((a) => a.audit), filmToolPlan)
+      const violating = audits.filter((a) => a.audit.violations.length > 0 && a.info.code.includes('useCurrentFrame'))
+      if (violating.length > 0) {
+        onProgress?.('repair', 72, `工具核对：${toolAuditBefore.violating} 个镜头没按计划使用指定工具，正在定向返工 ${violating.length} 个分批…`)
+        for (const { info, audit } of violating) {
+          if (signal?.aborted) throw createAbortError()
+          try {
+            const res = await invokeLlm({
+              system: info.systemPrompt,
+              messages: [{ role: 'user', content: buildToolUpgradePrompt({ filePath: info.filePath, exportName: info.exportName, code: info.code, violations: audit.violations, batchScenes: info.batchScenes }) }],
+              temperature: 0.25,
+              maxTokens: info.batchScenes.length >= 5 ? 16000 : 14000,
+              timeoutMs: 600_000,
+              signal,
+            })
+            const upgraded = extractTsxFromReply(res?.text, info.filePath, info.exportName)
+            if (upgraded) {
+              const after = auditToolUsage(upgraded, info.batchScenes.map((sc) => sc.id), filmToolPlan)
+              // keep an upgrade only when it really closes gaps; the compile loop below repairs any fallout
+              if (after.violations.length < audit.violations.length) {
+                info.preUpgradeCode = info.code
+                info.code = upgraded
+                upgradedInfos.push(info)
+              }
+            }
+          } catch (err) {
+            if (err?.name === 'AbortError' || signal?.aborted) throw err
+            if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: resolvedCfg?.model || '' })
+          }
+        }
+        if (upgradedInfos.length > 0) {
+          extraRounds = 2
+          continue
+        }
+      }
+    }
+    if (allErrors.length === 0 && visualReview && !visualReviewDone && batchInfos.some((b) => b.code.includes('useCurrentFrame'))) {
+      visualReviewDone = true
+      const rewritten = await runVisualSelfReview()
+      if (rewritten > 0) {
+        extraRounds += 2
+        continue
+      }
+    }
     if (allErrors.length === 0) {
       const authoredCount = batchInfos.filter((b) => b.code.includes('useCurrentFrame')).length
       if (authoredCount === 0) {
@@ -647,16 +945,52 @@ export async function authorBatchedRemotionScenes({
         totalBatches: batchInfos.length,
         lint,
         tsc,
+        toolAudit: { before: toolAuditBefore, after: finalToolAudit(), upgradedBatches: upgradedInfos.map((i) => i.filePath) },
+        visualReview: visualReport,
+        ...lockedInfo,
       }
     }
 
     // Group errors per BatchXX file so only failing modules undergo targeted LLM repair
     const failingInfos = batchInfos.filter((info) => {
       const base = `Batch${info.pad}.tsx`
-      return allErrors.some((e) => e.includes(info.filePath) || e.includes(base))
+      // Errors inside preserved Locked_*.tsx copies must not trigger repairs of unrelated batches
+      return allErrors.some((e) => !/Locked_/.test(e) && (e.includes(info.filePath) || e.includes(base)))
     })
 
-    if (round >= maxRepairRounds) {
+    if (round >= maxRepairRounds + extraRounds) {
+      const revertable = failingInfos.filter((info) => typeof info.preUpgradeCode === 'string')
+      if (revertable.length > 0) {
+        for (const info of revertable) {
+          info.code = info.preUpgradeCode
+          delete info.preUpgradeCode
+          if (info.visualFixed && visualReport) {
+            visualReport.failedBatches++
+            info.visualFixed = false
+          }
+        }
+        const revertedFiles = persistAllAndBuildComp()
+        const rvSandbox = scanAiGeneratedCodeSandbox(revertedFiles, { engine: 'remotion', hasMasterAudio })
+        const rvLint = await executeVideoLint({ projectDir: absDir, engine: 'remotion' })
+        const rvTsc = await runTypecheckOnProject(absDir)
+        if ((rvSandbox.errors || []).length === 0 && (rvLint.errors || []).length === 0 && (rvTsc.errors || []).length === 0) {
+          const authoredCount = batchInfos.filter((b) => b.code.includes('useCurrentFrame')).length
+          return {
+            ok: authoredCount > 0,
+            files: revertedFiles,
+            repairHistory,
+            isolatedBatches,
+            batchErrors,
+            authoredBatchCount: authoredCount,
+            totalBatches: batchInfos.length,
+            lint: rvLint,
+            tsc: rvTsc,
+            toolAudit: { before: toolAuditBefore, after: finalToolAudit(), upgradedBatches: upgradedInfos.filter((i) => typeof i.preUpgradeCode === 'string').map((i) => i.filePath), revertedBatches: revertable.map((i) => i.filePath) },
+            visualReview: visualReport,
+            ...lockedInfo,
+          }
+        }
+      }
       // Isolate any single persistently broken batch back to empty export so valid batches still ship cleanly!
       if (failingInfos.length > 0 && failingInfos.length < batchInfos.length) {
         for (const bad of failingInfos) {
@@ -678,6 +1012,7 @@ export async function authorBatchedRemotionScenes({
             totalBatches: batchInfos.length,
             lint: cleanLint,
             tsc: cleanTsc,
+            ...lockedInfo,
           }
         }
       }
@@ -689,6 +1024,7 @@ export async function authorBatchedRemotionScenes({
         batchErrors,
         authoredBatchCount: 0,
         errors: [...allErrors, ...batchErrors],
+        ...lockedInfo,
       }
     }
 
@@ -728,6 +1064,7 @@ export async function authorBatchedRemotionScenes({
         }
       } catch (err) {
         if (err?.name === 'AbortError' || signal?.aborted) throw err
+        if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: resolvedCfg?.model || '' })
       }
     }
   }
@@ -784,6 +1121,10 @@ export async function runAiStudioPipeline(options = {}) {
   const emit = (stage, progress, message) => {
     onProgress?.({ stage, progress, message })
   }
+  // Billing tripwire: helpers with graceful fallbacks (grounding, schema tiers, voice casting, AI BGM) must never
+  // re-call a provider that reported no balance / quota; checkpoints below stop the whole run instead.
+  const llmBilling = createBillingSentinel({ scope: 'llm', provider: llmCfg?.model || '' })
+  const guardedLlm = llmBilling.wrap((p) => callLlmChat({ overrideConfig: llmCfg, fetchImpl, ...p }))
 
   emit('init', 5, '1/7 正在准备工程目录与素材清单...')
   if (sources && (Array.isArray(sources) ? sources.length > 0 : true)) {
@@ -799,8 +1140,22 @@ export async function runAiStudioPipeline(options = {}) {
 
   // Backup prior version so user can always roll back
   if (existingScript) {
-    snapshotProjectVersion(absDir, 'pre-ai')
+    snapshotProjectVersion(absDir, 'pre-ai', { author: 'user', stage: 'ai-studio' })
   }
+  // 视觉风格 (style-presets.js): the requested 'auto' | preset | 'user:<id>' (default: the project's current choice,
+  // 'auto' for a new project). An auto project lets the plan call below pick a preset or design a new style.
+  const styleText = `${topic || ''} ${options.directorNotes || ''} ${userPrompt || ''}`
+  let styleRequest
+  try {
+    styleRequest = resolveStyleRequest(existingScript || {}, options.style ?? (existingScript?.style ? undefined : 'auto'), { text: styleText, reResolve: true })
+  } catch {
+    styleRequest = resolveStyleRequest(existingScript || {}, undefined, { text: styleText })
+  }
+  const styleScript = applyStyleDecision({ ...(existingScript || {}) }, styleRequest)
+  // 人物画风 picked for this run (studio form or MCP figureStyle): the director writes people for it, the coder draws it
+  applyFigureStyleChoice(styleScript, options)
+  // HTML engine: capture locked scenes' <template> blocks before any regeneration (first capture wins)
+  const lockedHtmlBlocks = existingScript && existingScript.engine !== 'remotion' && engine !== 'remotion' ? syncLockedHtmlStore(absDir, existingScript) : {}
 
   const assetsManifest = readAssets(absDir)
   const visuals = (assetsManifest.items || []).filter((i) => i.type === 'image' || i.type === 'video')
@@ -866,7 +1221,7 @@ export async function runAiStudioPipeline(options = {}) {
   const coderDurationPolicy = resolveTargetDurationPolicy({
     durationMode: durationMode || existingScript?.durationMode || 'auto',
     targetDurationSec: Number(targetDurationSec) || Number(existingScript?.targetDurationSec) || 0,
-    text: `${coreTopic} ${directorNotes || ''} ${userPrompt || ''} ${existingScript?.goal || ''}`,
+    text: stripPlazaTemplateGuidance(`${coreTopic} ${directorNotes || ''} ${userPrompt || ''} ${existingScript?.goal || ''}`),
     narrationMode: resolvedNarrationMode,
     hasVisualAssets: visuals.length > 0,
     bgmDurationSec: Number(analyzedBgmMeta?.durationSec || importedMusic[0]?.durationSec) || 0,
@@ -888,6 +1243,7 @@ export async function runAiStudioPipeline(options = {}) {
     height,
     topic: `${coreTopic} ${directorNotes || ''}`,
     assets: visuals,
+    targetPlatform: resolvedPlatform,
   })
 
   let archRes = { model: llmCfg.model || 'rule-engine', protocol: llmCfg.protocol || 'rule' }
@@ -898,10 +1254,11 @@ export async function runAiStudioPipeline(options = {}) {
     try {
       await groundVisualAssets({
         projectDir: absDir,
-        callLlmChatFn: llmCfg?.apiKey ? (p) => callLlmChat({ overrideConfig: llmCfg, fetchImpl, ...p }) : null,
+        callLlmChatFn: llmCfg?.apiKey ? guardedLlm : null,
         enableVision: Boolean(llmCfg?.apiKey) && resolvedCreationMode !== 'schema-plan',
       })
     } catch {}
+    llmBilling.throwIfTripped()
   }
   const groundedManifest = readAssets(absDir)
 
@@ -915,22 +1272,19 @@ export async function runAiStudioPipeline(options = {}) {
       authoringMode: resolvedCreationMode,
       directorNotes,
       contentOutline,
-      style: existingScript?.style || 'tech',
+      style: styleScript.style,
       targetPlatform: resolvedPlatform,
-      scriptData: existingScript || {},
+      scriptData: styleScript,
       assetsManifest: groundedManifest,
       bgmMeta: analyzedBgmMeta,
       narrationMode: resolvedNarrationMode,
       pacingMode: pacingMode || existingScript?.pacingMode || 'auto',
       durationMode: durationMode || existingScript?.durationMode || 'auto',
       targetDurationSec: effectiveCoderTargetSec,
-      callLlmChatFn: async (p) =>
-        callLlmChat({
-          overrideConfig: llmCfg,
-          fetchImpl,
-          ...p,
-        }),
+      callLlmChatFn: guardedLlm,
     })
+    // Schema tiers degrade on any error: a billing failure must stop the run instead of falling back
+    llmBilling.throwIfTripped()
     schemaMeta = {
       version: schemaRes.plan.version,
       degradationTier: schemaRes.degradationTier,
@@ -990,10 +1344,8 @@ export async function runAiStudioPipeline(options = {}) {
       pacingMode: pacingMode || existingScript?.pacingMode || 'auto',
     })
 
-    archRes = await callLlmChat({
-      overrideConfig: llmCfg,
-      fetchImpl,
-      system: directorPkg.system,
+    archRes = await guardedLlm({
+      system: directorPkg.system + buildStylePlanDirective(styleScript) + buildFigureStylePlanDirective(styleScript, { planJson: false }),
       messages: [{ role: 'user', content: directorPkg.user }],
       temperature: 0.5,
     })
@@ -1014,7 +1366,24 @@ export async function runAiStudioPipeline(options = {}) {
         })
       : baseDims
 
-  const theme = normalizeThemeFromPlan(plan.theme, plan.style || existingScript?.style || 'tech')
+  // Final style: the schema director already decided (and wrote it onto styleScript); the free director's plan JSON is
+  // decided here. Preset / 我的预设 projects keep the user's choice; auto follows the plan's pick or new design.
+  const finalStyle =
+    resolvedCreationMode === 'schema-plan'
+      ? currentStyleDecision(styleScript)
+      : decidePlanStyle({
+          script: styleScript,
+          planStyle: plan.style,
+          planProfile: plan.styleProfile,
+          text: `${coreTopic} ${directorNotes || ''}`,
+          genre: resolvedGenre,
+          genreLabel: resolvedGenreLabel,
+          by: 'llm',
+        })
+  const styleFields = applyStyleDecision({ theme: existingScript?.theme }, finalStyle)
+  const theme = finalStyle.profile ? styleFields.theme : normalizeThemeFromPlan(plan.theme, finalStyle.style)
+  plan.style = finalStyle.style
+  plan.theme = theme
   const bpm = Number(analyzedBgmMeta?.bpm || plan?.audioSpec?.bpm) || 118
   const fps = Number(requestedFps) || existingScript?.fps || 30
 
@@ -1067,7 +1436,7 @@ export async function runAiStudioPipeline(options = {}) {
       'media-spotlight': 'app-focus-shot',
       'closing-cta': 'radial-climax',
     }
-    const isHistoricalTopic = /历史|霸王|项羽|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(`${coreTopic || ''} ${userPrompt || ''}`)
+    const isHistoricalTopic = isHistoricalContent(`${coreTopic || ''} ${userPrompt || ''}`)
     const vibecodingFallbackCycle = ['3d-stage-opener', 'svg-architecture-flow', 'hud-telemetry-dashboard', 'vibecoding-spring-stage', 'metric-dashboard', 'radial-climax']
     const zeroAssetFallbackLayout =
       visuals.length === 0
@@ -1167,7 +1536,10 @@ export async function runAiStudioPipeline(options = {}) {
       }) || existingScript?.goal || '',
     genre: plan.genre || resolvedGenre,
     genreLabel: plan.genreLabel || resolvedGenreLabel,
-    style: plan.style || existingScript?.style || 'tech',
+    style: finalStyle.style,
+    styleMode: styleFields.styleMode,
+    styleProfile: styleFields.styleProfile,
+    styleAuto: styleFields.styleAuto,
     workflowSteps: Array.isArray(plan.workflowSteps) ? plan.workflowSteps : existingScript?.workflowSteps || [],
     brandMark: plan.brandMark || existingScript?.brandMark || '',
     engine: engine === 'remotion' ? 'remotion' : 'html',
@@ -1197,7 +1569,7 @@ export async function runAiStudioPipeline(options = {}) {
       ...(analyzedBgmMeta || {}),
       enabled: true,
       mode: resolvedBgmMode,
-      mood: plan?.audioSpec?.mood || 'tech',
+      mood: plan?.audioSpec?.mood || (finalStyle.profile ? styleMoodKey(finalStyle.profile) : 'tech'),
       bpm,
       volume: Number(plan?.audioSpec?.volume) || (resolvedNarrationMode === 'subtitle-mv' ? 0.85 : 0.28),
       uploadedPath: pickedUploadBgm || '',
@@ -1207,7 +1579,12 @@ export async function runAiStudioPipeline(options = {}) {
     scenes: plannedScenes,
   }
 
-  writeScriptJson(absDir, preTtsScript)
+  applyFigureStyleChoice(preTtsScript, options)
+
+  // Human edit protection: keep locked scenes + re-apply user overrides (three-way merge, user wins)
+  const editMerge = reconcileUserEdits({ projectDir: absDir, prevScript: existingScript || {}, nextScript: preTtsScript, stage: 'ai-studio-director' })
+  if (editMerge.report) emit('architect', 22, `人工修改保护：${summarizeEditMerge(editMerge.report)}`)
+  writeScriptJson(absDir, editMerge.script)
   let masteringReport = null
   if (resolvedNarrationMode === 'subtitle-mv') {
     emit('tts', 36, '3-4/7 纯音乐卡点 MV 模式：跳过 TTS 朗读，正在对齐分镜与字幕至音乐真实节拍...')
@@ -1220,20 +1597,26 @@ export async function runAiStudioPipeline(options = {}) {
           projectDir: absDir,
           genre: resolvedGenre,
           genreGuidance: buildGenreGuidance(resolvedGenre, preTtsScript.genreLabel),
-          callLlmChatFn: async (p) => callLlmChat({ overrideConfig: llmCfg, fetchImpl, ...p }),
+          callLlmChatFn: guardedLlm,
         })
         castOk = Boolean(castRes?.ok)
-      } catch {}
+      } catch (castErr) {
+        if (isBillingError(castErr)) throw toBillingError(castErr, { scope: 'llm', provider: llmCfg?.model || '' })
+      }
+      llmBilling.throwIfTripped()
     }
     if (!castOk) {
       matchAllScenesInScript(absDir, { voiceId: voiceId || 'auto', forceAuto: voiceId === 'auto' })
     }
+    // Voice casting / matching rewrites every scene: locked scenes keep their voice, emotion and pace
+    if (editMerge.report) reassertLockedScenes(absDir, editMerge.script)
     let midScript = readScriptJson(absDir).data
 
     emit('tts', 28, '3/7 正在通过本地 IndexTTS-2.5 音色库合成真人情感配音...')
     for (let i = 0; i < (midScript.scenes || []).length; i++) {
       const s = midScript.scenes[i]
-      const reused = plannedScenes[i]?.audioFile && existsSync(join(absDir, plannedScenes[i].audioFile))
+      // audioFile is only kept at plan time when the WAV is reusable (or the scene is locked)
+      const reused = s.audioFile && existsSync(join(absDir, s.audioFile))
       if (reused) {
         const measured = await probeAudioDuration(join(absDir, s.audioFile), fps)
         s.durationSec = Math.max(2.0, Number((measured.durationSec + 0.55).toFixed(4)))
@@ -1263,10 +1646,16 @@ export async function runAiStudioPipeline(options = {}) {
       llmOverride: llmCfg,
       fetchImpl,
     })
+    // Mastering falls back to DSP on LLM errors and only keeps the reason text: never ignore a billing failure
+    const masterBilling =
+      masteringReport?.mode !== 'ai-llm' ? billingErrorFromText(masteringReport?.engineerSummary, { scope: 'llm', provider: llmCfg?.model || '' }) : null
+    if (masterBilling) throw masterBilling
   }
 
   // Re-lock beat grid + full timing contract (preserving measured beats for uploaded BGM)
   let lockedScript = readScriptJson(absDir).data
+  // Human edit protection: remember locked scenes' sfxCues (and the old beat grid) before quantization
+  const lockedAudioSnap = snapshotLockedSceneAudio(lockedScript)
   const activeBeatMeta = analyzedBgmMeta?.analyzed
     ? analyzedBgmMeta
     : buildBeatGrid(lockedScript.totalDurationSec || 12, bpm)
@@ -1280,16 +1669,35 @@ export async function runAiStudioPipeline(options = {}) {
 
   if (enableBeatSync || resolvedNarrationMode === 'subtitle-mv' || resolvedNarrationMode === 'tts-beat-sync') {
     const qMode = resolvedNarrationMode === 'subtitle-mv' ? 'subtitle-mv' : 'tts-beat-sync'
+    // Genre-aware rhythm & SFX: without these, history/MV videos fell back to the product-promo palette
+    // (pops / chimes) and lost half-beat blitz cuts.
+    const adaptiveOpts = {
+      genre: lockedScript.genre || resolvedGenre,
+      genreLabel: lockedScript.genreLabel || resolvedGenreLabel,
+      title: lockedScript.title,
+      narrationMode: resolvedNarrationMode,
+      pacingMode: lockedScript.pacingMode || pacingMode,
+      audioProfile: lockedScript.audioProfile,
+      referenceStyle: lockedScript.referenceStyle,
+      style: lockedScript.style,
+    }
     lockedScript.scenes = quantizeScenesToBeatGrid(lockedScript.scenes || [], activeBeatMeta, {
+      ...adaptiveOpts,
       mode: qMode,
       fps,
       targetDurationSec: effectiveCoderTargetSec,
     })
-    lockedScript.scenes = choreographBeatSfxCues(lockedScript.scenes, activeBeatMeta)
+    lockedScript.scenes = choreographBeatSfxCues(lockedScript.scenes, activeBeatMeta, { ...adaptiveOpts, fps })
+    // Locked scenes keep their sfxCues (scene-relative, clamped if the grid moved); user overrides win again
+    restoreLockedSceneSfx(lockedScript, lockedAudioSnap)
+    applyUserOverrides(lockedScript)
     lockedScript.subtitles = lockedScript.scenes.flatMap((sc) => sc.subtitles || [])
     const lastSc = lockedScript.scenes[lockedScript.scenes.length - 1]
     lockedScript.totalDurationInFrames = lastSc ? Number(lastSc.startFrame || 0) + Number(lastSc.durationInFrames || 0) : lockedScript.totalDurationInFrames
     lockedScript.totalDurationSec = Number(((lockedScript.totalDurationInFrames || 30) / fps).toFixed(4))
+  } else {
+    // TTS re-measured durations: user overrides (e.g. a pinned durationSec / subtitleText) win again
+    applyUserOverrides(lockedScript)
   }
 
   let bgmCoderInfo = { mode: resolvedBgmMode, status: 'ok' }
@@ -1299,20 +1707,17 @@ export async function runAiStudioPipeline(options = {}) {
       const coderAudioRes = await generateAiCodedBgmTrack({
         projectDir: absDir,
         script: lockedScript,
-        callLlmChatFn: async (p) =>
-          callLlmChat({
-            overrideConfig: llmCfg,
-            fetchImpl,
-            ...p,
-          }),
+        callLlmChatFn: guardedLlm,
       })
       lockedScript.bgm.path = coderAudioRes.relWavPath
       lockedScript.bgm.source = 'llm-coded'
       lockedScript.bgm.codeScriptPath = coderAudioRes.relScriptPath
       bgmCoderInfo = { mode: 'llm-coded', status: 'ok', summary: coderAudioRes.summary, scriptPath: coderAudioRes.relScriptPath }
     } catch (err) {
+      if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: llmCfg?.model || '' })
       bgmCoderInfo = { mode: 'llm-coded', status: 'fallback-dsp', error: err?.message || String(err) }
     }
+    llmBilling.throwIfTripped()
   } else if (resolvedBgmMode === 'tts-engine') {
     emit('audio', 44, '5/7 正在通过 IndexTTS-2.5 配音引擎声学塑形生成氛围 BGM...')
     try {
@@ -1428,6 +1833,7 @@ export async function runAiStudioPipeline(options = {}) {
       llmConfig: llmCfg,
       fetchImpl,
       maxRepairRounds: repairRounds,
+      visualReview: lockedScript.visualReview !== false,
       onProgress: emit,
     })
     if (checkResult?.ok) {
@@ -1438,17 +1844,19 @@ export async function runAiStudioPipeline(options = {}) {
     }
   } else {
     emit('coder', 56, `6/7 正在让大模型 (${llmCfg.model}) 编写定制 HyperFrames HTML 视频源码...`)
-    const coderPkg = buildHtmlCoderSkillsPrompt({
-      plan,
-      timingContract,
-      width: lockedScript.width,
-      height: lockedScript.height,
-      aspectRatio: lockedScript.aspectRatio,
-    })
+    const coderPkg = withStyleGuide(
+      buildHtmlCoderSkillsPrompt({
+        plan,
+        timingContract,
+        width: lockedScript.width,
+        height: lockedScript.height,
+        aspectRatio: lockedScript.aspectRatio,
+      }),
+      lockedScript,
+      { engine: 'html' },
+    )
 
-    const codeRes = await callLlmChat({
-      overrideConfig: llmCfg,
-      fetchImpl,
+    const codeRes = await guardedLlm({
       system: coderPkg.system,
       messages: [{ role: 'user', content: coderPkg.user }],
       maxTokens: 15000,
@@ -1467,6 +1875,11 @@ export async function runAiStudioPipeline(options = {}) {
       llmConfig: llmCfg,
       fetchImpl,
       onProgress: emit,
+      // Locked scenes keep their <template data-scene-id> blocks from before the regeneration
+      protectFiles:
+        Object.keys(lockedHtmlBlocks).length > 0
+          ? (map) => (typeof map['index.html'] === 'string' ? { ...map, 'index.html': applyLockedHtmlStore(map['index.html'], lockedHtmlBlocks).html } : map)
+          : undefined,
     })
   }
 
@@ -1526,6 +1939,7 @@ export async function runAiStudioPipeline(options = {}) {
     builtAt: new Date().toISOString(),
   }
   writeFileSync(join(absDir, 'output', 'ai_build_log.json'), JSON.stringify(buildLog, null, 2) + '\n', 'utf8')
+  snapshotProjectVersion(absDir, 'post-ai', { author: 'ai', stage: 'ai-studio' })
 
   let renderResult = null
   if (render !== false) {
@@ -1549,33 +1963,77 @@ export async function runAiStudioPipeline(options = {}) {
   }
 }
 
+function summarizeRefinePrep(prep) {
+  return {
+    mode: prep.mode,
+    affectedSceneIds: prep.affectedSceneIds,
+    skippedLockedScenes: prep.skippedLockedScenes,
+    lockedSceneIds: prep.lockedSceneIds,
+    timeMap: prep.timeMap,
+    region: prep.region,
+    allowedFiles: prep.allowedFiles,
+  }
+}
+
 /**
  * Natural-language surgical refinement on a scene or whole project, with history backup and auto-repair.
+ * 指哪改哪: optional `timeRange` ({ startSec, endSec } on the final timeline) and/or `region`
+ * ({ x, y, w, h } normalised 0–1) confine the change to the affected scenes' local frame windows and
+ * screen area; only the affected batch / scene files may change. Locked scenes are never modified.
+ * Returns the before/after history version ids and their diff summary.
  */
 export async function refineAiScene({
   projectDir,
   sceneId = '',
+  sceneIds = [],
   instruction,
+  timeRange = null,
+  region = null,
   llmOverride = {},
   fetchImpl,
   render = true,
+  dryRun = false,
   onProgress,
 } = {}) {
   if (!projectDir) throw new Error('projectDir is required')
-  if (!instruction || !String(instruction).trim()) throw new Error('请填写对 AI 的修改意见')
 
   const absDir = resolve(projectDir)
   const script = readScriptJson(absDir).data
   const engine = script.engine === 'remotion' ? 'remotion' : 'html'
-  const llmCfg = resolveLlmConfig(llmOverride)
   const emit = (stage, progress, message) => onProgress?.({ stage, progress, message })
+  const targetSceneId = sceneId === 'ALL' ? '' : String(sceneId || '')
+
+  // 指哪改哪 scope + human edit protection (locked scenes are refused / skipped)
+  const prep = prepareTargetedRefine({ absDir, script, sceneId: targetSceneId, sceneIds, timeRange, region })
+  const targeted = summarizeRefinePrep(prep)
+  const wouldRefuse = prep.mode !== 'global' && prep.affectedSceneIds.length === 0
+  if (dryRun) {
+    // Preview only: affected scenes, local frame windows, region pixels and editable files (no LLM call, no writes)
+    const { promptBlock, ...preview } = prep
+    return { ok: true, dryRun: true, projectDir: absDir, ...preview, constraints: promptBlock, wouldRefuse, targeted }
+  }
+  if (!instruction || !String(instruction).trim()) throw new Error('请填写对 AI 的修改意见')
+  const llmCfg = resolveLlmConfig(llmOverride)
+  if (wouldRefuse) {
+    const message = `场景 ${prep.skippedLockedScenes.join(', ')} 已被锁定（人工保护），AI 精修已跳过；如需修改请先解锁。`
+    emit('done', 100, message)
+    return { ok: false, refused: true, locked: true, projectDir: absDir, skippedLockedScenes: prep.skippedLockedScenes, message, targeted }
+  }
 
   emit('backup', 10, '正在保存当前版本快照以支持一键撤回...')
-  snapshotProjectVersion(absDir, 'pre-refine')
+  const beforeVersion = snapshotProjectVersion(absDir, 'pre-refine', { author: 'user', stage: 'refine', note: String(instruction).slice(0, 160) })
+  let lockedModules = []
   if (engine === 'remotion') {
     writeShotcraftRemotionLib(absDir)
     writeNarrativeDioramaRemotionLib(absDir)
+    writeFigureKitRemotionLib(absDir)
+    lockedModules = preserveLockedSceneModules(absDir, new Set(prep.lockedSceneIds), {
+      sceneIds: (script.scenes || []).map((s) => s.id),
+    }).modules
+    writeLockedRegistryBlock(absDir, lockedModules)
   }
+  // HTML engine: locked scenes' <template> blocks as captured when they were locked (first capture wins)
+  const lockedHtmlBlocks = engine === 'html' ? syncLockedHtmlStore(absDir, script) : {}
 
   // Gather current workspace source files
   const currentFiles = {}
@@ -1596,19 +2054,38 @@ export async function refineAiScene({
     currentFiles['index.html'] = readFileSync(join(absDir, 'index.html'), 'utf8')
   }
 
-  emit('coder', 35, `大模型正在按您的要求精修 (${sceneId || '全局'})...`)
+  // Files shown to the LLM: scene / targeted mode only exposes the affected modules; Locked_ copies never
+  const visibleFiles = {}
+  for (const [rel, code] of Object.entries(currentFiles)) {
+    if (/src\/scenes\/Locked_/.test(rel)) continue
+    if (prep.allowedFiles && !prep.allowedFiles.includes(rel)) continue
+    visibleFiles[rel] = code
+  }
+
+  emit('coder', 35, `大模型正在按您的要求精修 (${prep.mode === 'global' ? '全局' : prep.affectedSceneIds.join(', ')})...`)
   const system = `你是资深 ${engine === 'remotion' ? 'Remotion TSX + 原生 Three.js 3D + 动态 SVG' : 'HyperFrames HTML'} 视频创意工程师。
 用户正在微调一个已有视频工程。请完全根据用户的自然语言需求自由编写/修改对应的 3D 场景与 2D 动态 SVG 视觉（不受任何固定预设限制！在 Remotion 中可从 './lib/shotcraft' 或 '../lib/shotcraft' 导入 FreeformThreeStage, FreeformThreeApi, buildSmoothSvgPath, describeSvgArc, ThreeCyberStage, SvgArchitectureDiagram, HudDataDashboard, computeBeatSpring, BeatSpringPhysicsRig 等自由造景原语），输出严格 JSON：
 {
   "files": { "相对路径": "完整更新后的源码" },
   "narrationUpdate": { "sceneId": "若需改口播词可填，否则省略" }
 }
-必须严格遵守原工程技术铁律（${engine === 'remotion' ? '禁止 CSS transition: / @keyframes / Math.random，导出 VideoComposition 且保留 <Audio src={staticFile("master-audio.wav")} />' : '保留 window.__seekToFrame / window.__totalFrames / <script id="dsh-script-data">'}）。`
+必须严格遵守原工程技术铁律（${engine === 'remotion' ? '禁止 CSS transition: / @keyframes / Math.random，导出 VideoComposition 且保留 <Audio src={staticFile("master-audio.wav")} />' : '保留 window.__seekToFrame / window.__totalFrames / <script id="dsh-script-data">'}）。${prep.promptBlock ? `\n${prep.promptBlock}` : ''}`
 
   const user = JSON.stringify(
     {
-      targetSceneId: sceneId || 'ALL',
+      targetSceneId: targetSceneId || (prep.mode === 'global' ? 'ALL' : prep.affectedSceneIds.join(',')),
+      affectedSceneIds: prep.mode === 'global' ? undefined : prep.affectedSceneIds,
       userInstruction: instruction,
+      targetConstraints: prep.promptBlock || undefined,
+      timeWindow: prep.timeMap
+        ? {
+            global: prep.timeMap.clamped,
+            scenes: prep.timeMap.scenes
+              .filter((s) => prep.affectedSceneIds.includes(s.sceneId))
+              .map((s) => ({ sceneId: s.sceneId, localStartFrame: s.localStartFrame, localEndFrame: s.localEndFrame })),
+          }
+        : undefined,
+      region: prep.region || undefined,
       canvas: { width: script.width, height: script.height, fps: script.fps, totalDurationInFrames: script.totalDurationInFrames },
       scenesSummary: (script.scenes || []).map((s) => ({
         id: s.id,
@@ -1616,46 +2093,101 @@ export async function refineAiScene({
         narration: s.narration,
         startFrame: s.startFrame,
         durationInFrames: s.durationInFrames,
+        ...(prep.lockedSceneIds.includes(s.id) ? { locked: true } : {}),
       })),
-      currentFiles,
+      otherFiles: Object.keys(currentFiles).filter((f) => !(f in visibleFiles)),
+      currentFiles: visibleFiles,
     },
     null,
     2,
   )
 
-  const res = await callLlmChat({
-    overrideConfig: llmCfg,
-    fetchImpl,
-    system,
-    messages: [{ role: 'user', content: user }],
-    temperature: 0.3,
-  })
+  let res
+  try {
+    res = await callLlmChat({
+      overrideConfig: llmCfg,
+      fetchImpl,
+      system,
+      messages: [{ role: 'user', content: user }],
+      temperature: 0.3,
+    })
+  } catch (err) {
+    if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: llmCfg?.model || '' })
+    throw err
+  }
   const parsed = extractJsonFromLlmText(res.text)
-  const patchFiles = parsed?.files && typeof parsed.files === 'object' ? parsed.files : {}
+  const rawPatch = parsed?.files && typeof parsed.files === 'object' ? parsed.files : {}
+  const { accepted: patchFiles, rejected: rejectedFiles } = filterRefinePatch(rawPatch, prep, currentFiles)
   if (Object.keys(patchFiles).length === 0) {
-    throw new Error('大模型未返回任何代码修改文件。')
+    throw new Error(
+      rejectedFiles.length > 0
+        ? `大模型返回的修改均超出允许范围，已全部丢弃：${rejectedFiles.map((r) => `${r.path}（${r.reason}）`).join('；')}`
+        : '大模型未返回任何代码修改文件。',
+    )
   }
 
-  // Optional narration update -> re-synthesize changed scene voice
-  let updatedScript = script
+  // Optional narration update -> re-synthesize changed scene voice (never for locked / out-of-scope scenes).
+  // The model call above can take minutes and the async refine leaves the UI editable: always apply changes to a FRESH
+  // copy of script.json, never to the one read at the start, or every edit saved meanwhile would be reverted.
+  const skippedNarrationUpdates = []
   if (parsed?.narrationUpdate && typeof parsed.narrationUpdate === 'object') {
     for (const [sid, newNar] of Object.entries(parsed.narrationUpdate)) {
-      const target = (updatedScript.scenes || []).find((s) => s.id === sid)
-      if (target && newNar && String(newNar).trim() && String(newNar).trim() !== target.narration) {
+      const fresh = readScriptJson(absDir).data
+      const target = (fresh.scenes || []).find((s) => s.id === sid)
+      if (!target) continue
+      if (prep.lockedSceneIds.includes(sid) || (prep.mode !== 'global' && !prep.affectedSceneIds.includes(sid))) {
+        skippedNarrationUpdates.push(sid)
+        continue
+      }
+      // narration the user wrote by hand (recorded override) wins over the model's suggestion
+      const userOv = fresh.userOverrides && fresh.userOverrides[sid]
+      if (userOv && Object.prototype.hasOwnProperty.call(userOv, 'narration')) {
+        skippedNarrationUpdates.push(sid)
+        continue
+      }
+      if (newNar && String(newNar).trim() && String(newNar).trim() !== target.narration) {
         target.narration = String(newNar).trim()
-        writeScriptJson(absDir, updatedScript)
+        writeScriptJson(absDir, fresh)
         await executeGenerateSpeech({
           text: target.narration,
           emotion: target.emotion || '平静',
           voiceId: target.voiceId || 'auto',
-          fps: updatedScript.fps || 30,
+          fps: fresh.fps || 30,
           outputPath: join(absDir, 'audio', `${target.id}.wav`),
           scriptPath: absDir,
           sceneId: target.id,
         })
       }
     }
-    updatedScript = readScriptJson(absDir).data
+  }
+
+  // Enforced on every repair round: Locked_ copies & out-of-scope files are reverted, registry keeps lock block
+  const protectFiles = (map) => {
+    const out = {}
+    for (const [k, v] of Object.entries(map)) {
+      const rel = String(k).replace(/\\/g, '/').replace(/^\/+/, '')
+      if (/src\/scenes\/Locked_/.test(rel)) {
+        if (rel in currentFiles) out[rel] = currentFiles[rel]
+        continue
+      }
+      if (prep.allowedFiles && !prep.allowedFiles.includes(rel)) {
+        if (rel in currentFiles) {
+          out[rel] = currentFiles[rel]
+          continue
+        }
+        if (!(prep.createAllowed && /^src\/scenes\/[\w-]+\.tsx$/.test(rel))) continue
+      }
+      out[rel] = v
+    }
+    if (lockedModules.length > 0 && typeof out['src/scenes/index.ts'] === 'string') {
+      out['src/scenes/index.ts'] = applyLockedRegistryBlock(out['src/scenes/index.ts'], lockedModules)
+    }
+    // HTML engine: the page is one file — put locked scenes' <template data-scene-id> blocks back verbatim
+    if (engine === 'html' && prep.lockedSceneIds.length > 0 && typeof out['index.html'] === 'string') {
+      if (Object.keys(lockedHtmlBlocks).length > 0) out['index.html'] = applyLockedHtmlStore(out['index.html'], lockedHtmlBlocks).html
+      else if (currentFiles['index.html']) out['index.html'] = restoreLockedHtmlScenes(currentFiles['index.html'], out['index.html'], prep.lockedSceneIds).html
+    }
+    return out
   }
 
   const mergedFiles = { ...currentFiles, ...patchFiles }
@@ -1664,20 +2196,24 @@ export async function refineAiScene({
     engine,
     systemPrompt: system,
     initialFiles: mergedFiles,
-    lockedScript: updatedScript,
+    lockedScript: readScriptJson(absDir).data,
     maxRepairRounds: llmCfg.maxRepairRounds || 3,
     llmConfig: llmCfg,
     fetchImpl,
     onProgress: emit,
+    protectFiles,
   })
 
   if (!checkRes.ok) {
     throw new Error(`局部修改自动修复未通过质检: ${(checkRes.errors || []).slice(0, 3).join(' | ')}`)
   }
 
+  // re-read once more: the repair loop above also takes minutes (see the narration note)
+  const updatedScript = readScriptJson(absDir).data
   updatedScript.authoringMode = 'ai-coded'
+  const touchedIds = new Set(prep.mode === 'global' ? (updatedScript.scenes || []).map((s) => s.id) : prep.affectedSceneIds)
   updatedScript.scenes = (updatedScript.scenes || []).map((sc) => {
-    if (!sceneId || sceneId === 'ALL' || sc.id === sceneId) {
+    if (touchedIds.has(sc.id) && !prep.lockedSceneIds.includes(sc.id)) {
       const next = { ...sc }
       delete next.useBuiltinLayout
       return next
@@ -1688,8 +2224,30 @@ export async function refineAiScene({
     ...(updatedScript.aiMeta || {}),
     lastRefineInstruction: instruction,
     lastRefineAt: new Date().toISOString(),
+    lastRefineTarget:
+      prep.mode === 'global'
+        ? null
+        : {
+            mode: prep.mode,
+            sceneIds: prep.affectedSceneIds,
+            timeRange: prep.timeMap ? prep.timeMap.clamped : null,
+            region: prep.region ? { x: prep.region.x, y: prep.region.y, w: prep.region.w, h: prep.region.h } : null,
+          },
   }
   writeScriptJson(absDir, updatedScript)
+
+  const afterVersion = snapshotProjectVersion(absDir, 'post-refine', { author: 'ai', stage: 'refine', note: String(instruction).slice(0, 160) })
+  let diff = null
+  if (beforeVersion?.id && afterVersion?.id) {
+    try {
+      diff =
+        beforeVersion.id === afterVersion.id
+          ? { ok: true, changedFiles: [], scenes: { added: [], removed: [], changed: [], reordered: false }, scriptFields: [], summaryText: '无实际变更' }
+          : diffProjectVersions(absDir, beforeVersion.id, afterVersion.id)
+    } catch (err) {
+      diff = { ok: false, error: err?.message || String(err) }
+    }
+  }
 
   let renderResult = null
   if (render !== false) {
@@ -1707,6 +2265,12 @@ export async function refineAiScene({
     ok: true,
     projectDir: absDir,
     updatedFiles: Object.keys(patchFiles),
+    rejectedFiles,
+    skippedNarrationUpdates,
+    targeted,
+    beforeVersionId: beforeVersion?.id || '',
+    afterVersionId: afterVersion?.id || '',
+    diff,
     repairHistory: checkRes.repairHistory,
     script: readScriptJson(absDir).data,
     render: renderResult,

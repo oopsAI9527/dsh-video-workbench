@@ -35,6 +35,20 @@ export function setupDshVideoProfile() {
   loadEnv()
   const dshHome = resolveEnvPath('DSH_VIDEO_HOME', './.dsh-home')
   const videoProfileDir = join(dshHome, 'profiles', 'video')
+  // A second copy of the plugin (a git worktree, a test run, a preview for acceptance) must not re-point the user's DSH
+  // `video` profile and desktop mount at itself: DSH_VIDEO_SKIP_PROFILE_MOUNT=1 leaves both untouched.
+  if (process.env.DSH_VIDEO_SKIP_PROFILE_MOUNT === '1') {
+    return {
+      dshHome: resolve(dshHome),
+      videoProfileDir,
+      profilePatchPath: join(videoProfileDir, 'cordis.patch.yml'),
+      desktopMounted: false,
+      desktopPatchPath: '',
+      desktopPkgPath: '',
+      pluginPaths: [],
+      skipped: true,
+    }
+  }
   mkdirSync(videoProfileDir, { recursive: true })
 
   // Keep standalone `video` runner explicit plugin paths

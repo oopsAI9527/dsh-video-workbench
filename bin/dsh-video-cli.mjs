@@ -76,6 +76,21 @@ if (cmd === 'mcp') {
   console.log(`• Hardware      : ${hw.cpu.threads} threads · ${hw.memory.freeGB}/${hw.memory.totalGB} GB RAM · ${hw.gpu.primaryName}`)
   console.log(`• Verdict       : ${hw.verdictTitle}`)
   console.log(`• MCP Tools     : ${tools.size} tools ready (${Array.from(tools.keys()).slice(0, 8).join(', ')}, ...)`)
+  try {
+    const { getVibeToolkitStatus } = await import('../packages/dsh-tool-media/vibe-toolkit-lib.js')
+    const vibe = getVibeToolkitStatus()
+    console.log(`• Vibecoding    : ${vibe.filter((t) => t.available).length}/${vibe.length} tools ready`)
+    for (const t of vibe) {
+      const state = t.available ? `✓ ${t.version || 'ready'}` : t.optional ? '– optional, not installed (built-in JS DSP fallback)' : '✗ missing (run pnpm install)'
+      console.log(`    ${t.name.padEnd(14)} ${state}`)
+    }
+  } catch (err) {
+    console.log(`• Vibecoding    : status unavailable (${err?.message || err})`)
+  }
+} else if (cmd === 'plaza') {
+  // 影核广场维护（作者用）：review / accept / add / index —— see packages/dsh-tool-media/plaza-cli.js and docs/plaza-community.md
+  const { runPlazaCli } = await import('../packages/dsh-tool-media/plaza-cli.js')
+  process.exitCode = await runPlazaCli(args.slice(1))
 } else if (cmd === 'print-config') {
   const mcpAbs = join(PACKAGE_ROOT, 'bin', 'dsh-video-mcp.mjs').replace(/\\/g, '/')
   const target = (args[1] || 'all').toLowerCase()
@@ -105,5 +120,6 @@ Commands:
   doctor                           Check hardware, FFmpeg, Remotion, TTS & registered tools
   install-tts --engine <id>        Install optional local TTS model (edge-tts / indextts25 / gptvoice / indextts2)
   print-config [claude|codex|workbuddy|cursor|dsh]  Print copy-paste MCP/plugin config for your agent
+  plaza review|accept|add|index    影核广场维护：审核 / 收录投稿包、发布自己的工程、生成在线模板目录（plaza help）
 `)
 }

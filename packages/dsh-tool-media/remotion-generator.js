@@ -16,6 +16,8 @@ import {
 } from '../shared/index.js'
 import { resolvePalette } from './html-generator.js'
 import { readAssets } from './asset-manager.js'
+import { writeFigureKitRemotionLib } from './figure-kit.js'
+import { isEpicCombatContext } from './genre-router.js'
 import { writeNarrativeDioramaRemotionLib } from './narrative-diorama.js'
 import { writeShotcraftRemotionLib } from './shotcraft-lib.js'
 import { buildMediaDimsMap } from './vision-grounding.js'
@@ -87,6 +89,12 @@ export function writeRemotionProjectFiles(projectDir, script, { rebuildTemplate 
   syncRemotionPublicAssets(absDir, script)
   writeShotcraftRemotionLib(absDir)
   writeNarrativeDioramaRemotionLib(absDir)
+  writeFigureKitRemotionLib(absDir)
+  // battle-epic treatment (slash wipes only, diorama fallback) for history films and history-themed MVs only
+  const epicContext = isEpicCombatContext({
+    genre: script?.genre || '',
+    text: `${script?.genreLabel || ''} ${script?.displayTitle || ''} ${script?.title || ''} ${script?.topic || ''}`,
+  })
 
   const hasCustomRegistry = useCustomSceneRegistry !== undefined
     ? Boolean(useCustomSceneRegistry)
@@ -179,9 +187,12 @@ import {
 import scriptData from '../script.json';
 import { AIBadge, AppWindow, AvatarOverlay, BeatSpringPhysicsRig, BeforeAfterWipe, buildSmoothSvgPath, computeBeatSpring, describeSvgArc, EndNotice, FocusShot, FreeformThreeStage, HudDataDashboard, HudTelemetryOverlay, MetricPanel, SceneTransitionOverlay, SvgArchitectureDiagram, ThreeCyberStage, THREE_STAGE_PRESETS, WorkflowBar, FONT_SANS, FONT_MONO, FONT_SERIF } from './lib/shotcraft';
 import { NarrativeDioramaStage } from './lib/narrative-diorama';
+import { scheduleFlashBudget } from './lib/flash-budget';
+import { CameraMotionBlur } from '@remotion/motion-blur';
 ${hasCustomRegistry ? "import { CUSTOM_SCENE_MAP } from './scenes';" : 'const CUSTOM_SCENE_MAP: Record<string, React.ComponentType<any>> = {};'}
 
 const PALETTE: any = ${JSON.stringify(theme)};
+const EPIC_CONTEXT: boolean = ${epicContext ? 'true' : 'false'};
 const SANS = FONT_SANS;
 const MONO = FONT_MONO;
 const DEFAULT_SUBTITLE_BOTTOM = ${safeZone.subtitleBottomPx};
@@ -200,6 +211,86 @@ const PARTICLES = Array.from({ length: 34 }, (_, i) => {
     alpha: 0.14 + (i % 5) * 0.06,
   };
 });
+
+// Atmosphere layer (any genre): particles chosen by what the shot shows (scene.atmosphere: dust / embers / snow / rain /
+// petals / leaves / bokeh / motes / fireflies / mist / none — planned by the director or inferred from the storyboard).
+// Every position, sway and twinkle is a pure function of the absolute frame; no flashes, no full-frame brightness change.
+const ATMO_SEEDS = Array.from({ length: 72 }, (_, i) => {
+  const s = (i * 7919 + 104729) % 100003;
+  return { x0: (s % 997) / 997, y0: ((s * 13) % 991) / 991, r: ((s * 31) % 97) / 97, ph: (i * 0.73) % 6.283, i };
+});
+
+const AmbientAtmosphere: React.FC<{ kind: string; absFrame: number; width: number; height: number; bp: number; accent: string; accent2: string }> = ({ kind, absFrame, width, height, bp, accent, accent2 }) => {
+  if (!kind || kind === 'none') return null;
+  const t = absFrame;
+  const u = width / 1920;
+  const wrap = (v: number): number => ((v % 1) + 1) % 1;
+  const els: React.ReactNode[] = [];
+  const count = kind === 'rain' ? 70 : kind === 'snow' ? 56 : kind === 'mist' ? 5 : kind === 'bokeh' ? 20 : kind === 'motes' ? 44 : kind === 'fireflies' ? 26 : kind === 'petals' || kind === 'leaves' ? 26 : 40;
+  for (let n = 0; n < count; n++) {
+    const p = ATMO_SEEDS[n % ATMO_SEEDS.length];
+    const key = 'atmo-' + n;
+    if (kind === 'rain') {
+      const x = wrap(p.x0 + t * 0.0016) * (width + 200) - 100;
+      const y = wrap(p.y0 + t * (0.035 + p.r * 0.02)) * (height + 120) - 60;
+      const len = (26 + p.r * 22) * u;
+      els.push(<line key={key} x1={x} y1={y} x2={x - len * 0.22} y2={y + len} stroke="#D6E4F0" strokeWidth={Math.max(1, 1.6 * u)} opacity={0.22 + p.r * 0.2} strokeLinecap="round" />);
+    } else if (kind === 'snow') {
+      const x = wrap(p.x0 + t * 0.0004 + Math.sin(t * 0.03 + p.ph) * 0.006) * width;
+      const y = wrap(p.y0 + t * (0.0018 + p.r * 0.0016)) * height;
+      els.push(<circle key={key} cx={x} cy={y} r={(2.6 + p.r * 5.5) * u} fill="url(#atmo-soft-white)" opacity={0.55 + p.r * 0.35} />);
+    } else if (kind === 'petals' || kind === 'leaves') {
+      const x = wrap(p.x0 + t * (0.0011 + p.r * 0.0008) + Math.sin(t * 0.025 + p.ph) * 0.01) * width;
+      const y = wrap(p.y0 + t * (0.0016 + p.r * 0.0012)) * height;
+      const rot = (t * (1.6 + p.r * 2.4) + p.ph * 57) % 360;
+      const c = kind === 'petals' ? (n % 3 === 0 ? '#FBCFE8' : '#F9A8D4') : n % 3 === 0 ? '#B45309' : n % 3 === 1 ? '#D97706' : '#92400E';
+      const s2 = (kind === 'petals' ? 5 : 8) * (0.7 + p.r * 0.7) * u;
+      els.push(<ellipse key={key} cx={x} cy={y} rx={s2} ry={s2 * 0.48} fill={c} opacity={0.62 + p.r * 0.25} transform={'rotate(' + rot.toFixed(1) + ' ' + x.toFixed(1) + ' ' + y.toFixed(1) + ')'} />);
+    } else if (kind === 'bokeh') {
+      const x = wrap(p.x0 + t * 0.0003 * (p.r - 0.5)) * width;
+      const y = wrap(p.y0 + Math.sin(t * 0.008 + p.ph) * 0.02) * height;
+      const r = (26 + p.r * 70) * u;
+      els.push(<circle key={key} cx={x} cy={y} r={r} fill={n % 2 ? 'url(#atmo-soft-accent)' : 'url(#atmo-soft-accent2)'} opacity={0.14 + p.r * 0.14 + bp * 0.04} />);
+    } else if (kind === 'mist') {
+      const y = (0.35 + p.y0 * 0.55) * height;
+      const x = wrap(p.x0 + t * (0.0004 + p.r * 0.0004)) * (width * 1.6) - width * 0.3;
+      els.push(<ellipse key={key} cx={x} cy={y} rx={width * (0.35 + p.r * 0.25)} ry={height * (0.06 + p.r * 0.05)} fill="url(#atmo-soft-white)" opacity={0.1 + p.r * 0.08} />);
+    } else if (kind === 'fireflies') {
+      const x = (p.x0 + Math.sin(t * 0.017 + p.ph) * 0.04) * width;
+      const y = (0.35 + p.y0 * 0.6 + Math.cos(t * 0.021 + p.ph * 2) * 0.03) * height;
+      const blink = 0.35 + 0.65 * Math.max(0, Math.sin(t * 0.09 + p.ph * 3));
+      els.push(<circle key={key} cx={x} cy={y} r={(5 + p.r * 5) * u} fill="url(#atmo-soft-lime)" opacity={0.25 + blink * 0.55} />);
+    } else if (kind === 'motes') {
+      const x = wrap(p.x0 + Math.sin(t * 0.012 + p.ph) * 0.01) * width;
+      const y = wrap(p.y0 - t * (0.0007 + p.r * 0.0006)) * height;
+      const tw = 0.55 + 0.45 * Math.sin(t * 0.08 + p.ph * 2);
+      els.push(<circle key={key} cx={x} cy={y} r={(1.6 + p.r * 2.4) * u} fill={n % 3 ? accent : accent2} opacity={(0.3 + p.r * 0.3) * tw} />);
+    } else {
+      // dust (warm specks) / embers (glowing rising sparks)
+      const ember = kind === 'embers';
+      const x = wrap(p.x0 + t * (ember ? 0.0003 : 0.00055) * (n % 2 ? 1 : -0.6)) * width + Math.sin(t * 0.05 + p.ph) * (8 + p.r * 10) * u;
+      const y = wrap(p.y0 - t * (ember ? 0.0016 + p.r * 0.0014 : 0.0005 + p.r * 0.0005)) * height;
+      const tw = 0.7 + 0.3 * Math.sin(t * (ember ? 0.21 : 0.11) + p.ph * 2);
+      const r = (ember ? 2.4 + p.r * 3.6 : 1.8 + p.r * 3.2) * u;
+      els.push(<circle key={key} cx={x} cy={y} r={r * 2.6} fill={ember ? 'url(#atmo-soft-ember)' : 'url(#atmo-soft-dust)'} opacity={Math.min(0.95, (ember ? 0.55 : 0.42) * tw + bp * 0.08)} />);
+    }
+  }
+  return (
+    <AbsoluteFill style={{ pointerEvents: 'none', zIndex: 18 }}>
+      <svg viewBox={'0 0 ' + width + ' ' + height} width="100%" height="100%">
+        <defs>
+          <radialGradient id="atmo-soft-white"><stop offset="0" stopColor="#FFFFFF" stopOpacity="1" /><stop offset="1" stopColor="#FFFFFF" stopOpacity="0" /></radialGradient>
+          <radialGradient id="atmo-soft-dust"><stop offset="0" stopColor="#FFE7B8" stopOpacity="1" /><stop offset="0.35" stopColor="#F2C27B" stopOpacity="0.75" /><stop offset="1" stopColor="#F2C27B" stopOpacity="0" /></radialGradient>
+          <radialGradient id="atmo-soft-ember"><stop offset="0" stopColor="#FFF4D6" stopOpacity="1" /><stop offset="0.3" stopColor="#FFB547" stopOpacity="0.9" /><stop offset="1" stopColor="#FF6A1A" stopOpacity="0" /></radialGradient>
+          <radialGradient id="atmo-soft-lime"><stop offset="0" stopColor="#F7FFD6" stopOpacity="1" /><stop offset="0.35" stopColor="#D9F99D" stopOpacity="0.8" /><stop offset="1" stopColor="#A3E635" stopOpacity="0" /></radialGradient>
+          <radialGradient id="atmo-soft-accent"><stop offset="0" stopColor={accent} stopOpacity="0.9" /><stop offset="1" stopColor={accent} stopOpacity="0" /></radialGradient>
+          <radialGradient id="atmo-soft-accent2"><stop offset="0" stopColor={accent2} stopOpacity="0.9" /><stop offset="1" stopColor={accent2} stopOpacity="0" /></radialGradient>
+        </defs>
+        {els}
+      </svg>
+    </AbsoluteFill>
+  );
+};
 
 const OPENER_SLOTS = [
   { x: -720, y: -340, z: -260, rx: 14, ry: 22, rz: -8, scale: 0.85 },
@@ -227,18 +318,82 @@ function hashNum(n: number): number {
   return s - Math.floor(s);
 }
 
+// Title units: whole Latin words / numbers / URLs stay together; every CJK char or punctuation is its own unit.
+function tokenizeTitleUnits(txt: string): string[] {
+  return String(txt || '').match(/[A-Za-z0-9][\\w.+%#&'’\\/-]*|\\s+|./gsu) || [];
+}
+
+// Approximate rendered width in CJK-character units (full-width = 1, Latin/digits ≈ 0.56, space ≈ 0.3).
+function titleUnitWidth(unit: string): number {
+  let w = 0;
+  for (const ch of unit) w += /[\\u2E80-\\u9FFF\\uF900-\\uFAFF\\uFF00-\\uFFEF\\u3000-\\u303F]/u.test(ch) ? 1 : /\\s/.test(ch) ? 0.3 : 0.56;
+  return w;
+}
+
+// Word boundaries (UTF-16 offsets) from Intl.Segmenter, or null when unavailable.
+function titleWordBoundaries(txt: string): Set<number> | null {
+  try {
+    const Seg: any = (Intl as any).Segmenter;
+    if (typeof Seg !== 'function') return null;
+    const set = new Set<number>();
+    for (const seg of new Seg('zh', { granularity: 'word' }).segment(txt) as any) set.add(seg.index + seg.segment.length);
+    return set;
+  } catch {
+    return null;
+  }
+}
+
+// Balanced two-line split at a unit boundary: prefer a colon, then spaces / commas near the visual middle,
+// never split inside a Latin word or number and never start a line with closing punctuation.
 function formatBalancedTitle(rawTitle: string, maxChars = 11): string[] {
   const txt = String(rawTitle || '').trim();
   if (!txt) return [''];
   if (txt.includes('\\n')) return txt.split('\\n').map((s) => s.trim()).filter(Boolean);
-  if (txt.length <= maxChars) return [txt];
+  const units = tokenizeTitleUnits(txt);
+  const total = units.reduce((a, u) => a + titleUnitWidth(u), 0);
+  if (total <= maxChars) return [txt];
   const colonIdx = txt.search(/[：:]/);
   if (colonIdx > 2 && colonIdx < txt.length - 3) {
     return [txt.slice(0, colonIdx + 1).trim(), txt.slice(colonIdx + 1).trim()];
   }
-  const mid = Math.ceil(txt.length / 2);
-  return [txt.slice(0, mid).trim(), txt.slice(mid).trim()];
+  const wordBounds = titleWordBoundaries(txt);
+  let best = -1;
+  let bestScore = Infinity;
+  let acc = 0;
+  let charPos = 0;
+  for (let i = 0; i < units.length - 1; i++) {
+    acc += titleUnitWidth(units[i]);
+    charPos += units[i].length;
+    const cur = units[i];
+    const next = units[i + 1];
+    if (/^[，。、！？；：,.!?;:）)》」』】%]/u.test(next)) continue;
+    if (/[（(《「『【“‘]$/u.test(cur)) continue;
+    let score = Math.abs(acc - total / 2);
+    const overflow = Math.max(acc, total - acc) - maxChars;
+    if (overflow > 0) score += overflow * 1.5;
+    if (/[，、,；;·—]$/u.test(cur)) score -= Math.max(0.9, total * 0.18);
+    else if (/^\\s+$/.test(cur) || /^\\s+$/.test(next)) score -= Math.max(0.6, total * 0.08);
+    else if (wordBounds && !wordBounds.has(charPos)) score += 1.2;
+    if (score < bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  if (best < 0) return [txt];
+  return [units.slice(0, best + 1).join('').trim(), units.slice(best + 1).join('').trim()].filter(Boolean);
 }
+
+// Landscape corner PiP: scale the whole scene into the lane beside the avatar so titles/media never hide under it.
+const PipSafeStage: React.FC<{ reserveX: number; onLeft: boolean; children: React.ReactNode }> = ({ reserveX, onLeft, children }) => {
+  const { width } = useVideoConfig();
+  if (!reserveX || reserveX <= 0) return <>{children}</>;
+  const k = Math.max(0.7, Math.min(1, (width - reserveX) / width));
+  return (
+    <AbsoluteFill style={{ overflow: 'hidden' }}>
+      <AbsoluteFill style={{ transform: \`scale(\${k})\`, transformOrigin: onLeft ? 'right center' : 'left center' }}>{children}</AbsoluteFill>
+    </AbsoluteFill>
+  );
+};
 
 function getBeatPulse(tSec: number, beats: any[]): number {
   if (!Array.isArray(beats) || beats.length === 0) return 0;
@@ -257,6 +412,32 @@ function getBeatPulse(tSec: number, beats: any[]): number {
   return best;
 }
 
+const SUB_CRIMSON_RE = /(私生子|匈奴|单于|楼兰|斩首|斩杀|斩|杀过去|杀|破阵|血战|血|死|战神|战|陨落|突袭|绝杀|锋芒|交锋|伏击|重围|决战|狂奔|冲锋|最前面|王庭|灭|敌|痛|失我|悲歌|孤军|激战|铁骑)/;
+const SUB_GOLD_RE = /(霍去病|冠军侯|大将军|皇后|汉武帝|卫青|大汉|封狼居胥|饮马瀚海|禅于姑衍|河西走廊|河西|祁连山|焉支山|丝绸之路|茂陵|长安|汉军|漠北|漠南|秦始皇|项羽|霸王|中国|天下|公元前?\\d+年?|前\\d+年|\\d+[万千百十亿]+[余多]?[人骑里年岁战级]?|\\d+岁|\\d+年|\\d+里|\\d+人|\\d+级|\\d+日)/;
+
+function pickSubtitleAccentColor(word: string, idx = 0): { color: string; glow: string } {
+  const w = String(word || '');
+  if (SUB_CRIMSON_RE.test(w)) {
+    return { color: '#FF3B30', glow: '0 0 18px rgba(255,59,48,0.65), 0 3px 10px rgba(0,0,0,0.98)' };
+  }
+  if (SUB_GOLD_RE.test(w)) {
+    return { color: '#FFD84D', glow: '0 0 18px rgba(255,216,77,0.58), 0 3px 10px rgba(0,0,0,0.98)' };
+  }
+  return idx % 2 === 0
+    ? { color: '#FFD84D', glow: '0 0 16px rgba(255,216,77,0.52), 0 3px 10px rgba(0,0,0,0.98)' }
+    : { color: '#FF453A', glow: '0 0 16px rgba(255,69,58,0.56), 0 3px 10px rgba(0,0,0,0.98)' };
+}
+
+function autoExtractSubHighlights(text: string): string[] {
+  const hits: string[] = [];
+  const rx = new RegExp(\`\${SUB_CRIMSON_RE.source}|\${SUB_GOLD_RE.source}\`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(text)) !== null) {
+    if (m[0] && !hits.includes(m[0])) hits.push(m[0]);
+  }
+  return hits.slice(0, 6);
+}
+
 function renderSubtitleSegments(rawText: string, accentWords: string[] = []): React.ReactNode {
   const clean = String(rawText || '').trim();
   if (!clean) return null;
@@ -272,16 +453,22 @@ function renderSubtitleSegments(rawText: string, accentWords: string[] = []): Re
   if (cursor < clean.length) {
     parts.push({ text: clean.slice(cursor), accent: false });
   }
-  const kwList = (Array.isArray(accentWords) ? accentWords : []).map((w) => String(w || '').trim()).filter(Boolean);
+  const explicitKws = (Array.isArray(accentWords) ? accentWords : []).map((w) => String(w || '').trim()).filter(Boolean);
+  const autoKws = autoExtractSubHighlights(clean);
+  const kwList = Array.from(new Set([...explicitKws, ...autoKws])).sort((a, b) => b.length - a.length);
   if (kwList.length === 0) {
-    return parts.map((p, pi) =>
-      p.accent ? <span key={pi} style={{ color: '#F6C26B' }}>{p.text}</span> : <span key={pi}>{p.text}</span>
-    );
+    return parts.map((p, pi) => {
+      if (!p.accent) return <span key={pi}>{p.text}</span>;
+      const sty = pickSubtitleAccentColor(p.text, pi);
+      return <span key={pi} style={{ color: sty.color, textShadow: sty.glow }}>{p.text}</span>;
+    });
   }
   const out: React.ReactNode[] = [];
+  let accentCounter = 0;
   parts.forEach((part, pi) => {
     if (part.accent) {
-      out.push(<span key={\`p-\${pi}\`} style={{ color: '#F6C26B' }}>{part.text}</span>);
+      const sty = pickSubtitleAccentColor(part.text, accentCounter++);
+      out.push(<span key={\`p-\${pi}\`} style={{ color: sty.color, textShadow: sty.glow }}>{part.text}</span>);
       return;
     }
     let rem = part.text;
@@ -303,12 +490,407 @@ function renderSubtitleSegments(rawText: string, accentWords: string[] = []): Re
       if (bestPos > 0) {
         out.push(<span key={\`\${pi}-\${subIdx++}\`}>{rem.slice(0, bestPos)}</span>);
       }
-      out.push(<span key={\`\${pi}-\${subIdx++}\`} style={{ color: '#F6C26B' }}>{bestKw}</span>);
+      const sty = pickSubtitleAccentColor(bestKw, accentCounter++);
+      out.push(<span key={\`\${pi}-\${subIdx++}\`} style={{ color: sty.color, textShadow: sty.glow }}>{bestKw}</span>);
       rem = rem.slice(bestPos + bestKw.length);
     }
   });
   return out;
 }
+
+/**
+ * Photosensitivity guard (WCAG 2.x / Harding: at most 3 flashes in any 1-second window; the render QA fails above
+ * that). Every full-screen flash this composition can draw is scheduled once from script.json, so frames stay
+ * deterministic in any render order: the shared flash budget keeps them by priority (heavy clash > flash-cut > clash
+ * > light wipes, the diorama beat flash and keyframed camera flashes > the accent wash at a shot's end), at least
+ * 0.5 s apart. A dropped flash is drawn without it: flash-cut / light wipes become zoom-punch, a clash keeps its
+ * sparks, blade arc, sound and shake but loses the white frame.
+ */
+const FLASH_WIPE_KINDS = ['flash-cut', 'slash-wipe', 'light-wipe', 'block-wipe'];
+type SceneFlashGate = { inFlash: boolean; exitFlash: boolean; clash: Record<number, boolean>; kfs: any[] | null };
+const NO_FLASH_GATE: SceneFlashGate = { inFlash: true, exitFlash: true, clash: {}, kfs: null };
+
+/** The transition a scene actually plays: beat-energy cut rhythm, no glitch / iris cuts in historical epics. */
+function resolveSceneTxKind(scene: any, idx: number): string {
+  const sData: any = scriptData;
+  const txKind = scene?.transition || 'iris-circle';
+  const genreName = String(sData?.genre || '').toLowerCase();
+  const narrationModeStr = String(sData?.narrationMode || 'tts').toLowerCase();
+  const isBeatEnergyVideo =
+    narrationModeStr === 'subtitle-mv' ||
+    narrationModeStr === 'tts-beat-sync' ||
+    genreName === 'history-theater' ||
+    genreName === 'mv-lyric';
+  void genreName;
+  const isHistoricalEpic = EPIC_CONTEXT;
+  const rawEffectiveTx =
+    idx > 0 && (!txKind || txKind === 'cut') && isBeatEnergyVideo
+      ? ['cut', 'flash-cut', 'slash-wipe', 'zoom-punch'][idx % 4]
+      : txKind;
+  // BAN cyberpunk glitch-cut & cartoon iris-circle in historical/epic videos!
+  return isHistoricalEpic && (rawEffectiveTx === 'glitch-cut' || rawEffectiveTx === 'iris-circle')
+    ? (scene?.actionMode === 'clash-flurry' ? 'slash-wipe' : scene?.actionMode === 'cavalry' ? 'zoom-punch' : 'cut')
+    : rawEffectiveTx;
+}
+
+const FLASH_GATE: SceneFlashGate[] = (() => {
+  const sData: any = scriptData;
+  const fps = Math.max(1, Number(sData?.fps) || 30);
+  const scenes: any[] = Array.isArray(sData?.scenes) ? sData.scenes : [];
+  const candidates: any[] = [];
+  const cutFrames: number[] = [];
+  const sortedKfs: any[][] = [];
+  scenes.forEach((scene: any, idx: number) => {
+    const start = Number(scene?.startFrame) || 0;
+    const dur = Math.max(8, Number(scene?.durationInFrames) || 90);
+    if (idx > 0) cutFrames.push(start);
+    const effTx = resolveSceneTxKind(scene, idx);
+    const rawTx = String(scene?.transition || 'iris-circle');
+    const isFlashCut = effTx === 'flash-cut' || rawTx === 'flash-cut';
+    const isWipe = FLASH_WIPE_KINDS.includes(effTx) || FLASH_WIPE_KINDS.includes(rawTx);
+    // the history diorama's own beat flash (strong on flash-cut / slash / cavalry shots)
+    const dioramaFlash = scene?.transitionKind === 'flash-cut' || /slash|cavalry/i.test(String(scene?.stageSpec?.archetype || 'hero-stand'));
+    if (isWipe || dioramaFlash) {
+      const inEnd = Math.min(16, Math.max(6, Math.round(dur * 0.45)));
+      candidates.push({ key: 'tx:' + idx, frame: start, len: isFlashCut ? 9 : isWipe ? inEnd : 5, prio: isFlashCut ? 4 : 2, coversCut: idx > 0 ? start : null });
+    }
+    // SceneTransitionOverlay washes the accent colour over the last 5 frames of every non-cut shot
+    if (effTx !== 'cut' || rawTx !== 'cut') {
+      candidates.push({ key: 'exit:' + idx, frame: start + dur - 1, lead: 4, len: 1, prio: 1, coversCut: idx < scenes.length - 1 ? start + dur : null });
+    }
+    const evs: any[] = Array.isArray(scene?.actionEvents) ? scene.actionEvents : [];
+    evs.forEach((ev: any, ei: number) => {
+      const k = String(ev?.kind || '');
+      const f = Number(ev?.frame);
+      if (!(k.startsWith('metal_clash') || k === 'heavy_impact') || !Number.isFinite(f)) return;
+      candidates.push({ key: 'clash:' + idx + ':' + ei, frame: start + Math.round(f), len: 3, prio: k === 'metal_clash_heavy' || k === 'heavy_impact' ? 5 : 3 });
+    });
+    const kfs: any[] = Array.isArray(scene?.cameraKeyframes)
+      ? [...scene.cameraKeyframes].sort((a: any, b: any) => Number(a?.t || 0) - Number(b?.t || 0))
+      : [];
+    sortedKfs.push(kfs);
+    kfs.forEach((kf: any, ki: number) => {
+      if (!(Number(kf?.flash) > 0.1)) return;
+      const clampT = (v: any, d: number) => Math.max(0, Math.min(1, Number.isFinite(Number(v)) ? Number(v) : d));
+      const peak = start + Math.round(clampT(kf?.t, 0) * (dur - 1));
+      // before the first / after the last keyframe the rig holds that keyframe's value to the shot's edge
+      const f0 = start + Math.floor((ki > 0 ? clampT(kfs[ki - 1]?.t, 0) : 0) * (dur - 1));
+      const f1 = start + Math.ceil((ki < kfs.length - 1 ? clampT(kfs[ki + 1]?.t, 1) : 1) * (dur - 1));
+      candidates.push({ key: 'kf:' + idx + ':' + ki, frame: peak, lead: Math.max(0, peak - f0), len: Math.max(1, f1 - peak + 1), prio: 2 });
+    });
+  });
+  const plan: any = scheduleFlashBudget({ fps, candidates, cutFrames });
+  const dropped: Record<string, boolean> = (plan && plan.dropped) || {};
+  return scenes.map((scene: any, idx: number) => {
+    const clash: Record<number, boolean> = {};
+    const evs: any[] = Array.isArray(scene?.actionEvents) ? scene.actionEvents : [];
+    evs.forEach((_ev: any, ei: number) => {
+      if (dropped['clash:' + idx + ':' + ei]) clash[ei] = false;
+    });
+    const kfs: any[] = sortedKfs[idx] || [];
+    const anyKfDropped = kfs.some((_kf: any, ki: number) => Boolean(dropped['kf:' + idx + ':' + ki]));
+    return {
+      inFlash: !dropped['tx:' + idx],
+      exitFlash: !dropped['exit:' + idx],
+      clash,
+      kfs: anyKfDropped ? kfs.map((kf: any, ki: number) => (dropped['kf:' + idx + ':' + ki] ? { ...kf, flash: 0 } : kf)) : null,
+    };
+  });
+})();
+
+function guardFlashTx(kind: string, gate: SceneFlashGate): string {
+  return !gate.inFlash && FLASH_WIPE_KINDS.includes(kind) ? 'zoom-punch' : kind;
+}
+/**
+ * True Timeline Keyframe Camera Rig (Pan X/Y + Punch-In/Zoom-Out + Full-Screen Combat Shake + Strobe Flash).
+ * Flashes follow the scene's photosensitivity gate (FLASH_GATE).
+ */
+function evaluateSceneCameraRig(
+  scene: any,
+  localFrame: number,
+  dur: number,
+  fps: number,
+  bp: number,
+  idx: number,
+  intensity: number,
+  txKind: string,
+  gate: SceneFlashGate = NO_FLASH_GATE,
+) {
+  const p = Math.max(0, Math.min(1, localFrame / Math.max(1, dur - 1)));
+  const actionMode = String(scene?.actionMode || '').toLowerCase();
+  const actionEvents: any[] = Array.isArray(scene?.actionEvents) ? scene.actionEvents : [];
+  const isClashScene = actionMode === 'clash-flurry' || actionMode === 'single-clash';
+  const isCavalryScene = actionMode === 'cavalry';
+  const isDropScene = actionMode === 'drop-impact';
+  const isCleanScene = actionMode === 'clean';
+  const isCombat = isClashScene || isCavalryScene || isDropScene;
+
+  // 1. Optional explicit timeline cameraKeyframes [{ t, x, y, scale, rotate, shake, flash }]
+  let kfX = 0;
+  let kfY = 0;
+  let kfScale = 1;
+  let kfRot = 0;
+  let kfShake = 0;
+  let kfFlash = 0;
+  // keyframes whose flash the photosensitivity budget dropped come with flash 0 (gate.kfs)
+  const kfs = Array.isArray(gate?.kfs) ? gate.kfs : Array.isArray(scene?.cameraKeyframes) ? scene.cameraKeyframes : [];
+  if (kfs.length >= 2) {
+    const sorted = [...kfs].sort((a, b) => Number(a.t || 0) - Number(b.t || 0));
+    let a = sorted[0];
+    let b = sorted[sorted.length - 1];
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (p >= Number(sorted[i].t || 0) && p <= Number(sorted[i + 1].t || 1)) {
+        a = sorted[i];
+        b = sorted[i + 1];
+        break;
+      }
+    }
+    const span = Math.max(0.001, Number(b.t || 1) - Number(a.t || 0));
+    const u = Math.max(0, Math.min(1, (p - Number(a.t || 0)) / span));
+    const eu = u * u * (3 - 2 * u);
+    kfX = Number(a.x || 0) + (Number(b.x || 0) - Number(a.x || 0)) * eu;
+    kfY = Number(a.y || 0) + (Number(b.y || 0) - Number(a.y || 0)) * eu;
+    kfScale = Number(a.scale ?? 1) + (Number(b.scale ?? 1) - Number(a.scale ?? 1)) * eu;
+    kfRot = Number(a.rotate || 0) + (Number(b.rotate || 0) - Number(a.rotate || 0)) * eu;
+    kfShake = Number(a.shake || 0) + (Number(b.shake || 0) - Number(a.shake || 0)) * eu;
+    kfFlash = Number(a.flash || 0) + (Number(b.flash || 0) - Number(a.flash || 0)) * eu;
+  } else if (intensity > 0.05) {
+    // Smooth alternating directional camera travel (pan X/Y + slow cinematic push/pull)
+    const pattern = idx % 5;
+    // calm shots keep a living camera (≈ 4.5 % push, ±12 px pan at intensity 1) — no shake, no flash
+    const travel = intensity * (isClashScene ? 0.95 : isCavalryScene ? 0.85 : 0.72);
+    if (pattern === 0) {
+      kfScale = interpolate(p, [0, 1], [1.0, 1.0 + 0.065 * travel]);
+      kfX = interpolate(p, [0, 1], [-16 * travel, 16 * travel]);
+    } else if (pattern === 1) {
+      kfScale = interpolate(p, [0, 1], [1.0 + 0.07 * travel, 1.0]);
+      kfX = interpolate(p, [0, 1], [18 * travel, -18 * travel]);
+    } else if (pattern === 2) {
+      kfScale = interpolate(p, [0, 0.5, 1], [1.01, 1.0 + 0.06 * travel, 1.02]);
+      kfY = interpolate(p, [0, 1], [10 * travel, -10 * travel]);
+    } else if (pattern === 3) {
+      kfScale = interpolate(p, [0, 1], [1.0, 1.0 + 0.055 * travel]);
+      kfY = interpolate(p, [0, 1], [-10 * travel, 10 * travel]);
+    } else {
+      kfScale = interpolate(p, [0, 0.35, 1], [1.0 + 0.075 * travel, 1.01, 1.0 + 0.04 * travel]);
+      kfX = interpolate(p, [0, 1], [-12 * travel, 12 * travel]);
+    }
+  }
+
+  // 2. EVENT-DRIVEN 0ms-LOCKED IMPACT IMPULSE (fires ONLY on real actionEvents clash/drop frames!)
+  let clashShock = 0;
+  let clashFlash = 0;
+  let clashDir = 1;
+  for (let ei = 0; ei < actionEvents.length; ei++) {
+    const ev = actionEvents[ei];
+    const k = String(ev?.kind || '');
+    const isHitEv =
+      k === 'metal_clash' ||
+      k === 'metal_clash_hi' ||
+      k === 'metal_clash_heavy' ||
+      k === 'heavy_impact' ||
+      k === 'war_drum' ||
+      k === 'hoof_stomp';
+    if (!isHitEv) continue;
+    const age = localFrame - Number(ev?.frame ?? -99);
+    if (age >= 0 && age < 10) {
+      const w = Number(ev?.intensity || 0.9) * (k === 'metal_clash_heavy' || k === 'heavy_impact' ? 1.25 : k === 'hoof_stomp' ? 0.55 : 1.0);
+      const dec = Math.exp(-age * 0.42) * w;
+      if (dec > clashShock) {
+        clashShock = dec;
+        clashDir = ei % 2 === 0 ? 1 : -1;
+      }
+      if (age < 3 && (k.startsWith('metal_clash') || k === 'heavy_impact') && gate?.clash?.[ei] !== false) {
+        const fl = (age === 0 ? 0.44 : age === 1 ? 0.22 : 0.08) * w;
+        if (fl > clashFlash) clashFlash = fl;
+      }
+    }
+  }
+
+  // Clean narrative/portrait/map scenes: ZERO jarring shake & ZERO blinding flash!
+  const cutRecoil =
+    !isCleanScene && idx > 0 && (txKind === 'zoom-punch' || txKind === 'flash-cut' || txKind === 'slash-wipe') && localFrame < 8
+      ? Math.exp(-localFrame * 0.42) * 0.72
+      : 0;
+  const gallopBounce = isCavalryScene ? Math.max(0, bp - 0.5) * 0.55 : 0;
+  const shakePower = isCleanScene
+    ? kfShake * intensity
+    : (clashShock * 1.35 + cutRecoil * 0.65 + gallopBounce + kfShake) * Math.max(0.5, intensity);
+
+  const shakeX = shakePower * Math.sin(localFrame * 6.9 + idx * 1.7) * 14.0 * clashDir;
+  const shakeY = shakePower * Math.cos(localFrame * 7.5 + idx * 2.3) * 10.0;
+  const shakeRot = shakePower * Math.sin(localFrame * 5.8 + idx) * 1.15;
+
+  const punchZoom =
+    clashShock * 0.085 +
+    (cutRecoil > 0 ? cutRecoil * 0.065 : 0) +
+    (isCleanScene ? Math.max(0, bp - 0.65) * 0.03 : Math.max(0, bp - 0.55) * 0.025);
+  const totalScale = Math.max(1.0, kfScale + punchZoom);
+
+  const cutStrobe =
+    !isCleanScene && idx > 0 && txKind === 'flash-cut' && localFrame < 4
+      ? (localFrame === 0 ? 0.38 : localFrame === 1 ? 0.18 : 0.06)
+      : 0;
+  const flashAlpha = Math.min(0.56, Math.max(kfFlash, clashFlash, cutStrobe));
+  const flashColor = clashFlash > 0.05 ? '#FFE6B8' : '#FFFFFF';
+
+  return {
+    tx: kfX + shakeX,
+    ty: kfY + shakeY,
+    scale: totalScale,
+    rotate: kfRot + shakeRot,
+    flashAlpha,
+    flashColor,
+    isCombat,
+  };
+}
+
+/**
+ * Frame-Exact Visual Combat Clash Overlay (0ms triple-locked with scene.actionEvents audio clashes!).
+ * Renders golden-white crescent blade slash arcs + blinding steel spark stars + directional sparks
+ * + synchronized crimson 斩 N kill-streak counter ONLY at exact metal_clash* frames.
+ */
+const ActionBeatClashOverlay: React.FC<{
+  scene: any;
+  localFrame: number;
+  width: number;
+  height: number;
+}> = ({ scene, localFrame, width, height }) => {
+  const actionEvents: any[] = Array.isArray(scene?.actionEvents) ? scene.actionEvents : [];
+  const clashEvents = actionEvents.filter((ev) => {
+    const k = String(ev?.kind || '');
+    return k === 'metal_clash' || k === 'metal_clash_hi' || k === 'metal_clash_heavy';
+  });
+  if (clashEvents.length === 0) return null;
+
+  // Kill counter: a flurry shot, or any clash shot continuing a melee run (killStep is cumulative across cuts)
+  const isFlurry =
+    (String(scene?.actionMode || '') === 'clash-flurry' && clashEvents.length >= 2) ||
+    clashEvents.some((ev) => Number(ev?.killStep || 0) >= 2);
+  let currentKillStep = 0;
+  let lastKillAge = 999;
+  for (let i = 0; i < clashEvents.length; i++) {
+    const ev = clashEvents[i];
+    const age = localFrame - Number(ev?.frame ?? 999);
+    if (age >= 0) {
+      currentKillStep = Number(ev?.killStep || i + 1);
+      lastKillAge = age;
+    }
+  }
+
+  return (
+    <AbsoluteFill style={{ pointerEvents: 'none', zIndex: 22 }}>
+      <svg viewBox="0 0 1920 1080" width="100%" height="100%" preserveAspectRatio="xMidYMid slice">
+        {clashEvents.map((ev, ci) => {
+          const age = localFrame - Number(ev?.frame ?? -99);
+          if (age < 0 || age > 9) return null;
+          const isHeavy = ev?.kind === 'metal_clash_heavy';
+          const isHi = ev?.kind === 'metal_clash_hi';
+          const t = age / 9;
+          const alpha = Math.pow(1 - t, 1.35);
+          const scale = (isHeavy ? 1.18 : 0.92) * (0.72 + Math.min(1, age / 2.2) * 0.42);
+          // Alternate impact centers slightly around the combat zone for dynamic fencing rhythm
+          const cx = 960 + (ci % 3 === 0 ? -70 : ci % 3 === 1 ? 95 : 15);
+          const cy = 515 + (ci % 2 === 0 ? -38 : 34);
+          const angle = isHeavy ? -18 : isHi ? 34 : -32 + (ci % 3) * 24;
+          return (
+            <g key={ci} transform={\`translate(\${cx} \${cy}) rotate(\${angle}) scale(\${scale.toFixed(3)})\`} opacity={alpha.toFixed(3)}>
+              {/* Razor Golden-White Crescent Blade Slash Arc */}
+              <path
+                d="M -360 110 Q -40 -145 370 -40 Q 20 -58 -360 110 Z"
+                fill={isHeavy ? '#FFF8E0' : '#FFE8A3'}
+                opacity={Math.max(0, 1 - t * 1.15)}
+              />
+              <path
+                d="M -375 126 Q -40 -168 395 -46"
+                fill="none"
+                stroke="#FF3B30"
+                strokeWidth={isHeavy ? 13 : 8}
+                strokeLinecap="round"
+                opacity={Math.max(0, 0.92 - t)}
+              />
+              {isHeavy ? (
+                <path
+                  d="M -290 -130 Q 10 25 320 120 Q 15 65 -290 -130 Z"
+                  fill="#FFF2C6"
+                  opacity={Math.max(0, 0.95 - t * 1.1)}
+                />
+              ) : null}
+              {/* Blinding 8-Point Forged-Steel Collision Star */}
+              <path
+                d="M 0 -135 L 14 -24 L 96 -78 L 26 -10 L 148 0 L 26 12 L 92 80 L 14 24 L 0 135 L -14 24 L -94 78 L -26 12 L -148 0 L -26 -10 L -96 -78 L -14 -24 Z"
+                fill="#FFFFFF"
+                opacity={age < 4 ? 0.98 : Math.max(0, 0.7 - t)}
+              />
+              <circle cx="0" cy="0" r={36 + age * 14} fill="none" stroke="#FFD84D" strokeWidth={Math.max(1.5, 7 - age * 0.7)} opacity={Math.max(0, 0.85 - t)} />
+              {/* 14 Directional Flying Steel Sparks & Crimson Splash Embers */}
+              {Array.from({ length: 14 }, (_, si) => {
+                const a = (si / 14) * Math.PI * 2 + ci * 0.7;
+                const dist = (28 + (si % 4) * 18) + age * (24 + (si % 3) * 14);
+                const x1 = Math.cos(a) * dist;
+                const y1 = Math.sin(a) * dist;
+                const len = 18 + (si % 3) * 14;
+                const x2 = x1 - Math.cos(a) * len;
+                const y2 = y1 - Math.sin(a) * len;
+                return (
+                  <line
+                    key={si}
+                    x1={x1.toFixed(1)}
+                    y1={y1.toFixed(1)}
+                    x2={x2.toFixed(1)}
+                    y2={y2.toFixed(1)}
+                    stroke={si % 3 === 0 ? '#FF3B30' : si % 2 === 0 ? '#FFFFFF' : '#FFD84D'}
+                    strokeWidth={si % 3 === 0 ? 5.5 : 3.2}
+                    strokeLinecap="round"
+                  />
+                );
+              })}
+            </g>
+          );
+        })}
+      </svg>
+      {/* Synchronized Kinetic Crimson Kill-Streak Counter (斩 1 -> 斩 2 -> 斩 3 ...) */}
+      {isFlurry && currentKillStep > 0 ? (
+        <div
+          style={{
+            position: 'absolute',
+            top: Math.round(height * 0.088),
+            right: Math.round(width * 0.045),
+            display: 'inline-flex',
+            alignItems: 'baseline',
+            gap: 10,
+            transform: \`scale(\${(1 + Math.exp(-lastKillAge * 0.45) * 0.34).toFixed(3)})\`,
+            transformOrigin: 'right center',
+          }}
+        >
+          <span
+            style={{
+              fontFamily: FONT_SERIF,
+              fontSize: Math.round(height * 0.044),
+              fontWeight: 900,
+              color: '#FFE6C4',
+              textShadow: '0 3px 14px rgba(0,0,0,0.95)',
+            }}
+          >
+            斩
+          </span>
+          <span
+            style={{
+              fontFamily: FONT_SERIF,
+              fontSize: Math.round(height * 0.072),
+              fontWeight: 900,
+              color: '#FF3B30',
+              textShadow: '0 0 22px rgba(255,59,48,0.82), 0 4px 14px rgba(0,0,0,0.98)',
+              lineHeight: 1,
+            }}
+          >
+            {currentKillStep}
+          </span>
+        </div>
+      ) : null}
+    </AbsoluteFill>
+  );
+};
 
 const MediaTile: React.FC<{
   media: any;
@@ -495,7 +1077,8 @@ const SceneStage: React.FC<{
   const absTimeSec = absFrame / Math.max(1, fps);
   const bp = getBeatPulse(absTimeSec, beats);
 
-  const txKind = scene.transition || 'iris-circle';
+  const flashGate: SceneFlashGate = FLASH_GATE[idx] || NO_FLASH_GATE;
+  const txKind = guardFlashTx(scene.transition || 'iris-circle', flashGate);
   const layout = scene.layout || (idx === 0 ? '3d-stage-opener' : idx === total - 1 ? 'radial-climax' : 'media-split-motion');
 
   const CustomSceneComp = CUSTOM_SCENE_MAP && scene?.id && !scene?.useBuiltinLayout ? CUSTOM_SCENE_MAP[scene.id] : undefined;
@@ -513,10 +1096,8 @@ const SceneStage: React.FC<{
     narrationModeStr === 'tts-beat-sync' ||
     genreName === 'history-theater' ||
     genreName === 'mv-lyric';
-  const effectiveTxKind =
-    idx > 0 && (!txKind || txKind === 'cut') && isBeatEnergyVideo
-      ? ['flash-cut', 'slash-wipe', 'zoom-punch', 'glitch-cut'][idx % 4]
-      : txKind;
+  // beat-energy cut rhythm + historical bans, then the photosensitivity budget
+  const effectiveTxKind = guardFlashTx(resolveSceneTxKind(scene, idx), flashGate);
 
   const hasSceneVisualMedia =
     (Array.isArray(scene.media) && scene.media.length > 0) ||
@@ -544,6 +1125,10 @@ const SceneStage: React.FC<{
       narrationMode: narrationModeStr,
       publicAssetFiles,
       threePreset: sceneThreePreset,
+      // false when the photosensitivity budget dropped this shot's entry flash (diorama beat flash off)
+      flashAllowed: flashGate.inFlash,
+      // the film's cast (演员表): castLook(scene, 'id') in the figure kit reads it, so a person looks the same in every shot
+      cast: Array.isArray((scriptData as any)?.cast) ? (scriptData as any).cast : [],
     };
     const audioCamIntensity = Number((scriptData as any)?.audioProfile?.cameraBeatIntensity);
     const resolvedCamIntensity = Number.isFinite(audioCamIntensity)
@@ -551,39 +1136,34 @@ const SceneStage: React.FC<{
       : isLightCustom
         ? 0
         : isBeatEnergyVideo
-          ? 1.0
+          ? 1.05
           : beats.length > 0
             ? 0.36
             : 0;
-    const applyBeatCamera = !isLightCustom && resolvedCamIntensity > 0.02 && (isBeatEnergyVideo || beats.length > 0);
-    const cutImpact = applyBeatCamera && idx > 0 && localFrame < 9 ? Math.exp(-localFrame * 0.34) * resolvedCamIntensity : 0;
-    const customShakeX = cutImpact * Math.sin(localFrame * 4.1 + idx) * 10;
-    const customShakeY = cutImpact * Math.cos(localFrame * 4.7 + idx) * 7;
-    const customPunchScale =
-      applyBeatCamera && (effectiveTxKind === 'zoom-punch' || effectiveTxKind === 'flash-cut' || effectiveTxKind === 'slash-wipe') && localFrame < 10
-        ? interpolate(localFrame, [0, 10], [1 + 0.075 * resolvedCamIntensity, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp', easing: easeOut })
-        : 1;
-    const customScale = applyBeatCamera ? customPunchScale + bp * (0.025 * resolvedCamIntensity) : 1;
-    const customFlashAlpha =
-      applyBeatCamera && resolvedCamIntensity >= 0.65 && idx > 0 && localFrame < 5
-        ? interpolate(localFrame, [0, 5], [effectiveTxKind === 'flash-cut' ? 0.40 * resolvedCamIntensity : 0.20 * resolvedCamIntensity, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
-        : 0;
+    const applyBeatCamera = !isLightCustom && resolvedCamIntensity > 0.02 && (isBeatEnergyVideo || beats.length > 0 || Array.isArray(scene.cameraKeyframes));
+    const camRig = applyBeatCamera
+      ? evaluateSceneCameraRig(scene, localFrame, dur, fps, bp, idx, resolvedCamIntensity, effectiveTxKind, flashGate)
+      : { tx: 0, ty: 0, scale: 1, rotate: 0, flashAlpha: 0, flashColor: '#FFFFFF', isCombat: false };
     return (
       <AbsoluteFill style={{ overflow: 'hidden', backgroundColor: isLightCustom ? '#F4F7FB' : PALETTE.background }}>
         <AbsoluteFill
           style={
             applyBeatCamera
               ? {
-                  transform: \`translate3d(\${customShakeX.toFixed(1)}px, \${customShakeY.toFixed(1)}px, 0) scale(\${customScale.toFixed(4)})\`,
+                  transform: \`translate3d(\${camRig.tx.toFixed(1)}px, \${camRig.ty.toFixed(1)}px, 0) rotate(\${camRig.rotate.toFixed(2)}deg) scale(\${camRig.scale.toFixed(4)})\`,
                   transformOrigin: 'center center',
                 }
               : undefined
           }
         >
           <CustomSceneComp scene={hydratedScene} idx={idx} total={total} beats={beats} />
+          <ActionBeatClashOverlay scene={hydratedScene} localFrame={localFrame} width={width} height={height} />
         </AbsoluteFill>
-        {customFlashAlpha > 0.01 ? (
-          <AbsoluteFill style={{ backgroundColor: '#FFF7E8', opacity: customFlashAlpha, pointerEvents: 'none', zIndex: 25 }} />
+        {!isLightCustom && String(scene.atmosphere || 'none') !== 'none' ? (
+          <AmbientAtmosphere kind={String(scene.atmosphere)} absFrame={absFrame} width={width} height={height} bp={bp} accent={PALETTE.accent} accent2={PALETTE.gold || PALETTE.accent2 || PALETTE.accent} />
+        ) : null}
+        {camRig.flashAlpha > 0.01 ? (
+          <AbsoluteFill style={{ backgroundColor: camRig.flashColor, opacity: camRig.flashAlpha, pointerEvents: 'none', zIndex: 25, mixBlendMode: 'screen' }} />
         ) : null}
         {allowTechHudOverlay ? (
           <HudTelemetryOverlay
@@ -602,6 +1182,7 @@ const SceneStage: React.FC<{
           accentColor={PALETTE.accent}
           goldColor={PALETTE.gold || PALETTE.accent2}
           bgColor={PALETTE.background}
+          exitFlash={flashGate.exitFlash}
         />
       </AbsoluteFill>
     );
@@ -610,12 +1191,24 @@ const SceneStage: React.FC<{
   const useNarrativeDioramaFallback =
     layout === 'narrative-diorama' ||
     Boolean(scene.stageSpec) ||
-    ((genreName === 'history-theater' || genreName === 'mv-lyric') && !hasSceneVisualMedia);
+    (EPIC_CONTEXT && !hasSceneVisualMedia);
 
   if (useNarrativeDioramaFallback) {
+    const dioramaRig = evaluateSceneCameraRig(scene, localFrame, dur, fps, bp, idx, isBeatEnergyVideo ? 1.05 : 0.65, effectiveTxKind, flashGate);
     return (
       <AbsoluteFill style={{ overflow: 'hidden', backgroundColor: PALETTE.background }}>
-        <NarrativeDioramaStage scene={scene} idx={idx} total={total} beats={beats} />
+        <AbsoluteFill
+          style={{
+            transform: \`translate3d(\${dioramaRig.tx.toFixed(1)}px, \${dioramaRig.ty.toFixed(1)}px, 0) rotate(\${dioramaRig.rotate.toFixed(2)}deg) scale(\${dioramaRig.scale.toFixed(4)})\`,
+            transformOrigin: 'center center',
+          }}
+        >
+          <NarrativeDioramaStage scene={flashGate.inFlash ? scene : { ...scene, flashAllowed: false }} idx={idx} total={total} beats={beats} />
+          <ActionBeatClashOverlay scene={scene} localFrame={localFrame} width={width} height={height} />
+        </AbsoluteFill>
+        {dioramaRig.flashAlpha > 0.01 ? (
+          <AbsoluteFill style={{ backgroundColor: dioramaRig.flashColor, opacity: dioramaRig.flashAlpha, pointerEvents: 'none', zIndex: 25, mixBlendMode: 'screen' }} />
+        ) : null}
         <SceneTransitionOverlay
           txKind={effectiveTxKind}
           localFrame={localFrame}
@@ -623,6 +1216,7 @@ const SceneStage: React.FC<{
           accentColor={PALETTE.accent}
           goldColor={PALETTE.gold || PALETTE.accent2}
           bgColor={PALETTE.background}
+          exitFlash={flashGate.exitFlash}
         />
       </AbsoluteFill>
     );
@@ -1653,8 +2247,44 @@ const SceneStage: React.FC<{
         accentColor={PALETTE.accent}
         goldColor={PALETTE.gold || PALETTE.accent2}
         bgColor={PALETTE.background}
+        exitFlash={flashGate.exitFlash}
       />
     </AbsoluteFill>
+  );
+};
+
+// Opt-in camera motion blur (@remotion/motion-blur). Default OFF: every sample re-renders the whole scene,
+// so render cost grows ~linearly with samples. Enable globally via script.motionBlur = { enabled: true, shutterAngle, samples }
+// or per scene via scene.motionBlur (true/false or an object; a scene object enables blur unless enabled === false,
+// and scene values override the global ones).
+type MotionBlurSpec = { shutterAngle: number; samples: number };
+function normalizeMotionBlurValue(v: any): any {
+  if (v === true) return { enabled: true };
+  if (v === false) return { enabled: false };
+  return v && typeof v === 'object' ? v : null;
+}
+function resolveSceneMotionBlur(scene: any): MotionBlurSpec | null {
+  const sData: any = scriptData;
+  const globalCfg = normalizeMotionBlurValue(sData?.motionBlur);
+  const sceneCfg = normalizeMotionBlurValue(scene?.motionBlur);
+  const merged: any = { ...(globalCfg || {}), ...(sceneCfg || {}) };
+  if (sceneCfg && sceneCfg.enabled === undefined) merged.enabled = true;
+  if (merged.enabled !== true) return null;
+  const angleRaw = Number(merged.shutterAngle);
+  const samplesRaw = Math.round(Number(merged.samples));
+  const shutterAngle = Number.isFinite(angleRaw) ? Math.min(360, Math.max(0, angleRaw)) : 180;
+  const maxSamples = sData?.lowSpecSafe ? 6 : 16;
+  const samples = Number.isFinite(samplesRaw) ? Math.min(maxSamples, Math.max(2, samplesRaw)) : Math.min(maxSamples, 8);
+  if (shutterAngle <= 0) return null;
+  return { shutterAngle, samples };
+}
+const SceneMotionBlur: React.FC<{ scene: any; children: React.ReactNode }> = ({ scene, children }) => {
+  const spec = resolveSceneMotionBlur(scene);
+  if (!spec) return <>{children}</>;
+  return (
+    <CameraMotionBlur shutterAngle={spec.shutterAngle} samples={spec.samples}>
+      {children}
+    </CameraMotionBlur>
   );
 };
 
@@ -1704,6 +2334,20 @@ export const VideoComposition: React.FC = () => {
   const accentWords: string[] = Array.isArray(activeScene?.accentWords) ? activeScene.accentWords : [];
   const activeAvatar = activeScene?.avatarClip?.path ? activeScene.avatarClip : (sData?.avatarClip?.path ? sData.avatarClip : null);
   const avatarLayout = activeScene?.avatarLayout || activeAvatar?.layout || sData?.avatarLayout || 'pip-br';
+  // Corner PiP reservation (mirrors AvatarOverlay geometry) so subtitles and the stage never run underneath it.
+  const pipOn = Boolean(activeAvatar?.path) && (avatarLayout === 'pip-br' || avatarLayout === 'pip-bl');
+  const pipBoxW = isPortrait ? Math.round(width * 0.34) : Math.round(width * 0.22);
+  const pipBoxH = Math.round(pipBoxW * 1.125);
+  const pipSide = isPortrait ? 28 : 42;
+  const pipBottom = isPortrait ? Math.round(height * 0.25) : 96;
+  const pipReserveX = pipOn ? pipBoxW + pipSide + (isPortrait ? 18 : 28) : 0;
+  const pipOnLeft = avatarLayout === 'pip-bl';
+  const subBottomBase = Number(sData.subtitleBottomPx) || DEFAULT_SUBTITLE_BOTTOM || (isPortrait ? 240 : 110);
+  // Portrait: the PiP floats above the subtitle band (bottom 25 %), so only landscape needs a horizontal lane.
+  const subLaneOverlapsPip = pipOn && !isPortrait && subBottomBase < pipBottom + pipBoxH;
+  const subPadLeft = subLaneOverlapsPip && pipOnLeft ? pipReserveX : 0;
+  const subPadRight = subLaneOverlapsPip && !pipOnLeft ? pipReserveX : 0;
+  const subMaxW = Math.max(Math.round(width * 0.42), Math.round(width * 0.90) - (subPadLeft + subPadRight));
 
   return (
     <AbsoluteFill style={{ backgroundColor: PALETTE.background }}>
@@ -1713,7 +2357,11 @@ export const VideoComposition: React.FC = () => {
           from={Number(scene.startFrame) || 0}
           durationInFrames={Math.max(8, Number(scene.durationInFrames) || 90)}
         >
-          <SceneStage scene={scene} idx={idx} total={scenes.length} beats={beats} />
+          <SceneMotionBlur scene={scene}>
+            <PipSafeStage reserveX={pipOn && !isPortrait && scene?.pipAvoid !== false ? pipReserveX : 0} onLeft={pipOnLeft}>
+              <SceneStage scene={scene} idx={idx} total={scenes.length} beats={beats} />
+            </PipSafeStage>
+          </SceneMotionBlur>
         </Sequence>
       ))}
 
@@ -1755,7 +2403,9 @@ export const VideoComposition: React.FC = () => {
           style={{
             justifyContent: 'flex-end',
             alignItems: 'center',
-            paddingBottom: Number(sData.subtitleBottomPx) || DEFAULT_SUBTITLE_BOTTOM || (isPortrait ? 240 : 110),
+            paddingBottom: subBottomBase,
+            paddingLeft: subPadLeft,
+            paddingRight: subPadRight,
             pointerEvents: 'none',
             zIndex: 40,
           }}
@@ -1764,33 +2414,38 @@ export const VideoComposition: React.FC = () => {
             style={
               isCinematicSub
                 ? {
-                    padding: '6px 26px',
+                    padding: '8px 32px',
                     fontFamily: FONT_SERIF,
-                    fontSize: isPortrait ? 34 : 38,
+                    fontSize: isPortrait ? 50 : 54,
                     fontWeight: 900,
-                    letterSpacing: '0.03em',
-                    color: '#FDF6E7',
-                    maxWidth: Math.round(width * 0.88),
-                    whiteSpace: isPortrait ? 'normal' : 'nowrap',
+                    letterSpacing: '0.045em',
+                    lineHeight: 1.24,
+                    color: '#FFFDF7',
+                    maxWidth: subLaneOverlapsPip ? subMaxW : Math.round(width * 0.92),
+                    whiteSpace: isPortrait || subLaneOverlapsPip ? 'normal' : 'nowrap',
+                    textWrap: 'balance' as any,
                     textAlign: 'center',
-                    textShadow: '0 3px 10px rgba(0,0,0,0.98), 0 0 6px rgba(0,0,0,0.98), 0 6px 22px rgba(0,0,0,0.9)',
+                    WebkitTextStroke: '1.6px rgba(0, 0, 0, 0.88)',
+                    paintOrder: 'stroke fill',
+                    textShadow: '0 4px 12px rgba(0,0,0,0.99), 0 0 8px rgba(0,0,0,0.98), 0 8px 28px rgba(0,0,0,0.92)',
                   }
                 : {
-                    padding: isPortrait ? '10px 22px' : '10px 30px',
-                    borderRadius: 12,
-                    background: 'rgba(5, 8, 18, 0.84)',
-                    border: \`1px solid rgba(\${PALETTE.rgbAccent || '125,178,255'}, 0.36)\`,
-                    borderLeft: \`4px solid \${PALETTE.accent}\`,
+                    padding: isPortrait ? '12px 26px' : '12px 34px',
+                    borderRadius: 14,
+                    background: 'rgba(5, 8, 18, 0.86)',
+                    border: \`1.5px solid rgba(\${PALETTE.rgbAccent || '125,178,255'}, 0.42)\`,
+                    borderLeft: \`5px solid \${PALETTE.accent}\`,
                     fontFamily: SANS,
-                    fontSize: isPortrait ? 28 : 32,
-                    fontWeight: 700,
+                    fontSize: isPortrait ? 38 : 42,
+                    fontWeight: 800,
                     color: '#FFFFFF',
-                    maxWidth: Math.round(width * 0.88),
-                    whiteSpace: isPortrait ? 'normal' : 'nowrap',
+                    maxWidth: subLaneOverlapsPip ? subMaxW : Math.round(width * 0.90),
+                    whiteSpace: isPortrait || subLaneOverlapsPip ? 'normal' : 'nowrap',
+                    textWrap: 'balance' as any,
                     textAlign: 'center',
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
-                    textShadow: '0 2px 10px rgba(0,0,0,0.9)',
+                    textShadow: '0 3px 12px rgba(0,0,0,0.95)',
                   }
             }
           >

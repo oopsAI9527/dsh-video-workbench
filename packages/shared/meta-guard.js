@@ -125,6 +125,26 @@ const BOILERPLATE_GOALS = new Set([
   '呈现具备动态视觉排版、空间运镜、粒子光效、节拍音效、配乐与配音的完整成片',
 ])
 
+/**
+ * A stringified missing value ("undefined" / "null") is never brief content. An old client bug stored briefs such as
+ * 「【一句话】undefined」 in script.json — drop the whole value, or every 【marker】 whose value is only that (on its own
+ * line, or inline before the next 【marker】 when the brief was flattened to one line).
+ */
+export function dropMissingBriefValues(text) {
+  const s = String(text ?? '')
+  if (/^\s*(?:undefined|null)\s*$/i.test(s)) return ''
+  return s
+    .replace(/^[ \t]*【[^】\r\n]{1,20}】[ \t]*(?:undefined|null)[ \t]*(?:\r?\n|$)/gim, '')
+    .replace(/【[^】\r\n]{1,20}】[ \t]*(?:undefined|null)[ \t]*(?=【|\r?\n|$)/gi, '')
+}
+
+const BRIEF_TEXT_FIELDS = ['goal', 'userPrompt', 'polishedTopic', 'topic', 'title', 'displayTitle', 'directorNotes', 'genre', 'genreLabel']
+function withoutMissingBriefValues(obj) {
+  const out = { ...obj }
+  for (const k of BRIEF_TEXT_FIELDS) if (typeof out[k] === 'string') out[k] = dropMissingBriefValues(out[k])
+  return out
+}
+
 export function normalizeContentOutline(val) {
   if (Array.isArray(val)) {
     return val
@@ -148,6 +168,7 @@ export function normalizeContentOutline(val) {
 
 export function formatDirectorBrief(scriptLike = {}) {
   if (!scriptLike || typeof scriptLike !== 'object') return ''
+  scriptLike = withoutMissingBriefValues(scriptLike)
   const rawGoal = String(scriptLike.goal || scriptLike.userPrompt || scriptLike.polishedTopic || '').trim()
   const notes = String(scriptLike.directorNotes || '').trim()
   const outlineItems = normalizeContentOutline(scriptLike.contentOutline)
@@ -186,6 +207,7 @@ export function formatDirectorBrief(scriptLike = {}) {
 }
 
 export function splitDirectorBrief(spec = {}) {
+  spec = withoutMissingBriefValues(spec && typeof spec === 'object' ? spec : {})
   const rawTopic = String(spec.topic || '').trim()
   const sections = parseBriefSections(rawTopic)
   const explicitOutline = normalizeContentOutline(spec.contentOutline)
@@ -252,12 +274,29 @@ function scrubText(text, briefs, { allowEmpty = true } = {}) {
  * Final gate before write / render. Mutates `script` in place and returns { script, removed[] }.
  * Spoken (narration / subtitles) and on-screen (titles / tags / highlights) fields are all scrubbed.
  */
-export function sanitizeScriptForRender(script) {
+export const SCRUBBED_SCENE_TEXT_KEYS = ['narration', 'subtitleText', 'subtitleLine', 'title', 'tag', 'windowTitle', 'counterLabel', 'caption', 'text']
+
+/** Key for `trusted`: a scene text field the user changed in the current save (see writeScriptJson's trustedSceneText). */
+export const trustedSceneTextKey = (sceneId, field) => `${sceneId}\u0000${field}`
+
+export function sanitizeScriptForRender(script, { trusted = null } = {}) {
   const removed = []
   if (!script || typeof script !== 'object') return { script, removed }
-  const briefs = [script.directorNotes, script.goal, script.userPrompt, script.briefRaw]
+  // An over-long topic is a brief too (it is moved into directorNotes below). Registering it up front keeps the gate
+  // idempotent: a second write of the same script must not scrub anything the first write kept.
+  const longTopic = String(script.topic || '').length > 40 ? script.topic : ''
+  const briefs = [script.directorNotes, script.goal, script.userPrompt, script.briefRaw, longTopic]
     .map((x) => String(x || '').trim())
     .filter((x) => x.length >= 24)
+
+  // Text the user wrote by hand (recorded in `script.userOverrides` by the editors) is never scrubbed: quoting your own
+  // brief in your own narration is legitimate. The gate exists for AI output (brief / director notes echoed on screen).
+  const overrides = script.userOverrides && typeof script.userOverrides === 'object' ? script.userOverrides : {}
+  const userOwned = (sc, key) => {
+    if (trusted && sc && sc.id && trusted.has(trustedSceneTextKey(sc.id, key))) return true
+    const o = sc && sc.id ? overrides[sc.id] : null
+    return Boolean(o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, key) && String(o[key] ?? '') === String(sc[key] ?? ''))
+  }
 
   const scrub = (obj, key, opts) => {
     if (!obj || typeof obj[key] !== 'string') return
@@ -269,9 +308,11 @@ export function sanitizeScriptForRender(script) {
     }
   }
 
-  // Script-level on-screen title
+  // Script-level on-screen title. A short title naturally reuses words of the brief ("DSH Video Workbench：双引擎全链路…"),
+  // so only a title longer than 40 chars (a pasted brief) gets the brief-overlap test; every title is checked for
+  // meta instructions. (Re-deriving a short title from itself only cut it at its first comma / colon.)
   const titleBefore = String(script.title || '')
-  const titleAfter = scrubText(titleBefore, briefs)
+  const titleAfter = scrubText(titleBefore, titleBefore.length > 40 ? briefs : [])
   if (titleAfter !== titleBefore || titleBefore.length > 40) {
     removed.push({ field: 'title', before: titleBefore.slice(0, 60) })
     script.title = titleAfter && titleAfter.length <= 40 ? titleAfter : deriveDisplayTitle(titleBefore, script.topic && script.topic.length <= 40 ? script.topic : '作品')
@@ -279,17 +320,22 @@ export function sanitizeScriptForRender(script) {
   if (String(script.topic || '').length > 40 || isMetaInstructionText(script.topic)) {
     removed.push({ field: 'topic', before: String(script.topic || '').slice(0, 60) })
     script.directorNotes = Array.from(new Set([script.directorNotes, script.topic].filter(Boolean))).join('\n')
-    script.topic = deriveDisplayTitle(script.topic, script.title || '作品')
+    // the topic is a short subject: the (already safe) title is the best one; derive from the brief only without it
+    const safeTitle = String(script.title || '').trim()
+    script.topic = safeTitle && safeTitle.length <= 40 && !isMetaInstructionText(safeTitle) ? safeTitle : deriveDisplayTitle(script.topic, script.title || '作品')
   }
 
   for (const sc of script.scenes || []) {
-    for (const key of ['narration', 'subtitleText', 'subtitleLine', 'title', 'tag', 'windowTitle', 'counterLabel', 'caption', 'text']) {
+    for (const key of SCRUBBED_SCENE_TEXT_KEYS) {
+      if (userOwned(sc, key)) continue
       scrub(sc, key)
     }
-    if (Array.isArray(sc.subChunks)) {
+    // subtitle chunks / cues are cut from the narration (or the on-screen subtitle text): user-written → keep them too
+    const userSpoken = ['narration', 'subtitleText', 'subtitleLine'].some((k) => userOwned(sc, k))
+    if (Array.isArray(sc.subChunks) && !userSpoken) {
       sc.subChunks = sc.subChunks.map((c) => scrubText(c, briefs)).filter(Boolean)
     }
-    if (Array.isArray(sc.subtitles)) {
+    if (Array.isArray(sc.subtitles) && !userSpoken) {
       sc.subtitles = sc.subtitles.filter((c) => c && scrubText(c.text, briefs))
     }
     if (Array.isArray(sc.highlights)) {

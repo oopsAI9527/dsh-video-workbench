@@ -30,6 +30,32 @@ export async function getTtsServerHealth(timeoutMs = 2500, engineId = '') {
       message: ok ? 'Windows 系统内置语音就绪（0 显存纯 CPU）' : '仅支持 Windows 平台',
     }
   }
+  if (spec.kind === 'minimax-tts') {
+    const ok = Boolean(String(spec.apiKey || process.env.MINIMAX_API_KEY || '').trim())
+    return {
+      reachable: ok,
+      ready: ok,
+      engine: spec.id,
+      engineName: spec.name,
+      kind: spec.kind,
+      endpoint: spec.endpoint || 'https://api.minimaxi.com/v1/t2a_v2',
+      vramBadge: spec.vramBadge,
+      message: ok ? `MiniMax 云端语音就绪 (${spec.model || 'speech-2.6-hd'})` : '请先填写 MiniMax API Key',
+    }
+  }
+  if (spec.kind === 'doubao-tts') {
+    const ok = Boolean(String(spec.appId || process.env.DOUBAO_TTS_APPID || '').trim() && String(spec.token || process.env.DOUBAO_TTS_TOKEN || '').trim())
+    return {
+      reachable: ok,
+      ready: ok,
+      engine: spec.id,
+      engineName: spec.name,
+      kind: spec.kind,
+      endpoint: spec.endpoint || 'https://openspeech.bytedance.com/api/v1/tts',
+      vramBadge: spec.vramBadge,
+      message: ok ? `火山方舟豆包语音就绪 (${spec.voiceType || 'default'})` : '请先填写豆包 AppID 与 Token',
+    }
+  }
   if (spec.kind === 'openai-tts' || spec.kind === 'http-json') {
     const ep = String(spec.endpoint || '').trim()
     if (!ep) return { reachable: false, ready: false, engine: spec.id, engineName: spec.name, kind: spec.kind, message: '未填写接口地址' }
@@ -215,6 +241,59 @@ function spawnServer(engineId = 'indextts25') {
   })
   child.unref()
   return child.pid
+}
+
+function runQuiet(bin, args, timeoutMs = 15_000) {
+  return new Promise((resolvePromise) => {
+    let out = ''
+    let child
+    try {
+      child = spawn(bin, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch {
+      resolvePromise('')
+      return
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+    }, timeoutMs)
+    child.stdout?.on('data', (d) => { out += d.toString('utf8') })
+    child.on('error', () => { clearTimeout(timer); resolvePromise('') })
+    child.on('close', () => { clearTimeout(timer); resolvePromise(out) })
+  })
+}
+
+/**
+ * Stop the local IndexTTS-2.5 / IndexTTS-2 server listening on the configured loopback port (used to free VRAM
+ * for GPU-heavy steps such as lip-sync). Only a Python process that owns the LISTENING socket is terminated.
+ * Returns `{ stopped, pid, reason }`; `ensureTtsServer()` starts it again on demand.
+ */
+export async function stopTtsServer({ engineId = 'indextts25' } = {}) {
+  const spec = resolveTtsEngineSpec(engineId)
+  if (!['indextts25', 'indextts2'].includes(spec.kind)) return { stopped: false, pid: null, reason: `not a local IndexTTS engine (${spec.kind})` }
+  let url
+  try {
+    url = new URL(spec.endpoint || endpoint(spec.id))
+  } catch {
+    return { stopped: false, pid: null, reason: 'invalid endpoint' }
+  }
+  if (!['127.0.0.1', 'localhost'].includes(url.hostname)) return { stopped: false, pid: null, reason: 'remote endpoint' }
+  const port = url.port || '9880'
+  if (process.platform !== 'win32') return { stopped: false, pid: null, reason: 'only implemented on Windows' }
+  const netstat = await runQuiet('netstat', ['-ano', '-p', 'tcp'])
+  const line = netstat
+    .split(/\r?\n/)
+    .find((l) => /LISTENING/i.test(l) && new RegExp(`(127\\.0\\.0\\.1|0\\.0\\.0\\.0):${port}\\s`).test(l))
+  const pid = line ? Number(line.trim().split(/\s+/).pop()) : 0
+  if (!pid) return { stopped: false, pid: null, reason: `no listener on port ${port}` }
+  const tasklist = await runQuiet('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'])
+  if (!/python/i.test(tasklist)) return { stopped: false, pid, reason: `PID ${pid} is not a Python process` }
+  await runQuiet('taskkill', ['/PID', String(pid), '/T', '/F'])
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250))
+    const h = await getTtsServerHealth(800, spec.id)
+    if (!h.reachable) return { stopped: true, pid, reason: 'terminated' }
+  }
+  return { stopped: false, pid, reason: 'still reachable after taskkill' }
 }
 
 /**

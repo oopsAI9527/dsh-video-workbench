@@ -12,7 +12,31 @@ import {
   stripMetaInstructions,
   VIDEO_STYLES,
 } from '../shared/index.js'
-import { buildGenreGuidance, detectGenre, getGenreProfile, resolveGenreSelection } from './genre-router.js'
+import { buildGenreGuidance, detectGenre, getGenreProfile, isHistoricalContent, resolveGenreSelection } from './genre-router.js'
+import { buildFigureStylePlanDirective, FIG_BUILDS, FIG_HAIR, FIG_HEADWEAR, FIG_OUTFITS, FIG_PROPS, FIG_STYLES, normalizeAmbience, normalizeAtmosphere, normalizeCast, normalizeFigureStyle, normalizeFigureStyleNote } from './figure-kit.js'
+import { applyStyleDecision, buildStylePlanDirective, decidePlanStyle, effectiveStyleMode } from './style-presets.js'
+import { extractBriefBeats } from './brief-beats.js'
+import { isBillingError } from './cloud-ledger.js'
+import { stripPlazaTemplateGuidance } from './plaza-guidance.js'
+
+/** A model call that failed for a reason worth waiting out (rate limit, gateway / server busy, timeout, network). */
+export function isTransientLlmFailure(err) {
+  if (!err || isBillingError(err)) return false
+  const msg = String(err?.message || err || '')
+  const status = Number(err?.status) || Number((msg.match(/返回错误 \((\d{3})\)/) || [])[1]) || 0
+  if ([429, 502, 503, 504, 524].includes(status)) return true
+  return /超时|timed? ?out|fetch failed|network|econnreset|etimedout|socket|other side closed|terminated|und_err/i.test(msg)
+}
+
+/** Rule-engine shots that follow the brief's key points (opener with the topic, then one shot per key point). */
+export function buildBriefFallbackShots({ topic = '', beats = [], pacingId = 'auto' } = {}) {
+  const dur = pacingId === 'calm' ? 4.6 : pacingId === 'balanced' ? 3.6 : 2.6
+  const opener = String(topic || '').trim()
+  const shots = []
+  if (opener && !beats.includes(opener)) shots.push({ title: opener, narration: opener, durationSec: Number((dur + 0.6).toFixed(2)) })
+  for (const b of beats) shots.push({ title: b, narration: b, durationSec: dur })
+  return shots
+}
 
 export const PROMO_PLAN_VERSION = 'promo-plan/1'
 
@@ -487,7 +511,7 @@ export function repairPromoPlanRules(
   const cleanStyle = normalizeVideoStyle(rawPlan?.style || style || 'tech')
   const isHistoricalTopic =
     resolvedGenre === 'history-theater' ||
-    /历史|霸王|项羽|霍去病|卫青|汉武|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(
+    isHistoricalContent(
       `${cleanTopic} ${rawPlan?.title || ''} ${existingScript?.title || ''} ${existingScript?.goal || ''}`,
     )
   const vibecodingZeroAssetLayouts = [
@@ -694,7 +718,16 @@ export function repairPromoPlanRules(
       threePreset: chosenThreePreset,
       stageSpec: computedStageSpec,
       beatCount: Number.isFinite(Number(s?.beatCount)) ? Number(s.beatCount) : existingScenes[idx]?.beatCount,
+      // Keep the director's explicit audio-visual action label (the keyword guesser is only a fallback)
+      actionMode: ['clash-flurry', 'single-clash', 'cavalry', 'drop-impact', 'clean'].includes(String(s?.actionMode || '').trim().toLowerCase()) ? String(s.actionMode).trim().toLowerCase() : existingScenes[idx]?.actionMode,
+      impactBeats: Array.isArray(s?.impactBeats) ? s.impactBeats.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n >= 0 && n <= 16).slice(0, 12) : existingScenes[idx]?.impactBeats,
       visualBlueprint: String(s?.visualBlueprint || existingScenes[idx]?.visualBlueprint || '').trim() || undefined,
+      // Director's per-shot tool plan (0-3): must-use tools for the coder, audited after coding
+      vibeTools: Array.isArray(s?.vibeTools) ? s.vibeTools.map((t) => String(t).trim().toLowerCase()).map((t) => (t === 'character-rig' ? 'figure-kit' : t)).filter((t) => ['threejs', 'animejs', 'tweenjs', 'ammojs', 'tsl-textures', 'figure-kit'].includes(t)).slice(0, 3) : existingScenes[idx]?.vibeTools,
+      // who is on screen (cast ids), air particles and the environmental sound bed of this shot
+      castIds: Array.isArray(s?.cast) ? s.cast.map((c) => String(c ?? '').trim()).filter(Boolean).slice(0, 8) : Array.isArray(s?.castIds) ? s.castIds : existingScenes[idx]?.castIds,
+      atmosphere: normalizeAtmosphere(s?.atmosphere) || existingScenes[idx]?.atmosphere,
+      ambience: normalizeAmbience(s?.ambience) || existingScenes[idx]?.ambience,
       motionNotes: String(s?.motionNotes || s?.visualBlueprint || existingScenes[idx]?.motionNotes || '').trim() || undefined,
       emotion: chosenEmotion,
       voiceEmotion: chosenEmotion,
@@ -737,9 +770,15 @@ export function repairPromoPlanRules(
   const rawTitle = normalizeNumeralsForDisplay(stripMetaInstructions(rawPlan?.title || existingScript?.title || cleanTopic)) || cleanTopic
   const audioProfile = rawPlan?.audioProfile && typeof rawPlan.audioProfile === 'object' ? rawPlan.audioProfile : (existingScript?.audioProfile || undefined)
 
+  const planCast = normalizeCast(Array.isArray(rawPlan?.cast) ? rawPlan.cast : existingScript?.cast)
+  const planFigureStyle = normalizeFigureStyle(rawPlan?.figureStyle) || normalizeFigureStyle(existingScript?.figureStyle)
+  const planFigureNote = normalizeFigureStyleNote(rawPlan?.figureStyleNote ?? existingScript?.figureStyleNote)
   return {
     version: PROMO_PLAN_VERSION,
     ...(audioProfile ? { audioProfile } : {}),
+    ...(planCast.length ? { cast: planCast } : {}),
+    ...(planFigureStyle ? { figureStyle: planFigureStyle } : {}),
+    ...(planFigureStyle === 'custom' && planFigureNote ? { figureStyleNote: planFigureNote } : {}),
     mode: isNarrativeMv ? 'narrative-mv' : 'promo-ui',
     genre: resolvedGenre,
     genreLabel: resolvedGenreLabel,
@@ -785,6 +824,12 @@ export function resolvePlanSchedule(plan, baseScript = {}) {
       threePreset: shot.threePreset || shot?.stageSpec?.threePreset || baseScene.threePreset || VALID_THREE_PRESETS[idx % VALID_THREE_PRESETS.length],
       stageSpec: shot.stageSpec || baseScene.stageSpec,
       beatCount: Number.isFinite(Number(shot.beatCount)) ? Number(shot.beatCount) : baseScene.beatCount,
+      actionMode: shot.actionMode || baseScene.actionMode,
+      impactBeats: Array.isArray(shot.impactBeats) ? shot.impactBeats : baseScene.impactBeats,
+      vibeTools: Array.isArray(shot.vibeTools) ? shot.vibeTools : baseScene.vibeTools,
+      castIds: Array.isArray(shot.castIds) ? shot.castIds : baseScene.castIds,
+      atmosphere: shot.atmosphere || baseScene.atmosphere,
+      ambience: shot.ambience || baseScene.ambience,
       visualBlueprint: shot.visualBlueprint || baseScene.visualBlueprint,
       motionNotes: shot.motionNotes || shot.visualBlueprint || baseScene.motionNotes,
       emotion: shot.voiceEmotion || shot.emotion || baseScene.emotion || '自信明快',
@@ -910,11 +955,57 @@ export async function runSchemaDirectorWithDegradation({
   referenceStyle = null,
   callLlmChatFn = null,
   forceTierForTest = null,
+  signal = null,
+  // one extra Tier-1 attempt after a transient failure (rate limit / gateway busy); tests pass 0
+  transientRetryDelayMs = 45_000,
+  onLlmWait = null,
 }) {
   const effectiveRefStyle = referenceStyle || scriptData?.referenceStyle || null
   const trace = []
   let chosenPlan = null
   let degradationTier = 4
+  // set when the model is still unavailable after the extra Tier-1 attempt: Tier 2 / 3 would hit the same limit
+  let llmOutage = null
+  const sleepAbortable = (ms) =>
+    new Promise((resolveSleep, rejectSleep) => {
+      const abortErr = () => signal?.reason || Object.assign(new Error('Request aborted'), { name: 'AbortError' })
+      if (signal?.aborted) return rejectSleep(abortErr())
+      const onAbort = () => {
+        clearTimeout(t)
+        rejectSleep(abortErr())
+      }
+      const t = setTimeout(() => {
+        signal?.removeEventListener?.('abort', onAbort)
+        resolveSleep()
+      }, Math.max(0, ms))
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+    })
+  const tier1Llm =
+    typeof callLlmChatFn === 'function'
+      ? async (args) => {
+          try {
+            return await callLlmChatFn(args)
+          } catch (err) {
+            if (!isTransientLlmFailure(err) || !(Number(transientRetryDelayMs) >= 0)) throw err
+            try {
+              onLlmWait?.({ waitMs: Number(transientRetryDelayMs), error: err })
+            } catch {}
+            await sleepAbortable(Number(transientRetryDelayMs))
+            try {
+              return await callLlmChatFn(args)
+            } catch (err2) {
+              if (isTransientLlmFailure(err2)) llmOutage = err2
+              throw err2
+            }
+          }
+        }
+      : null
+  // 视觉风格: an auto project (「AI 自由匹配」) lets the Tier-1 plan pick one of the 6 presets or design a new style
+  // (styleProfile) inside the same plan JSON; preset / 「我的预设」 projects keep the user's style.
+  const styleScript = { ...(scriptData && typeof scriptData === 'object' ? scriptData : {}), style: scriptData?.style || style }
+  // + the 人物画风 the user picked in the studio (none → the plan chooses figureStyle itself, rule 3.21)
+  const styleDirective = buildStylePlanDirective(styleScript) + buildFigureStylePlanDirective(styleScript)
+  let styleAnswer = null
   const mediaCheck = (assetsManifest?.items || []).filter(
     (it) => it.role !== 'music' && it.role !== 'sfx' && it.role !== 'note' && it.role !== 'brand_mark' && it.role !== 'avatar_base' && it.role !== 'voice_clone' && it.type !== 'audio',
   )
@@ -1018,12 +1109,14 @@ export async function runSchemaDirectorWithDegradation({
         const durationPolicy = resolveTargetDurationPolicy({
           durationMode: durationMode || scriptData?.durationMode || 'auto',
           targetDurationSec: Number(targetDurationSec) || Number(scriptData?.targetDurationSec) || 0,
-          text: rawGoalText,
+          // the user's wording only: a plaza template's style recipe describes its source film
+          text: stripPlazaTemplateGuidance(rawGoalText),
           pacingProfile,
           narrationMode: effectiveNarrationModeT1,
           hasVisualAssets: mediaNames.length > 0,
           bgmDurationSec: Number(effectiveBgm?.durationSec) || 0,
           referenceShotCount: Number(effectiveRefStyle?.pacingSignature?.targetShotCount || effectiveRefStyle?.shotCount || 0),
+          referenceDurationSec: Number(effectiveRefStyle?.durationSec || 0),
         })
         const isComprehensiveUnlimited = durationPolicy.unlimited || noteSummaries.length >= 420 || mediaNames.length >= 6
         const desiredZeroShotsMin = durationPolicy.enforced || isPureMusicMvT1 || pacingProfile.id === 'dynamic'
@@ -1063,7 +1156,7 @@ export async function runSchemaDirectorWithDegradation({
         }
         const isHistoricalPrompt =
           resolvedGenre === 'history-theater' ||
-          /历史|霸王|项羽|霍去病|卫青|汉武|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(rawGoalText)
+          isHistoricalContent(rawGoalText)
         const unlimitedDurationHint = `\n- ${durationPolicy.promptDirective}`
         const refReplicationRules = effectiveRefStyle?.replicationPrompt
           ? `\n【红线铁律 · 参考视频复刻基因】：用户上传了参考视频并要求复刻同款风格与节奏！必须严格继承以下风格蓝图（替换为用户新主题内容）：\n${String(effectiveRefStyle.replicationPrompt).slice(0, 1200)}`
@@ -1100,12 +1193,16 @@ export async function runSchemaDirectorWithDegradation({
           ? `你是顶级音画动态导演 (AI Visual & Motion Director)，擅长 Remotion + 原生 Three.js 3D + 动态 SVG / Canvas 全题材无限制自由编程创作。
 当前没有任何图片/视频素材 (zeroVisualAssets=true)，全部画面将由下游 AI 主程根据你为每一幕撰写的 \`visualBlueprint\`，使用 \`<FreeformThreeStage>\` + 动态 \`<svg>\` / \`<canvas>\` **100% 从零自由编写专属代码**（${isFreeformCoding ? '直接填写 `"layout": "freeform-stage"`，严禁千篇一律套用宣传片黑卡片！' : '`layout` 为内置安全预设'}）！
 ${pacingLabelHint}
-输出严格紧凑 JSON：{ "version": "promo-plan/1", "genre": "${resolvedGenre}", "genreLabel": "${resolvedGenreLabel}", "mode": "${pacingProfile.id === 'dynamic' ? 'narrative-mv' : 'promo-ui'}", "beatSync": ${pacingProfile.id === 'dynamic' || narrationMode === 'subtitle-mv' || narrationMode === 'tts-beat-sync'}, "title": "纯粹正片作品标题", "style": "cinematic|tech|emerald|energetic|documentary", "bpm": ${effectiveBgm?.bpm || (pacingProfile.id === 'calm' ? 88 : 110)}, "audioProfile": { "profileName": "贴合本题材的专属声场名", "beatCutIntensity": "high|medium|gentle", "cameraBeatIntensity": 0.0, "targetLufs": -14.5, "bgmDuckRatio": 2.6, "sfxPalette": { "opener": ["hit","shimmer_swell"], "drop": ["sub_drop","shine"], "action": ["whoosh","slash"], "data": ["counter","tick"], "neutral": ["whoosh","pop_soft"], "internal": ["sparkle","tick"], "preCut": ["riser","swoosh"] } }, "shots": [{ "id": "scene-01", "title": "...", "narration": "纯粹正片台词(保持自然阿拉伯数字)", "emotion": "欢快热情|激昂有力|温和亲切|重点强调|悬念低沉|深沉史诗", "speechRate": 1.04, "role": "narrator|host", "accentWords": ["核心关键词"], "layout": "${zeroLayoutExample}", "threePreset": "orbital-core|cyber-terrain|particle-vortex|floating-monoliths|chrono-helix|matrix-cubes", "beatCount": ${pacingProfile.id === 'dynamic' ? 2 : 4}, "durationSec": ${pacingProfile.id === 'calm' ? 5.0 : pacingProfile.id === 'balanced' ? 4.5 : 2.0}, "transition": "${pacingProfile.id === 'calm' ? 'light-wipe' : 'slash-wipe'}", "visualBlueprint": "具体描述本镜专属视觉构图（紧扣 ${resolvedGenreLabel} 自由发明贴合内容的画面与镜头语言，不受任何固定版式上限约束）与镜头物理节奏", "highlights": ["要点1","要点2"]${isHistoricalPrompt ? ', "stageSpec": { "mood": "dawn-amber|crimson-war|indigo-night|ash-twilight|bronze-hall|jade-river|void-gold", "setting": "palace-stairs|mountain-camp|city-siege|river-gorge|vast-plain", "archetype": "hero-numeral|hero-stand|oath-break|cavalry-rush|slash-climax|duel-confront|farewell-tent|strategic-map|bamboo-slips|scroll-calligraphy|plaque-summary|channel-end", "headwear": "plume|helmet|emperor|crown", "weapon": "spear|sword|halberd|raised-arm", "heroNum": "119", "heroUnit": "年", "bannerChar": "汉", "plaques": ["要点1","要点2"], "headline": "结尾主标题", "subheadline": "副标题" }' : ''} }] }。
+输出严格紧凑 JSON：{ "version": "promo-plan/1", "genre": "${resolvedGenre}", "genreLabel": "${resolvedGenreLabel}", "mode": "${pacingProfile.id === 'dynamic' ? 'narrative-mv' : 'promo-ui'}", "beatSync": ${pacingProfile.id === 'dynamic' || narrationMode === 'subtitle-mv' || narrationMode === 'tts-beat-sync'}, "title": "纯粹正片作品标题", "style": "cinematic|tech|emerald|energetic|documentary", "bpm": ${effectiveBgm?.bpm || (pacingProfile.id === 'calm' ? 88 : 110)}, "audioProfile": { "profileName": "贴合本题材的专属声场名", "beatCutIntensity": "high|medium|gentle", "cameraBeatIntensity": ${isHistoricalPrompt ? '1.0' : '0.0'}, "targetLufs": ${isHistoricalPrompt && narrationMode === 'subtitle-mv' ? '-10.5' : '-14.5'}, "bgmDuckRatio": ${narrationMode === 'subtitle-mv' ? '1.35' : '2.6'}, "sfxPalette": ${isHistoricalPrompt ? '{ "opener": ["war_drum"], "drop": ["heavy_impact","war_drum"], "action": ["metal_clash","metal_clash_hi","blade_whoosh"], "data": ["war_drum"], "neutral": [], "internal": ["metal_clash","metal_clash_hi"], "preCut": [] }' : '{ "opener": ["hit","shimmer_swell"], "drop": ["sub_drop","shine"], "action": ["whoosh","slash"], "data": ["counter","tick"], "neutral": ["whoosh","pop_soft"], "internal": ["sparkle","tick"], "preCut": ["riser","swoosh"] }'} }, "figureStyle": "auto|${FIG_STYLES.join('|')}|custom", "figureStyleNote": "选 custom 时写清楚人物画风", "cast": [{ "id": "hero", "name": "角色名", "role": "主角|配角|群像", "aliases": ["你"], "look": "一句话外形", "figure": { "gender": "male|female", "build": "${FIG_BUILDS.join('|')}", "outfit": "${FIG_OUTFITS.join('|')}", "hair": "${FIG_HAIR.join('|')}", "headwear": "${FIG_HEADWEAR.join('|')}", "beard": "none|short|long", "cape": false, "props": { "right": "${FIG_PROPS.join('|')}" }, "colors": { "top": "#hex", "bottom": "#hex", "accent": "#hex", "cape": "#hex" } } }], "shots": [{ "id": "scene-01", "title": "...", "narration": "纯粹正片台词(保持自然阿拉伯数字)", "emotion": "欢快热情|激昂有力|温和亲切|重点强调|悬念低沉|深沉史诗", "speechRate": 1.04, "role": "narrator|host", "accentWords": ["核心关键词"], "actionMode": "${isHistoricalPrompt ? 'clash-flurry|single-clash|cavalry|drop-impact|clean' : 'clean'}", ${isHistoricalPrompt ? '"impactBeats": [0, 0.5, 1, 1.5, 2, 2.5, 3.5], ' : ''}"layout": "${zeroLayoutExample}", "threePreset": "orbital-core|cyber-terrain|particle-vortex|floating-monoliths|chrono-helix|matrix-cubes", "vibeTools": [], "cast": ["hero"], "atmosphere": "none", "ambience": "none", "beatCount": ${pacingProfile.id === 'dynamic' ? 2 : 4}, "durationSec": ${pacingProfile.id === 'calm' ? 5.0 : pacingProfile.id === 'balanced' ? 4.5 : 2.0}, "transition": "${pacingProfile.id === 'calm' ? 'light-wipe' : 'slash-wipe'}", "visualBlueprint": "具体描述本镜专属视觉构图（紧扣 ${resolvedGenreLabel} 自由发明贴合内容的画面与镜头语言，不受任何固定版式上限约束）与镜头物理节奏", "highlights": ["要点1","要点2"]${isHistoricalPrompt ? ', "stageSpec": { "mood": "dawn-amber|crimson-war|indigo-night|ash-twilight|bronze-hall|jade-river|void-gold", "setting": "palace-stairs|mountain-camp|city-siege|river-gorge|vast-plain", "archetype": "hero-numeral|hero-stand|oath-break|cavalry-rush|slash-climax|duel-confront|farewell-tent|strategic-map|bamboo-slips|scroll-calligraphy|plaque-summary|channel-end", "headwear": "plume|helmet|emperor|crown", "weapon": "spear|sword|halberd|raised-arm", "heroNum": "119", "heroUnit": "年", "bannerChar": "汉", "plaques": ["要点1","要点2"], "headline": "结尾主标题", "subheadline": "副标题" }' : ''} }] }。
 核心硬性要求：
-1. **贴合题材的拆镜与节奏**：拆分为 **${desiredZeroShotsMin}~${desiredZeroShotsMax} 个镜头**，${pacingProfile.ruleHint}（单镜口播长度与时长严格匹配；每幕设置富有感染力的 \`emotion\` 与合理 \`speechRate\` \`0.92~1.14\`）；并在 \`audioProfile\` 中为本题材精准挑选贴合画风的 48kHz 音效组合（可用：\`hit, slash, sub_drop, crash_cym, whoosh, swoosh, riser, suck, click, typing, counter, tick, radar, shutter, boing, pop, pop_soft, flip, card, stamp, chime, sparkle, shine, shimmer_swell, bell_warm, glitch\`）与镜头节拍震动强度（教程 \`0.0\` / 科普数据 \`0.2~0.35\` / 发布会 \`0.5\` / 史诗高燃 \`0.9~1.0\`）。
+1. **贴合题材的拆镜与节奏（严格音画合一，绝不乱加音效！）**：拆分为 **${desiredZeroShotsMin}~${desiredZeroShotsMax} 个镜头**，${pacingProfile.ruleHint}（单镜口播长度与时长严格匹配；每幕设置富有感染力的 \`emotion\` 与合理 \`speechRate\` \`0.92~1.14\`）；为每幕精准标注 \`actionMode\`：**只有真正刀剑/长矛短兵相接激战的镜头才标 \`clash-flurry\`（触发半拍连续急促刀剑金属碰撞），单次拔剑/迎击标 \`single-clash\`，真实骑兵冲锋标 \`cavalry\`，重拍高潮标 \`drop-impact\`，其余朝堂/人物肖像/地图/竹简/封禅/尾声一律标 \`clean\`（纯 BGM 呼吸，严禁乱加打斗音或叮咚铃！）**。${isHistoricalPrompt ? '**兵刃接触必须画出来并给出拍位**：凡标 \`clash-flurry\` / \`single-clash\` 的镜头，\`visualBlueprint\` 必须写清每一次可见的兵器相交（谁的矛/剑撞上谁的兵器、火星在哪里），并用 \`impactBeats\` 给出接触发生的拍位（从本镜切入点起算，0 = 切入点，可用 0.5 半拍、0.25 四分之一拍）：\`clash-flurry\` 每半拍一次可见格挡/劈砍，2~4 拍的镜头安排 5~8 次（如 [0,0.5,1,1.5,2,2.5,3.5]，最后一击最重），接触前写出蓄力挥砍；\`single-clash\` 只给 1 个拍位；只有冲锋、对峙、行军而没有兵刃相交的镜头不要标 clash（标 \`cavalry\` 或 \`clean\`）。**每一场真正的大战（首战、主战役、决战高潮）都要安排一组连续 2~3 个镜头的短兵交锋（\`clash-flurry\` 与半拍闪切 \`single-clash\` 交替，beatCount 用 0.5~4），像参考片一样急促激烈、刀刀踩在节拍上**；不该有打斗声的镜头在 \`visualBlueprint\` 里写明“无兵刃接触/不加打斗声”。' : ''}
 2. **零预设束缚，每镜写出独一无二的 \`visualBlueprint\`（下游 TSX 代码生成员直读！）**：严格遵循 ${resolvedGenreLabel} 的专属视觉审美自由造景（不要生搬硬套不相关的科技/电商卡片）。
-3. **绝对禁止输出任何网址 URL、参考来源标注或制作指令词**：所有旁白纯正自然，禁用双引号，阿拉伯数字原样保留（系统会自动按语义切分字幕）。
-4. \`transition\` 仅允许 \`${VALID_TRANSITIONS.join(' | ')}\` 中的合法值（首镜用 \`cut\`）。`
+3. **按画面为每镜规划 Vibecoding 工具**：\`vibeTools\` 从 threejs（三维空间/纵深/粒子）、animejs（文字、书法、印章、图表的交错编排）、tweenjs（弹性缓动与镜头推拉曲线）、ammojs（真实物理坠落/碰撞/散落）、tsl-textures（水面、云层、玉石青铜等程序化材质）中选出本镜真正需要的 0~3 个——下游主程会被要求在该镜代码里真正实现并逐镜核对，所以只写画面确实需要的；人物/马匹镜头系统会自动建议剪影人物库，不必写进 vibeTools。
+3.2 **演员表 cast（任何题材通用）**：作品里出现的主要人物（≤6 个，古装将领、现代上班族、童话角色、讲解员都算；马匹由画面自动处理，猫狗等其他动物不进演员表）写进顶层 \`cast\`，外观 \`figure\` 字段只能从给出的选项里选、颜色用 #hex，同一角色全片外观一致；每镜 \`cast\` 列出该镜出镜的角色 id；没有人物的作品给 \`"cast": []\`。
+3.21 **人物画风 \`figureStyle\`（全片统一；按每部作品自己的气质选，不要所有作品都用同一种）**：用户需求里点名了画风就照用户的——是剪影 silhouette / 剪纸 papercut / 皮影 puppet / 水墨 ink / 扁平侧身 flat / 火柴人 stick 之一就填对应 id（这些有现成人物库），是其它画风（Q版萌系、日系动漫、美式卡通、绘本手绘、年画、像素风、低多边形、黏土、写实插画等）就填 custom 并在 \`figureStyleNote\` 写清楚（如：Q版大头萌系，圆脸大眼），主程会自己设计角色；用户没提时按作品气质选：历史史诗、战争常用 silhouette，民俗节日可用 papercut，戏曲传说可用 puppet，古诗词山水可用 ink，其它题材（现代生活、产品、科普、童话、职场、MV 等）想要鲜明的角色设计就填 custom 并写清楚，拿不准就填 auto（交给主程按画面决定）。
+3.3 **氛围与环境声**：每镜 \`atmosphere\`（none|dust|embers|snow|rain|petals|leaves|bokeh|motes|fireflies|mist）按画面里真实存在的空气/天气选择（篝火战火→embers，风沙→dust，雪→snow，霓虹夜景→bokeh，科技数据→motes，雾→mist，没有就 none）；\`ambience\`（none|wind|river|rain|fire|crowd|night|city|office|forest|sea|space|battle）按画面里应当听到的环境声选择（江边/渡船→river，战场→battle，宴会/集市/咖啡馆/餐厅→crowd，街道车流→city，办公室/教室→office，森林→forest，海边→sea，夜晚虫鸣→night，旷野风沙→wind，篝火壁炉→fire；界面演示、数据图表、纯文字镜头给 none）。
+3.1 **绝对禁止输出任何网址 URL、参考来源标注或制作指令词**：所有旁白纯正自然，禁用双引号，阿拉伯数字原样保留（系统会自动按语义切分字幕）。
+4. \`transition\` 仅允许 \`${isHistoricalPrompt ? 'cut | flash-cut | slash-wipe | zoom-punch' : VALID_TRANSITIONS.join(' | ')}\` 中的合法值（首镜用 \`cut\`${isHistoricalPrompt ? '，历史史诗题材严禁使用 glitch-cut 故障条或 iris-circle 卡通圆圈转场！' : ''}）。`
           : `你是顶级全题材动态导演兼交互式软件教程视觉总监，擅长依据具体题材灵活编排真实现场画面与自由写码分镜。
 ${pacingLabelHint}
 输出严格紧凑 JSON（不要输出冗余 cams/subChunks 大数组，聚焦高质量剧情、精确图片路径与清晰简短 visualBlueprint）：
@@ -1114,8 +1211,8 @@ ${pacingLabelHint}
 1. **依应用场景适配节奏与富有感情的配音演播**：拆分为 **${desiredUiShotsMin}~${desiredUiShotsMax} 个镜头**，${pacingProfile.ruleHint} 每幕标注生动 \`emotion\` 与节奏感 \`speechRate\`（\`1.05~1.12\`）。
 2. **精确对应文件名与内容，拒绝错配！**：每张截图引用 exact \`relativeAssets\` 路径并只解说该文件名真实对应的界面（例如 \`01b-drawer-open-light\` 讲工程抽屉，\`01c-new-project-modal\` 讲新建工程弹窗，\`02a/02b\` 讲硬件/低配保护）；开篇/原理/转折/结尾或自由视觉场景可置 \`assetRefs: []\` 并用 \`layout: "freeform-stage"\` 交由 AI 自由编码。
 3. **严禁网址参考来源注释与元指令词，禁用双引号且保留阿拉伯数字**。\`transition\` 仅允许 ${VALID_TRANSITIONS.join('/')}。`
-        const res = await callLlmChatFn({
-          system: systemPrompt,
+        const res = await tier1Llm({
+          system: systemPrompt + styleDirective,
           messages: [{ role: 'user', content: JSON.stringify(prompt) }],
           temperature: zeroVisualAssets ? 0.4 : 0.28,
           maxTokens: desiredZeroShotsMin >= 30 || durationPolicy.targetSec >= 110 ? 15000 : isComprehensiveUnlimited || zeroVisualAssets ? 10000 : 7500,
@@ -1215,6 +1312,7 @@ ${pacingLabelHint}
           }
           chosenPlan = repaired
           degradationTier = 1
+          styleAnswer = { style: candidate?.style, profile: candidate?.styleProfile || null }
           trace.push({ tier: 1, name: 'Full JSON Schema', ok: true })
         } else {
           trace.push({ tier: 1, name: 'Full JSON Schema', ok: false, reason: 'JSON 结构未通过约束' })
@@ -1227,8 +1325,14 @@ ${pacingLabelHint}
     }
   }
 
+  if (!chosenPlan && llmOutage) {
+    const why = String(llmOutage?.message || llmOutage).slice(0, 160)
+    trace.push({ tier: 2, name: 'Sectioned List', ok: false, reason: `已跳过：大模型接口暂时不可用（${why}）` })
+    trace.push({ tier: 3, name: 'MCQ Choice', ok: false, reason: '已跳过：大模型接口暂时不可用' })
+  }
+
   // Tier 2: Sectioned lightweight list
-  if (!chosenPlan && (!forceTierForTest || forceTierForTest <= 2) && typeof callLlmChatFn === 'function') {
+  if (!chosenPlan && !llmOutage && (!forceTierForTest || forceTierForTest <= 2) && typeof callLlmChatFn === 'function') {
     try {
       const visualItemsT2 = (assetsManifest?.items || []).filter(
         (it) => it.role !== 'music' && it.role !== 'sfx' && it.role !== 'note' && it.role !== 'brand_mark' && it.role !== 'avatar_base' && it.role !== 'voice_clone' && it.type !== 'audio',
@@ -1238,7 +1342,7 @@ ${pacingLabelHint}
       const t2DurationPolicy = resolveTargetDurationPolicy({
         durationMode: durationMode || scriptData?.durationMode || 'auto',
         targetDurationSec: Number(targetDurationSec) || Number(scriptData?.targetDurationSec) || 0,
-        text: `${cleanTopic} ${effectiveDirectorNotes} ${scriptData?.goal || ''}`,
+        text: stripPlazaTemplateGuidance(`${cleanTopic} ${effectiveDirectorNotes} ${scriptData?.goal || ''}`),
         pacingProfile,
         narrationMode: narrationMode || scriptData?.narrationMode || 'tts',
         hasVisualAssets: mediaNamesT2.length > 0,
@@ -1249,7 +1353,7 @@ ${pacingLabelHint}
         : pacingProfile.id === 'calm' ? '6~12' : mediaNamesT2.length >= 8 ? `${mediaNamesT2.length}~${mediaNamesT2.length + 6}` : pacingProfile.id === 'balanced' ? '10~16' : '22~30'
       const isHistoricalT2 =
         resolvedGenre === 'history-theater' ||
-        /历史|霸王|项羽|霍去病|卫青|汉武|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(`${cleanTopic} ${effectiveDirectorNotes}`)
+        isHistoricalContent(`${cleanTopic} ${effectiveDirectorNotes}`)
       const res = await callLlmChatFn({
         system: zeroVisT2
           ? isHistoricalT2
@@ -1333,7 +1437,7 @@ ${pacingLabelHint}
   }
 
   // Tier 3: Ultra-simple A/B/C Multiple Choice Token for weak/tiny models
-  if (!chosenPlan && (!forceTierForTest || forceTierForTest <= 3) && typeof callLlmChatFn === 'function') {
+  if (!chosenPlan && !llmOutage && (!forceTierForTest || forceTierForTest <= 3) && typeof callLlmChatFn === 'function') {
     try {
       const res = await callLlmChatFn({
         system: '只回复一个字母：A=科技锐利推拉风，B=电影稳重横移风，C=高能卡点快闪风。',
@@ -1362,6 +1466,7 @@ ${pacingLabelHint}
           { topic: cleanTopic, style: presetStyle, genre: resolvedGenre, genreLabel: resolvedGenreLabel, authoringMode: effectiveAuthoringMode, directorNotes: effectiveDirectorNotes, contentOutline, assetsManifest, existingScript: scriptData, narrationMode, pacingMode: effectivePacingMode },
         )
         degradationTier = 3
+        styleAnswer = { style: presetStyle, profile: null }
         trace.push({ tier: 3, name: `MCQ Choice (${ch})`, ok: true })
       } else {
         trace.push({ tier: 3, name: 'MCQ Choice', ok: false, reason: '模型未返回 A/B/C 单字母' })
@@ -1371,14 +1476,47 @@ ${pacingLabelHint}
     }
   }
 
-  // Tier 4: Deterministic Code Rules Fallback (zero failure guarantee)
+  // Tier 4: Deterministic Code Rules Fallback (zero failure guarantee). Its storyboard follows the brief's own key
+  // points when the brief lists them, so a degraded film is still about the user's subject.
+  let briefBeatCount = 0
   if (!chosenPlan) {
+    const briefBeats = extractBriefBeats({
+      contentOutline,
+      texts: [effectiveDirectorNotes, topic, scriptData?.goal, scriptData?.directorNotes, scriptData?.userPrompt],
+    })
+    const briefShots = briefBeats.length >= 3 ? buildBriefFallbackShots({ topic: cleanTopic, beats: briefBeats, pacingId: pacingProfile.id }) : null
+    briefBeatCount = briefShots ? briefBeats.length : 0
     chosenPlan = repairPromoPlanRules(
-      { targetPlatform, style, genre: resolvedGenre, genreLabel: resolvedGenreLabel, authoringMode: effectiveAuthoringMode, pacingMode: pacingProfile.id },
+      { targetPlatform, style, genre: resolvedGenre, genreLabel: resolvedGenreLabel, authoringMode: effectiveAuthoringMode, pacingMode: pacingProfile.id, ...(briefShots ? { shots: briefShots } : {}) },
       { topic: cleanTopic, style, genre: resolvedGenre, genreLabel: resolvedGenreLabel, authoringMode: effectiveAuthoringMode, directorNotes: effectiveDirectorNotes, contentOutline, assetsManifest, existingScript: scriptData, narrationMode, pacingMode: effectivePacingMode },
     )
     degradationTier = 4
-    trace.push({ tier: 4, name: 'Deterministic Rule Engine Fallback', ok: true })
+    trace.push({ tier: 4, name: briefShots ? `Deterministic Rule Engine Fallback (brief key points × ${briefBeats.length})` : 'Deterministic Rule Engine Fallback', ok: true })
+  }
+
+  // Final style: an auto project follows the model's pick / design (validated, contrast fixed up) or, without a usable
+  // answer (rule tiers, weak models), the keyword rules — never an error. The decision is also written onto the passed
+  // scriptData so callers that persist it (the pipeline director stage) keep it.
+  const styleDecision = decidePlanStyle({
+    script: styleScript,
+    planStyle: styleAnswer?.style,
+    planProfile: styleAnswer?.profile,
+    text: `${cleanTopic} ${effectiveDirectorNotes} ${scriptData?.goal || ''}`,
+    genre: resolvedGenre,
+    genreLabel: resolvedGenreLabel,
+    by: styleAnswer ? 'llm' : 'rules',
+  })
+  chosenPlan.style = styleDecision.style
+  chosenPlan.styleMode = styleDecision.mode
+  chosenPlan.styleProfile = styleDecision.profile || null
+  if (effectiveStyleMode(styleScript) === 'auto' || !styleScript.style) {
+    if (scriptData && typeof scriptData === 'object') applyStyleDecision(scriptData, styleDecision)
+    trace.push({
+      tier: 'style',
+      name: styleDecision.custom ? `AI 自创风格「${styleDecision.profile.name}」(基于 ${styleDecision.style})` : `${styleDecision.by === 'llm' ? 'AI 选择' : '规则匹配'}预设风格 ${styleDecision.style}`,
+      ok: true,
+      ...(styleDecision.fixes && styleDecision.fixes.length ? { contrastFixes: styleDecision.fixes.map((f) => `${f.key} ${f.from}→${f.to}`) } : {}),
+    })
   }
 
   const validation = validatePromoPlan(chosenPlan)
@@ -1405,5 +1543,7 @@ ${pacingLabelHint}
             ? 'Tier 3 · A/B/C 选择题降级'
             : 'Tier 4 · 纯规则代码引擎兜底',
     trace,
+    llmOutage: llmOutage ? String(llmOutage?.message || llmOutage).slice(0, 300) : '',
+    briefBeatCount,
   }
 }

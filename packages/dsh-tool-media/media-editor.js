@@ -2,9 +2,9 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import {
   createAbortError,
-  normalizeVideoStyle,
   readScriptJson,
   resolveBinaries,
+  resolveStyleKey,
   resolveVideoDimensions,
   runCommandRedirected,
   VIDEO_STYLES,
@@ -28,7 +28,7 @@ export async function executeCurateAndEditAssets(options = {}) {
     quality = '1080p',
     width,
     height,
-    style = 'tech',
+    style = '',
     trimSeconds = 0,
     clipSpeed = 1.0,
     chromaKeyColor = '',
@@ -47,20 +47,23 @@ export async function executeCurateAndEditAssets(options = {}) {
   const manifest = readAssets(absDir)
   const scriptObj = existsSync(join(absDir, 'script.json')) ? readScriptJson(absDir).data : null
 
+  // 'auto' follows the project's resolved canvas (e.g. 3:4 picked for 小红书) instead of guessing again from the assets
   const dims = resolveVideoDimensions({
-    aspectRatio: aspectRatio || scriptObj?.aspectRatio || '16:9',
+    aspectRatio: aspectRatio && aspectRatio !== 'auto' ? aspectRatio : scriptObj?.aspectRatio || 'auto',
     quality: quality || scriptObj?.quality || '1080p',
     width: width || scriptObj?.width,
     height: height || scriptObj?.height,
     topic: scriptObj?.topic || scriptObj?.title || '',
     assets: (manifest.items || []).filter((i) => i.type === 'image' || i.type === 'video'),
+    targetPlatform: scriptObj?.targetPlatform || '',
   })
 
   const targetW = dims.width
   const targetH = dims.height
   const safeSpeed = Math.max(0.5, Math.min(2.5, Number(clipSpeed) || 1.0))
   const safeTrim = Math.max(0, Number(trimSeconds) || 0)
-  const resolvedStyle = normalizeVideoStyle(style || scriptObj?.style || 'tech')
+  // 'auto' (AI 自由匹配) / 'user:<id>' (我的风格预设) grade with the project's base preset
+  const resolvedStyle = resolveStyleKey(style, scriptObj)
   const gradeFilter = enhanceColor ? (STYLE_COLOR_GRADE[resolvedStyle] || STYLE_COLOR_GRADE.tech) : ''
 
   const visuals = (manifest.items || []).filter((it) => {
@@ -147,7 +150,7 @@ export async function executeCurateAndEditAssets(options = {}) {
         item.editedWebPath = `./${outRel}`
         item.editedWidth = actualW
         item.editedHeight = actualH
-        item.editedSpec = { width: actualW, height: actualH, style: style || 'tech', chromaKeyColor: wantsChroma ? chromaKeyColor : '' }
+        item.editedSpec = { width: actualW, height: actualH, style: resolvedStyle, chromaKeyColor: wantsChroma ? chromaKeyColor : '' }
         editedItems.push({ id: item.id, type: item.type, editedPath: outRel })
       }
     } else {
@@ -188,7 +191,7 @@ export async function executeCurateAndEditAssets(options = {}) {
         item.editedSpec = {
           width: actualVW,
           height: actualVH,
-          style: style || 'tech',
+          style: resolvedStyle,
           clipSpeed: safeSpeed,
           trimSeconds: safeTrim,
           chromaKeyColor: wantsChroma ? chromaKeyColor : '',
@@ -244,7 +247,7 @@ export async function executeCurateAndEditAssets(options = {}) {
     editedCount: editedItems.length,
     targetWidth: targetW,
     targetHeight: targetH,
-    style: style || scriptObj?.style || 'tech',
+    style: resolvedStyle,
     items: editedItems,
   }
 }

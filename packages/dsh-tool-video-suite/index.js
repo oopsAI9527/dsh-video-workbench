@@ -28,16 +28,24 @@ import {
 } from '../dsh-tool-media/remotion-generator.js'
 import {
   captureHtmlSnapshots,
+  computeRemotionOutputSize,
   renderHtmlVideoToMp4,
   renderRemotionProject,
+  resolveCompositionAudioPlan,
 } from './frame-renderer.js'
+import { enforceAudioTruePeak } from './true-peak-guard.js'
+import { enforceExposure } from './exposure-guard.js'
 import {
   runPostRenderQa,
+  runTemporalQaAnalysis,
   runTypecheckOnProject,
   scanAiGeneratedCodeSandbox,
 } from './qa-checker.js'
+import { DELIVERY_FORMATS, exportProjectPackage } from './delivery-export.js'
+import { applyColorLut, applyProjectColorLut, BUILTIN_LUTS, listColorLuts, renderVideoScopes, SCOPE_KINDS } from './color-tools.js'
 
-export { resolveBrowserExecutable, runPostRenderQa, runTypecheckOnProject, scanAiGeneratedCodeSandbox }
+export { resolveBrowserExecutable, runPostRenderQa, runTemporalQaAnalysis, runTypecheckOnProject, scanAiGeneratedCodeSandbox }
+export { applyColorLut, applyProjectColorLut, exportProjectPackage, listColorLuts, renderVideoScopes }
 
 /**
  * Parse hex color (#RRGGBB or #RGB) to relative luminance per WCAG 2.1.
@@ -356,6 +364,20 @@ function computeSampleFrames(script) {
   return picked.sort((a, b) => a - b)
 }
 
+/** Re-extract the contact-sheet frames from the delivered film (after a guard changed the picture). */
+async function refreshSnapshotFrames(ffmpeg, mp4Path, frames, framesDir, signal) {
+  const list = (Array.isArray(frames) ? frames : []).map((f) => Math.max(0, Math.round(Number(f) || 0)))
+  if (!list.length || !existsSync(mp4Path)) return false
+  mkdirSync(framesDir, { recursive: true })
+  const sel = list.map((f) => `eq(n,${f})`).join('+')
+  const res = await runCommandRedirected(
+    ffmpeg,
+    ['-y', '-hide_banner', '-v', 'error', '-i', mp4Path, '-an', '-vf', `select='${sel}'`, '-vsync', '0', '-frames:v', String(list.length), '-start_number', '1', join(framesDir, 'shot_%02d.png')],
+    { timeoutMs: 180_000, signal },
+  )
+  return res.code === 0
+}
+
 async function stitch3x3Grid(ffmpeg, framesDir, outPath) {
   const stitchRes = await runCommandRedirected(ffmpeg, [
     '-y',
@@ -573,10 +595,15 @@ export async function executeVideoRender(args = {}) {
     assetsManifest,
     outputPath: join(dirname(outPath), 'master-audio.wav'),
     signal: args.signal,
+    writeStems: Boolean(args.writeStems),
   })
 
   // 2. Render every frame via selected engine
+  // 「720P 快速审片」: a draft scale in (0, 1) shrinks the output of BOTH engines (full-quality renders pass none)
+  const draftScale = Number(args.draftScale) > 0 && Number(args.draftScale) < 1 ? Number(args.draftScale) : 0
   let renderMethod = ''
+  let renderW = width
+  let renderH = height
   if (engine === 'remotion' && existsSync(join(targetDir, 'src', 'Root.tsx'))) {
     syncRemotionPublicAssets(targetDir, script)
     const vcPath = join(targetDir, 'src', 'VideoComposition.tsx')
@@ -598,14 +625,21 @@ export async function executeVideoRender(args = {}) {
       snapshotDir: framesDir,
       onlySnapshots: false,
       signal: args.signal,
+      onProgress: args.onProgress,
+      chunkSec: args.chunkSec,
+      ...(draftScale ? { scale: draftScale } : {}),
     })
     if (r.ok && existsSync(outPath)) {
-      renderMethod = 'remotion-renderer'
+      renderMethod = r.chunked?.enabled ? 'remotion-renderer-chunked' : 'remotion-renderer'
+      var remotionChunkInfo = r.chunked || null
+      if (draftScale) {
+        const scaled = computeRemotionOutputSize(width, height, draftScale)
+        renderW = scaled.width
+        renderH = scaled.height
+      }
     }
   }
 
-  let renderW = width
-  let renderH = height
   if (!renderMethod) {
     const browserBin = resolveBrowserExecutable()
     const htmlEntry = join(targetDir, 'index.html')
@@ -640,6 +674,39 @@ export async function executeVideoRender(args = {}) {
     renderMethod = 'chromium-cdp-full-fps'
   }
 
+  // 3a. Delivery exposure guard: shots designed on near-black backgrounds (figures unreadable on a phone) get a
+  //     video-range gamma lift for exactly their frames; lit-by-design shots and dark UI themes are left alone.
+  let exposureGuard = null
+  try {
+    exposureGuard = await enforceExposure({ mp4Path: outPath, script, ffmpeg, signal: args.signal, enabled: args.exposureGuard !== false })
+  } catch (err) {
+    if (args.signal?.aborted || err?.name === 'AbortError') throw err
+    exposureGuard = { applied: false, reason: 'error', error: String(err?.message || err).slice(0, 300) }
+  }
+
+  // 3b. Delivery true-peak guard: AAC encoding can lift the limited master above the R128 ceiling (codec overshoot);
+  //    re-encode only the audio with a gain trim when the delivered file measures above −1 dBTP.
+  let truePeakGuard = null
+  try {
+    let sourceAudioPath = ''
+    if (renderMethod === 'chromium-cdp-full-fps') sourceAudioPath = mixRes.outputPath
+    else if (renderMethod.startsWith('remotion')) {
+      const plan = resolveCompositionAudioPlan(targetDir)
+      if (plan.mode === 'master') sourceAudioPath = plan.path
+    }
+    truePeakGuard = await enforceAudioTruePeak({ mp4Path: outPath, sourceAudioPath, ffmpeg, signal: args.signal })
+  } catch (err) {
+    if (args.signal?.aborted || err?.name === 'AbortError') throw err
+    truePeakGuard = { applied: false, reason: 'error', error: String(err?.message || err).slice(0, 300) }
+  }
+
+  if (exposureGuard?.applied) {
+    try {
+      await refreshSnapshotFrames(ffmpeg, outPath, sampleFrames, framesDir, args.signal)
+    } catch (err) {
+      if (args.signal?.aborted || err?.name === 'AbortError') throw err
+    }
+  }
   await stitch3x3Grid(ffmpeg, framesDir, snapshotOut)
   const qaReport = await runPostRenderQa({
     projectDir: targetDir,
@@ -647,6 +714,8 @@ export async function executeVideoRender(args = {}) {
     script,
     expectedWidth: renderW,
     expectedHeight: renderH,
+    exposure: exposureGuard,
+    signal: args.signal,
   })
 
   const fileSizeBytes = statSync(outPath).size
@@ -671,6 +740,11 @@ export async function executeVideoRender(args = {}) {
     sfxCount: mixRes.sfxCount,
     bgmSource: mixRes.bgmSource,
     segmentCache: typeof htmlRenderRes !== 'undefined' ? (htmlRenderRes?.segmentCache || null) : null,
+    chunkedRender: typeof remotionChunkInfo !== 'undefined' ? remotionChunkInfo : null,
+    stems: mixRes.stems || null,
+    ambience: mixRes.ambience || null,
+    exposureGuard,
+    truePeakGuard,
     qaReportPath: qaReport?.qaReportPath || '',
     qaReport,
   }
@@ -774,6 +848,14 @@ export function apply(ctx) {
           enum: ['html', 'remotion'],
           description: 'Optional engine override.',
         },
+        chunkSec: {
+          type: 'number',
+          description: 'Remotion only: resumable frame-exact chunk length in seconds (default DSH_RENDER_CHUNK_SEC or 10; 0 = legacy single pass). Completed chunks are reused when the bundle inputs are unchanged.',
+        },
+        writeStems: {
+          type: 'boolean',
+          description: 'Also write aligned voice/sfx/bgm stems (32-bit float WAV, pre-limiter) to output/stems/. The master mix is unchanged.',
+        },
       },
       required: ['projectDir'],
       additionalProperties: false,
@@ -788,6 +870,99 @@ export function apply(ctx) {
     isConcurrencySafe: () => false,
     async execute(args) {
       return await executeVideoRender(args)
+    },
+  })
+
+  ctx.tools.register({
+    name: 'export_project_package',
+    description:
+      'Export a delivery package into <projectDir>/output/export/: SRT/WebVTT subtitles (global timing), aligned audio stems (voice/sfx/bgm WAV), and NLE timelines — FCPXML 1.10 (Final Cut Pro / DaVinci Resolve) and Final Cut Pro 7 XML (xmeml v5, Premiere Pro / DaVinci Resolve) referencing per-scene ranges of the final MP4 plus the stems, with markers at scene cuts, musical downbeats and drops. Only documented interchange formats are produced. Optionally grade the video with a LUT first.',
+    parameters: {
+      type: 'object',
+      properties: {
+        projectDir: { type: 'string', description: 'Video project directory containing script.json.' },
+        formats: {
+          type: 'array',
+          items: { type: 'string', enum: [...DELIVERY_FORMATS, 'all'] },
+          description: 'Formats to export (default: srt, vtt, stems, fcpxml, xmeml). Timelines automatically include stems (reused if already exported).',
+        },
+        mp4Path: { type: 'string', description: 'Optional video to reference (defaults to output/final.mp4).' },
+        stemsEnabled: {
+          type: 'boolean',
+          description: 'If true the stems are active in the timeline and the MP4 mix is muted; default false keeps the finished mix active and stems disabled for re-mixing.',
+        },
+        lut: { type: 'string', description: `Optional LUT applied to a graded copy that the timelines then reference (built-in: ${BUILTIN_LUTS.map((l) => l.id).join(', ')}, or a .cube path).` },
+        lutIntensity: { type: 'number', description: 'LUT strength 0–1 (default 1).' },
+      },
+      required: ['projectDir'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', additionalProperties: true } },
+    timeoutMs: 900_000,
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      loadEnv()
+      return await exportProjectPackage({ ...args, formats: args.formats?.length ? args.formats : undefined, signal: args.signal })
+    },
+  })
+
+  ctx.tools.register({
+    name: 'apply_color_lut',
+    description:
+      'Grade a rendered video with a 3D LUT via FFmpeg lut3d (tetrahedral) and an intensity mix (0–1), writing a graded copy (H.264 BT.709, audio copied) ONLY inside the project\'s output/ folder (default output/<source>.graded-<lut>.mp4). Never overwrites the source, and never overwrites an existing file unless overwrite=true is passed explicitly: an existing outputPath is refused, the default name gets a -2, -3 … suffix instead. Built-in 17³ LUTs: teal-orange, warm-film, bleach-bypass, mono-contrast, night-cool; or pass a user .cube path. Pass lut="list" to list built-ins.',
+    parameters: {
+      type: 'object',
+      properties: {
+        projectDir: { type: 'string', description: 'Video project directory.' },
+        lut: { type: 'string', description: 'Built-in LUT id, path to a .cube/.3dl file, or "list".' },
+        intensity: { type: 'number', description: 'Mix between original (0) and fully graded (1). Default 1.' },
+        mp4Path: { type: 'string', description: 'Optional source video (defaults to output/final.mp4).' },
+        outputPath: {
+          type: 'string',
+          description:
+            'Optional output file relative to the project\'s output/ folder, e.g. "graded/final-teal.mp4" (.mp4/.mov/.m4v; a leading "output/" is accepted). Absolute, drive, UNC and ".." paths are rejected.',
+        },
+        overwrite: { type: 'boolean', description: 'Replace an existing file at the output path (default false: existing files are never overwritten).' },
+        crf: { type: 'number', description: 'x264 CRF for the graded copy (default 18).' },
+      },
+      required: ['projectDir', 'lut'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', additionalProperties: true } },
+    timeoutMs: 900_000,
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      loadEnv()
+      if (String(args.lut || '').trim().toLowerCase() === 'list') return { ok: true, luts: listColorLuts() }
+      return await applyProjectColorLut({ ...args, overwrite: args.overwrite === true, signal: args.signal })
+    },
+  })
+
+  ctx.tools.register({
+    name: 'render_video_scopes',
+    description:
+      'Render broadcast scopes for one timestamp of a video into output/scopes/: luma waveform, vectorscope and RGB/YUV histogram PNGs plus the analysed frame (FFmpeg waveform / vectorscope / histogram filters). Use read_image on the returned files to judge exposure, clipping and colour balance.',
+    parameters: {
+      type: 'object',
+      properties: {
+        projectDir: { type: 'string', description: 'Video project directory.' },
+        timeSec: { type: 'number', description: 'Timestamp in seconds (default 0).' },
+        mp4Path: { type: 'string', description: 'Optional video path (defaults to output/final.mp4).' },
+        kinds: {
+          type: 'array',
+          items: { type: 'string', enum: [...SCOPE_KINDS] },
+          description: 'Which scopes to render (default all).',
+        },
+      },
+      required: ['projectDir'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', additionalProperties: true } },
+    timeoutMs: 120_000,
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      loadEnv()
+      return await renderVideoScopes({ ...args, signal: args.signal })
     },
   })
 }

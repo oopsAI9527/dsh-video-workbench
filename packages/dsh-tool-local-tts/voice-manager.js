@@ -1,17 +1,20 @@
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readSync,
   closeSync,
   readdirSync,
   readFileSync,
+  rmdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   loadEnv,
   PACKAGE_ROOT,
@@ -418,7 +421,14 @@ function scanDirectoryRecursive(dir, registerEntry, depth = 0, maxDepth = 4) {
   if (!st.isDirectory()) return
 
   const dirBaseName = basename(dir)
-  if (dirBaseName === '情感参考' || dirBaseName === 'node_modules' || dirBaseName.startsWith('.')) {
+  // `_uploads` / `_previews` are the workbench's own temp folders (staged uploads, audition WAVs), never voices
+  if (
+    dirBaseName === '情感参考' ||
+    dirBaseName === 'node_modules' ||
+    dirBaseName === '_uploads' ||
+    dirBaseName === '_previews' ||
+    dirBaseName.startsWith('.')
+  ) {
     return
   }
 
@@ -598,6 +608,8 @@ export function getVoiceCatalog() {
     String(process.env.DEFAULT_TTS_ENGINE || 'indextts25').trim().toLowerCase() === 'indextts2' && !hasInferV25
 
   const byId = new Map()
+  const refOwner = new Map() // normalized reference file → id of the voice that registered it first
+  const aliasOf = new Map() // id of a skipped duplicate → id of the voice it duplicates
 
   const registerEntry = (raw) => {
     if (!raw || !raw.id) return
@@ -613,6 +625,15 @@ export function getVoiceCatalog() {
         .find((cand) => existsSync(cand))
       if (siblingAudio) resolvedRef = siblingAudio
     }
+    // A file the folder scan finds again (e.g. the copy an import made in imported/<id>/) belongs to the voice already
+    // registered for it — listing it a second time as `pack-…` showed every imported voice twice.
+    const refKey = resolvedRef ? (process.platform === 'win32' ? resolve(resolvedRef).toLowerCase() : resolve(resolvedRef)) : ''
+    if (refKey && String(raw.source || '').startsWith('discovered') && refOwner.has(refKey) && refOwner.get(refKey) !== raw.id) {
+      // keep the old id working for projects that picked the duplicate (scene voiceId, default voice)
+      aliasOf.set(raw.id, refOwner.get(refKey))
+      return
+    }
+    if (refKey && !refOwner.has(refKey)) refOwner.set(refKey, raw.id)
     const resolvedExt = extname(resolvedRef || '').toLowerCase()
     const isLegacyPt = resolvedExt === '.pt'
     const isAudioSample = ['.wav', '.mp3', '.flac'].includes(resolvedExt)
@@ -715,13 +736,23 @@ export function getVoiceCatalog() {
 
   const emotionReferences = discoverEmotionReferences()
   const voiceLibraryPath = syncVoiceLibraryJson(voices, categories, packsDir)
+  voiceIdAliases = aliasOf
   return {
     voices,
     categories,
     emotionReferences,
     catalogPath,
     voiceLibraryPath,
+    aliases: Object.fromEntries(aliasOf),
   }
+}
+
+/** Ids of de-duplicated catalog entries → the voice they duplicate (refreshed by every getVoiceCatalog call). */
+let voiceIdAliases = new Map()
+/** The id to use for a requested voice id: itself, or the voice a de-duplicated `pack-…` id now points to. */
+export function resolveVoiceIdAlias(id) {
+  const s = String(id || '')
+  return voiceIdAliases.get(s) || s
 }
 
 /**
@@ -746,6 +777,247 @@ function saveUserVoicesToCatalog(newEntries) {
   existing.voices = Array.from(map.values())
   writeFileSync(catalogPath, JSON.stringify(existing, null, 2) + '\n', 'utf8')
   return catalogPath
+}
+
+// Files that belong to one voice: its reference audio plus same-stem siblings (speaker tensor, transcript)
+const VOICE_FILE_EXTS = new Set(['.wav', '.mp3', '.flac', '.pt', '.txt'])
+const IS_WIN = process.platform === 'win32'
+const fsKey = (p) => (IS_WIN ? resolve(p).toLowerCase() : resolve(p))
+const stemKey = (name) => (IS_WIN ? String(name).toLowerCase() : String(name))
+
+/** `child` lies strictly inside `root` (case-insensitive on Windows). */
+function isInsideDir(root, child) {
+  const r = fsKey(root)
+  return Boolean(child) && fsKey(child).startsWith(r.endsWith(sep) ? r : r + sep)
+}
+
+/** True when `target`, or any existing folder between `root` and it, is a symlink / junction (never delete through one). */
+function hasLinkBelow(root, target) {
+  const rel = relative(resolve(root), resolve(target))
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return true
+  let cur = resolve(root)
+  for (const part of rel.split(sep)) {
+    cur = join(cur, part)
+    let st
+    try {
+      st = lstatSync(cur)
+    } catch {
+      return false
+    }
+    if (st.isSymbolicLink()) return true
+  }
+  return false
+}
+
+/**
+ * Drop a deleted voice from the pack manifests (`voices.json` / `manifest.json`) under `imported/`, so the folder scan
+ * does not list it again. Only entries with the voice's id or pointing at one of its deleted files are removed.
+ */
+function pruneVoiceManifests(importedDir, voiceId, goneKeys) {
+  const changed = []
+  const visit = (dir, depth) => {
+    if (depth > 4) return
+    let ents = []
+    try {
+      ents = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const ent of ents) {
+      const p = join(dir, ent.name)
+      if (ent.isSymbolicLink()) continue
+      if (ent.isDirectory()) {
+        if (!ent.name.startsWith('.') && !['_uploads', '_previews', 'node_modules', '情感参考'].includes(ent.name)) visit(p, depth + 1)
+        continue
+      }
+      if (!ent.isFile() || (ent.name !== 'voices.json' && ent.name !== 'manifest.json')) continue
+      let json
+      try {
+        json = JSON.parse(readFileSync(p, 'utf8'))
+      } catch {
+        continue
+      }
+      let dirty = false
+      if (Array.isArray(json?.voices)) {
+        // same id rule as scanDirectoryRecursive
+        const keep = json.voices.filter((v) => {
+          const refRel = v?.refAudio || v?.refPath || ''
+          const gone = refRel && goneKeys.has(fsKey(resolve(dir, refRel)))
+          return !((v?.id || `pack-${slugifyId(v?.name)}`) === voiceId || gone)
+        })
+        if (keep.length !== json.voices.length) {
+          json.voices = keep
+          dirty = true
+        }
+      } else if (json && typeof json === 'object') {
+        for (const [k, val] of Object.entries(json)) {
+          if (!val || typeof val !== 'object' || !val.ref_audio) continue
+          const gone = goneKeys.has(fsKey(resolve(dir, val.ref_audio))) || goneKeys.has(fsKey(resolve(dirname(dir), val.ref_audio)))
+          if (`discovered-${slugifyId(k)}` === voiceId || gone) {
+            delete json[k]
+            dirty = true
+          }
+        }
+      }
+      if (dirty) {
+        writeFileSync(p, JSON.stringify(json, null, 2) + '\n', 'utf8')
+        changed.push(p)
+      }
+    }
+  }
+  visit(importedDir, 0)
+  return changed
+}
+
+/**
+ * Delete ONE user-imported / cloned voice — exactly that voice, on the first call:
+ *  - its reference audio plus same-stem siblings (`.wav/.mp3/.flac/.pt/.txt`) — never the other voices of a pack;
+ *  - every `catalog.json` entry that points at those files, and its entry in a pack manifest (`voices.json` /
+ *    `manifest.json`), so the folder scan does not list it again;
+ *  - a folder only when it is the voice's own `imported/<id>/` folder and nothing else is left in it (never recursive).
+ * The voice is found by exact id: its catalog entry and/or the voice(s) the folder scanner derives this id from inside
+ * `imported/` (e.g. `pack-<pack>-<file>` of a zip-imported pack). Built-in voices and anything outside
+ * `voice-packs/imported/` are refused; files behind a symlink / junction are never deleted.
+ */
+export function deleteImportedVoice(voiceId) {
+  const raw = String(voiceId || '').trim()
+  if (!raw || raw.length > 200 || /[\\/]|\.\./.test(raw)) throw new Error(`非法的音色 ID: ${raw.slice(0, 80)}`)
+  const packsDir = getVoicePacksDir()
+  const importedDir = resolve(packsDir, 'imported')
+  const catalogPath = join(packsDir, 'catalog.json')
+  const relOut = (p) => relative(packsDir, p).replace(/\\/g, '/')
+
+  let catalog = { version: '1.0.0', updatedAt: new Date().toISOString(), voices: [] }
+  if (existsSync(catalogPath)) {
+    try {
+      catalog = JSON.parse(readFileSync(catalogPath, 'utf8'))
+      if (!Array.isArray(catalog.voices)) catalog.voices = []
+    } catch {}
+  }
+  const refOf = (v) => {
+    const p = expandEnvPlaceholders(v?.refPath || v?.refAudio || '')
+    return p ? resolve(REPO_ROOT, p) : ''
+  }
+  // Exact matches only — never guess by prefix or by folder
+  const entry = catalog.voices.find((v) => v.id === raw) || null
+  const refs = new Map() // fsKey → reference file of this voice
+  if (entry) {
+    const refAbs = refOf(entry)
+    if (!isInsideDir(importedDir, refAbs)) throw new Error(`「${entry.name || entry.id}」不是导入/克隆音色，内置音色不可删除`)
+    refs.set(fsKey(refAbs), refAbs)
+  }
+  let discoveredName = ''
+  if (existsSync(importedDir)) {
+    scanDirectoryRecursive(
+      importedDir,
+      (e) => {
+        if (e?.id !== raw || !e.refPath) return
+        if (!discoveredName) discoveredName = e.name || ''
+        refs.set(fsKey(e.refPath), resolve(e.refPath))
+      },
+      0,
+      4,
+    )
+  }
+  if (!entry && refs.size === 0) return { ok: false, removedId: '', error: `未找到可删除的导入音色: ${raw}` }
+
+  // The voice's files: each reference file and its same-stem siblings in the same folder (inside imported/, no links)
+  const files = new Map()
+  const linked = []
+  for (const ref of refs.values()) {
+    if (!isInsideDir(importedDir, ref)) continue // e.g. a manifest entry pointing outside: only the entry is dropped
+    if (hasLinkBelow(importedDir, ref)) {
+      linked.push(ref)
+      continue
+    }
+    const dir = dirname(ref)
+    const stem = stemKey(basename(ref, extname(ref)))
+    let names = []
+    try {
+      names = readdirSync(dir)
+    } catch {}
+    const group = []
+    for (const n of names) {
+      if (!VOICE_FILE_EXTS.has(extname(n).toLowerCase()) || stemKey(basename(n, extname(n))) !== stem) continue
+      const p = join(dir, n)
+      try {
+        if (lstatSync(p).isFile()) group.push(p)
+      } catch {}
+    }
+    // the reference itself first: if it cannot be removed, its siblings are left alone
+    group.sort((a, b) => Number(fsKey(b) === fsKey(ref)) - Number(fsKey(a) === fsKey(ref)))
+    for (const p of group) files.set(fsKey(p), p)
+  }
+  if (linked.length > 0) {
+    // Nothing is touched: deleting through a symlink / junction would remove files outside voice-packs/imported/
+    return {
+      ok: false,
+      refused: true,
+      removedId: '',
+      error: `音色「${entry?.name || discoveredName || raw}」的文件位于符号链接 / 联接 (junction) 目录中，为安全起见不会删除: ${relOut(linked[0])}`,
+    }
+  }
+  const removedFiles = []
+  for (const p of files.values()) {
+    try {
+      unlinkSync(p)
+      removedFiles.push(p)
+    } catch (err) {
+      throw new Error(`音色文件删除失败（可能正被其他程序占用）: ${relOut(p)} — ${err?.code || err?.message || err}`)
+    }
+  }
+
+  // Catalog stays consistent: drop this id and every imported entry whose reference file is now gone
+  const goneKeys = new Set(removedFiles.map(fsKey))
+  for (const r of refs.values()) if (!existsSync(r)) goneKeys.add(fsKey(r))
+  const removedCatalogIds = []
+  catalog.voices = catalog.voices.filter((v) => {
+    const ref = refOf(v)
+    const drop = v.id === raw || (isInsideDir(importedDir, ref) && goneKeys.has(fsKey(ref)))
+    if (drop) removedCatalogIds.push(v.id)
+    return !drop
+  })
+  if (removedCatalogIds.length > 0) {
+    catalog.updatedAt = new Date().toISOString()
+    writeFileSync(catalogPath, JSON.stringify(catalog, null, 2) + '\n', 'utf8')
+  }
+  const updatedManifests = existsSync(importedDir) ? pruneVoiceManifests(importedDir, raw, goneKeys) : []
+
+  // A folder goes only when it is the voice's own imported/<id>/ folder (a real directory) and is now empty
+  let folderRemoved = false
+  let keptFolder = ''
+  for (const id of new Set([raw, ...removedCatalogIds])) {
+    if (!id || /[\\/]/.test(id) || id === '.' || id === '..') continue
+    const own = join(importedDir, id)
+    if (fsKey(dirname(own)) !== fsKey(importedDir)) continue
+    let st = null
+    try {
+      st = lstatSync(own)
+    } catch {}
+    if (!st?.isDirectory()) continue // missing, a file, or a symlink / junction
+    let left = []
+    try {
+      left = readdirSync(own)
+    } catch {}
+    if (left.length === 0) {
+      try {
+        rmdirSync(own)
+        folderRemoved = true
+      } catch {}
+    } else if (id === raw) {
+      keptFolder = own
+    }
+  }
+  return {
+    ok: true,
+    removedId: raw,
+    name: entry?.name || discoveredName || raw,
+    removedFiles: removedFiles.map(relOut),
+    removedCatalogIds,
+    updatedManifests: updatedManifests.map(relOut),
+    folderRemoved,
+    keptFolder: keptFolder || undefined,
+  }
 }
 
 /**
@@ -912,8 +1184,8 @@ export function matchVoiceForScene(scene = {}, projectMeta = {}, catalogVoices =
     throw new Error('Voice catalog is empty. Please import a voice pack or check INDEXTTS_ROOT in .env.')
   }
 
-  // 1. Check if user explicitly specified a voiceId or voice name
-  const requestedId =
+  // 1. Check if user explicitly specified a voiceId or voice name (an id of a de-duplicated entry maps to its voice)
+  const requestedId = resolveVoiceIdAlias(
     explicitVoiceId && explicitVoiceId !== 'auto'
       ? explicitVoiceId
       : scene.voiceLocked && scene.voiceId && scene.voiceId !== 'auto'
@@ -922,7 +1194,8 @@ export function matchVoiceForScene(scene = {}, projectMeta = {}, catalogVoices =
           ? projectMeta.defaultVoiceId
           : scene.voiceId && scene.voiceId !== 'auto'
             ? scene.voiceId
-            : ''
+            : '',
+  )
 
   if (requestedId) {
     const kw = requestedId.toLowerCase()
@@ -1167,20 +1440,28 @@ export function matchAllScenesInScript(projectOrFile, options = {}) {
 
   const results = []
   data.scenes = (data.scenes || []).map((scene) => {
-    const effectiveScene = forceAuto ? { ...scene, voiceId: 'auto', voiceLocked: false } : scene
+    // A voice the user picked by hand for this one scene (Web Studio inspector) beats both the global
+    // voice and an automatic re-match, as long as that voice still exists in the catalog.
+    const manualPick =
+      scene.voiceCastBy === 'manual' &&
+      scene.voiceLocked &&
+      scene.voiceId &&
+      scene.voiceId !== 'auto' &&
+      voices.some((v) => v.id === scene.voiceId && v.available !== false)
+    const effectiveScene = forceAuto && !manualPick ? { ...scene, voiceId: 'auto', voiceLocked: false } : scene
     const matched = matchVoiceForScene(
       effectiveScene,
       { ...data, _primaryVoiceId: primaryAnchorId },
       voices,
-      globalVoiceId,
+      manualPick ? scene.voiceId : globalVoiceId,
     )
     const updated = {
       ...scene,
       voiceId: matched.voice.id,
       voiceName: matched.voice.name,
       voiceCategory: matched.voice.category,
-      voiceLocked: matched.mode === 'manual' ? true : Boolean(scene.voiceLocked && !forceAuto),
-      voiceMatchReason: matched.reason,
+      voiceLocked: matched.mode === 'manual' ? true : Boolean(scene.voiceLocked && (!forceAuto || manualPick)),
+      voiceMatchReason: manualPick ? `用户为本幕手动指定音色: ${matched.voice.name}` : matched.reason,
     }
     results.push({
       sceneId: updated.id,
@@ -1370,6 +1651,7 @@ export async function castVoicesWithLlm({
  */
 export async function cloneRecordedVoice({
   audioBase64,
+  sourcePath = '',
   fileName = 'recorded-voice.webm',
   name = '',
   gender = 'female',
@@ -1379,9 +1661,17 @@ export async function cloneRecordedVoice({
   promptText = '',
   stripSilence = true,
 }) {
-  const cleanB64 = String(audioBase64 || '').replace(/^data:[^;]+;base64,/, '').trim()
-  if (!cleanB64) {
+  // Callers may pass a local recording / audio / video file (`sourcePath`) instead of base64 bytes
+  const srcAbs = sourcePath ? resolve(String(sourcePath)) : ''
+  if (srcAbs && !existsSync(srcAbs)) {
+    throw new Error(`克隆声纹的源文件不存在: ${srcAbs}`)
+  }
+  const cleanB64 = srcAbs ? '' : String(audioBase64 || '').replace(/^data:.*?;base64,/, '').trim()
+  if (!srcAbs && !cleanB64) {
     throw new Error('录音或音频文件二进制内容为空，无法克隆声纹')
+  }
+  if (srcAbs && (!fileName || fileName === 'recorded-voice.webm')) {
+    fileName = basename(srcAbs)
   }
 
   const packsDir = getVoicePacksDir()
@@ -1397,7 +1687,8 @@ export async function cloneRecordedVoice({
   const rawInputPath = join(tmpDir, `${safeSlug}-${stamp}${rawExt}`)
   const normalizedWav = join(tmpDir, `${safeSlug}-${stamp}-clean.wav`)
 
-  writeFileSync(rawInputPath, Buffer.from(cleanB64, 'base64'))
+  if (srcAbs) copyFileSync(srcAbs, rawInputPath)
+  else writeFileSync(rawInputPath, Buffer.from(cleanB64, 'base64'))
 
   const { ffmpeg } = resolveBinaries()
   const baseFilter = 'highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=9'

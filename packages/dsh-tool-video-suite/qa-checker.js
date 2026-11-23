@@ -15,6 +15,87 @@ import {
   RESTRICTED_COMMERCIAL_FONT_PATTERNS,
   runCommandRedirected,
 } from '../shared/index.js'
+import {
+  analyzeFrozenFrames,
+  analyzeJumpCuts,
+  analyzeMotionActivity,
+  buildSceneTimeline,
+  buildTemporalQaChecks,
+  collectIntentionalImpactTimes,
+  collectTemporalSignals,
+  DEFAULT_TEMPORAL_QA_OPTIONS,
+  detectOutlierFrameBursts,
+  detectPhotosensitiveFlashes,
+} from './qa-detectors.js'
+import { buildDeterminismCheck, runDeterminismCheck } from './determinism-check.js'
+
+function parseFrameRate(rate, fallback = 30) {
+  const m = /^(\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?$/.exec(String(rate || '').trim())
+  if (!m) return fallback
+  const v = Number(m[1]) / (m[2] ? Number(m[2]) || 1 : 1)
+  return Number.isFinite(v) && v > 0 ? v : fallback
+}
+
+/**
+ * Photosensitive-flash / frozen-frame / jump-cut analysis (one extra downscaled decode pass).
+ */
+export async function runTemporalQaAnalysis({ mp4Path, script, fps, durationSec, freezeThresholdSec, options = {}, signal } = {}) {
+  const { ffmpeg } = resolveBinaries()
+  const opts = { ...DEFAULT_TEMPORAL_QA_OPTIONS, ...options }
+  const freezeSec = Number(freezeThresholdSec) > 0
+    ? Number(freezeThresholdSec)
+    : Number(process.env.DSH_QA_FREEZE_SEC) > 0
+      ? Number(process.env.DSH_QA_FREEZE_SEC)
+      : opts.freezeThresholdSec
+  const sig = await collectTemporalSignals({
+    ffmpeg,
+    mp4Path,
+    durationSec,
+    freezeNoise: opts.freezeNoise,
+    freezeMinSec: freezeSec,
+    scdetThreshold: opts.scdetThreshold,
+    signal,
+  })
+  const timeline = buildSceneTimeline(script || {}, fps)
+  const impactTimes = collectIntentionalImpactTimes(script || {}, timeline)
+  const flash = detectPhotosensitiveFlashes({
+    grid: sig.grid,
+    gridCells: sig.gridCells,
+    frameCount: sig.frameCount,
+    yavg: sig.yavg,
+    fps,
+    fullRange: sig.fullRange,
+    intentionalTimes: impactTimes,
+    options: opts,
+  })
+  const freeze = analyzeFrozenFrames({
+    freezes: sig.freezes,
+    timeline,
+    totalSec: durationSec,
+    thresholdSec: freezeSec,
+    allowedIntervals: script?.qa?.allowedFreezes || [],
+  })
+  const jumps = analyzeJumpCuts({
+    cuts: sig.cuts,
+    timeline,
+    fps,
+    flashFrames: flash.softTransitionFrames,
+    impactTimes,
+    outlierBursts: detectOutlierFrameBursts({ grid: sig.grid, gridCells: sig.gridCells, frameCount: sig.frameCount }),
+    toleranceFrames: opts.cutToleranceFrames,
+  })
+  const motion = analyzeMotionActivity({ ydif: sig.ydif, fps, timeline, cutTimes: (sig.cuts || []).map((c) => c.timeSec) })
+  const { softTransitionFrames, ...flashReport } = flash
+  return {
+    flash: flashReport,
+    freeze,
+    jumps,
+    motion,
+    checks: buildTemporalQaChecks({ flash, freeze, jumps, motion }),
+    frameCount: sig.frameCount,
+    analysisMs: sig.analysisMs,
+  }
+}
 
 /**
  * Scan LLM-generated TSX/HTML files for unsafe APIs, external links, hardcoded Windows paths, or Remotion/HyperFrames violations.
@@ -185,10 +266,56 @@ export async function runTypecheckOnProject(projectDir) {
 }
 
 /**
- * Post-render automated FFmpeg quality audit (`ffprobe` + `blackdetect` + `ebur128` LUFS).
+ * Post-render automated FFmpeg quality audit (`ffprobe` + `blackdetect` + `ebur128` LUFS),
+ * plus temporal checks (photosensitive flash risk · frozen frames · unplanned jump cuts)
+ * and an optional `deep` determinism check (same frame rendered twice, pixel hashes compared).
  * Persists result to `output/qa_report.json`.
  */
-export async function runPostRenderQa({ projectDir, mp4Path, script, expectedWidth, expectedHeight }) {
+/** QA entry for the render's exposure guard result (null when the guard did not run). */
+export function buildExposureCheck(exposure) {
+  if (!exposure || typeof exposure !== 'object') return null
+  const pct = (y) => {
+    if (!Number.isFinite(Number(y))) return '?'
+    const lo = exposure.fullRange ? 0 : 16
+    const hi = exposure.fullRange ? 255 : 235
+    return `${Math.round(((Number(y) - lo) / (hi - lo)) * 100)}%`
+  }
+  const lifted = Array.isArray(exposure.lifted) ? exposure.lifted : []
+  if (exposure.applied) {
+    return {
+      name: '画面亮度可读性（过暗镜头自动提亮）',
+      passed: true,
+      value: `${lifted.length} 个过暗镜头已提亮（全片平均亮度 ${pct(exposure.before?.meanY)} → ${pct(exposure.after?.meanY)}，黑白场不变）`,
+    }
+  }
+  if (exposure.reason === 'within-range') {
+    return { name: '画面亮度可读性（过暗镜头自动提亮）', passed: true, value: `全片平均亮度 ${pct(exposure.before?.meanY)}，无过暗镜头` }
+  }
+  if (exposure.reason === 'error' && lifted.length) {
+    return {
+      name: '画面亮度可读性（过暗镜头自动提亮）',
+      passed: false,
+      severity: 'warning',
+      value: `${lifted.length} 个镜头过暗（最暗约 ${pct(exposure.before?.darkestMeanY)}），自动提亮未完成：${String(exposure.error || '').slice(0, 120)}`,
+    }
+  }
+  return null
+}
+
+export async function runPostRenderQa({
+  projectDir,
+  mp4Path,
+  script,
+  expectedWidth,
+  expectedHeight,
+  deep = false,
+  temporal,
+  freezeThresholdSec,
+  temporalOptions = {},
+  determinismFrames,
+  exposure = null,
+  signal,
+}) {
   const absDir = resolve(projectDir)
   const targetMp4 = mp4Path ? resolve(mp4Path) : join(absDir, 'output', 'final.mp4')
   const qaOutPath = join(absDir, 'output', 'qa_report.json')
@@ -305,12 +432,13 @@ export async function runPostRenderQa({ projectDir, mp4Path, script, expectedWid
     },
     {
       name: '响度与峰值标准 (EBU R128)',
+      // Delivered (AAC-encoded) true peak must keep headroom so platform re-encodes cannot clip (≤ -0.5 dBTP)
       passed:
         integratedLufs === null ||
-        (integratedLufs >= -24 && integratedLufs <= -9 && (truePeakDbtp === null || truePeakDbtp <= 0.2)),
+        (integratedLufs >= -24 && integratedLufs <= -7.5 && (truePeakDbtp === null || truePeakDbtp <= -0.5)),
       value:
         integratedLufs !== null
-          ? `响度 ${integratedLufs.toFixed(1)} LUFS · 峰值 ${(truePeakDbtp ?? 0).toFixed(1)} dBTP · LRA ${(rangeLu ?? 0).toFixed(1)} LU`
+          ? `响度 ${integratedLufs.toFixed(1)} LUFS · 峰值 ${(truePeakDbtp ?? 0).toFixed(1)} dBTP · LRA ${(rangeLu ?? 0).toFixed(1)} LU${truePeakDbtp !== null && truePeakDbtp > -0.5 ? '（峰值过高，平台转码可能削波）' : ''}`
           : '音轨响度分析完成',
     },
   ]
@@ -332,6 +460,10 @@ export async function runPostRenderQa({ projectDir, mp4Path, script, expectedWid
           ? '缺少 bundled NotoSansSC-VF.woff2'
           : safeZonePreflight.collisions.map((c) => c.suggestion).join('; '),
   })
+
+  // Exposure: the render's exposure guard measured every shot (and lifted unreadably dark ones)
+  const expCheck = buildExposureCheck(exposure)
+  if (expCheck) checks.push(expCheck)
 
   // Generate compact 3x3 verification contact sheet directly from final MP4
   const contactSheetOut = join(absDir, 'output', 'snapshot-3x3.png')
@@ -360,6 +492,51 @@ export async function runPostRenderQa({ projectDir, mp4Path, script, expectedWid
     value: hasContactSheet ? '已生成 3×3 成片抽帧对比图' : '未生成抽帧图',
   })
 
+  // Temporal checks run on every QA (one extra 320px decode pass ≈ 20–25× realtime); DSH_QA_TEMPORAL=0 disables
+  let temporalReport = null
+  const temporalEnabled = temporal !== undefined ? Boolean(temporal) : process.env.DSH_QA_TEMPORAL !== '0'
+  if (temporalEnabled && vStream.codec_name && actualDurationSec > 0.3) {
+    const videoFps = parseFrameRate(vStream.avg_frame_rate || vStream.r_frame_rate, Number(script?.fps) || 30)
+    try {
+      temporalReport = await runTemporalQaAnalysis({
+        mp4Path: targetMp4,
+        script,
+        fps: videoFps,
+        durationSec: actualDurationSec,
+        freezeThresholdSec,
+        options: temporalOptions,
+        signal,
+      })
+      checks.push(...temporalReport.checks)
+    } catch (err) {
+      if (signal?.aborted) throw err
+      checks.push({
+        name: '时序质检 (闪烁/冻结/跳帧)',
+        passed: true,
+        severity: 'skipped',
+        value: `已跳过：${String(err?.message || err).slice(0, 160)}`,
+      })
+    }
+  }
+
+  let determinism = null
+  if (deep) {
+    try {
+      determinism = await runDeterminismCheck({
+        projectDir: absDir,
+        script,
+        engine: script?.engine,
+        frames: determinismFrames,
+        signal,
+      })
+    } catch (err) {
+      if (signal?.aborted) throw err
+      determinism = { ok: false, error: String(err?.message || err).slice(0, 240) }
+    }
+    const detCheck = buildDeterminismCheck(determinism)
+    if (detCheck) checks.push(detCheck)
+  }
+
   const passed = checks.every((c) => c.passed)
   const report = {
     ok: true,
@@ -379,6 +556,14 @@ export async function runPostRenderQa({ projectDir, mp4Path, script, expectedWid
     },
     loudness: { integratedLufs, rangeLu, truePeakDbtp },
     blackSegments,
+    photosensitivity: temporalReport?.flash || null,
+    frozenFrames: temporalReport?.freeze || null,
+    jumpCuts: temporalReport?.jumps || null,
+    motionActivity: temporalReport?.motion ? { ...temporalReport.motion, perSec: undefined } : null,
+    temporalAnalysisMs: temporalReport?.analysisMs ?? null,
+    determinism,
+    deep: Boolean(deep),
+    warnings: checks.filter((c) => c.severity === 'warning').map((c) => `${c.name}：${c.value}`),
     checks,
     checkedAt: new Date().toISOString(),
   }

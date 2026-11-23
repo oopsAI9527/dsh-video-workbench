@@ -135,11 +135,22 @@ export const VIDEO_STYLES = {
 
 export function normalizeVideoStyle(rawStyle) {
   const key = String(rawStyle || 'tech').trim().toLowerCase()
-  if (key === 'minimal-editorial') return 'documentary'
+  if (key === 'minimal-editorial' || key === 'editorial' || key === 'minimal') return 'documentary'
   if (key === 'vibrant-brand') return 'energetic'
   if (key === 'cinema') return 'cinematic'
-  if (key === 'mint' || key === 'emerald-trench') return 'emerald'
+  if (key === 'cyber') return 'tech'
+  if (key === 'mint' || key === 'emerald-trench' || key === 'luxury') return 'emerald'
   return VIDEO_STYLES[key] ? key : 'tech'
+}
+
+/**
+ * Preset style key for a consumer (BGM mood, colour grade, voice mastering …) that may receive a UI selection value:
+ * 'auto' (AI 自由匹配) and 'user:<id>' (我的风格预设) resolve to the project's base preset (`script.style`).
+ */
+export function resolveStyleKey(style, script) {
+  const key = String(style || '').trim().toLowerCase()
+  if (key && key !== 'auto' && !key.startsWith('user:')) return normalizeVideoStyle(key)
+  return normalizeVideoStyle(script && script.style)
 }
 
 /**

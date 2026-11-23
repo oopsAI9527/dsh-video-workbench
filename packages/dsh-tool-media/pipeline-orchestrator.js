@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import {
+  buildGlobalSubtitleTrack,
   buildSentenceSubtitles,
   cleanSubtitleChunk,
   createAbortError,
@@ -33,23 +34,53 @@ import { importAssets, readAssets } from './asset-manager.js'
 import { planVideoFromAssets, syncProjectCodeFromScript } from './ai-director.js'
 import { buildRichHtmlVideo } from './html-generator.js'
 import { authorBatchedRemotionScenes, runCodeAutoRepairLoop } from './ai-coder.js'
+import { applyFigureStyleChoice, enrichScenesForVisuals, FIGURE_STYLE_ZH, normalizeCast, normalizeFigureStyle, normalizeFigureStyleNote } from './figure-kit.js'
+import { syncCastWithCharacterBank } from './cast-bank-sync.js'
+
+import { formatToolSummary } from './scene-tool-plan.js'
+import { summarizeVisualReview } from './visual-review.js'
+import { AMBIENCE_LABELS_ZH } from './ambience-dsp.js'
 import { executeCurateAndEditAssets } from './media-editor.js'
-import { buildGenreGuidance, detectGenre, resolveGenreSelection } from './genre-router.js'
+import { buildGenreGuidance, detectGenre, isEpicCombatContext, isHistoricalContent, resolveGenreSelection } from './genre-router.js'
 import { generateAiCodedBgmTrack, generateAiCodedSfxCues, synthesizeTtsEngineAudioCue } from './audio-coder.js'
 import {
   analyzeAudioBeatStructure,
   buildBeatGrid,
   choreographBeatSfxCues,
   ensureProjectAudioAssets,
+  generateBgmWav,
   mixVideoAudio,
   quantizeScenesToBeatGrid,
 } from './audio-synth.js'
 import { buildHtmlCoderSkillsPrompt, buildRemotionCoderSkillsPrompt } from './shotcraft-lib.js'
-import { callLlmChat, extractJsonFromLlmText, getSafeLlmConfigSummary } from './llm-client.js'
+import { withStyleGuide } from './style-presets.js'
+import { callLlmChat, extractJsonFromLlmText, getSafeLlmConfigSummary, resolveLlmConfig } from './llm-client.js'
+import { stripPlazaTemplateGuidance } from './plaza-guidance.js'
 import { runSchemaDirectorWithDegradation } from './plan-schema.js'
 import { writeRemotionProjectFiles } from './remotion-generator.js'
 import { taskManager } from './task-manager.js'
 import { buildMediaDimsMap, groundVisualAssets } from './vision-grounding.js'
+import {
+  createPaidJobBudget,
+  executeMediaSourcingPlan,
+  isBillingError,
+  loadCloudMediaConfig,
+  resolveMediaSourcingPlan,
+  toBillingError,
+} from './cloud-media.js'
+import { billingErrorFromText, createBillingSentinel } from './cloud-ledger.js'
+import { safeProjectSnapshot } from './project-history.js'
+import { applyLockedHtmlStore, syncLockedHtmlStore } from './region-refine.js'
+import {
+  applyUserOverrides,
+  getLockedSceneIds,
+  isSceneLocked,
+  reassertLockedScenes,
+  reconcileUserEdits,
+  restoreLockedSceneSfx,
+  snapshotLockedSceneAudio,
+  summarizeEditMerge,
+} from './scene-locks.js'
 
 /**
  * Normalize pipeline execution mode (`local-draft` / `draft` / `fast-draft` -> `fast-draft`).
@@ -77,7 +108,6 @@ async function recomputeCumulativeTimeline(absDir) {
   const fps = Number(script.fps) || 30
   let cursorFrame = 0
   let totalSec = 0
-  const allSubs = []
 
   for (let i = 0; i < (script.scenes || []).length; i++) {
     const sc = script.scenes[i]
@@ -103,31 +133,13 @@ async function recomputeCumulativeTimeline(absDir) {
         sceneId: sc.id,
       }))
     }
-    for (const sub of sc.subtitles || []) {
-      const gStartSec = Number((totalSec + Number(sub.startSec || 0)).toFixed(3))
-      const gEndSec = Number((totalSec + Number(sub.endSec || 0)).toFixed(3))
-      const gStartFrame = cursorFrame + Number(sub.startFrame || 0)
-      const gEndFrame = cursorFrame + Number(sub.endFrame || 0)
-      allSubs.push({
-        ...sub,
-        localStartSec: Number(sub.startSec || 0),
-        localEndSec: Number(sub.endSec || 0),
-        startSec: gStartSec,
-        endSec: gEndSec,
-        startFrame: gStartFrame,
-        endFrame: gEndFrame,
-        globalStartSec: gStartSec,
-        globalEndSec: gEndSec,
-        globalStartFrame: gStartFrame,
-        globalEndFrame: gEndFrame,
-      })
-    }
 
     cursorFrame += durFrames
     totalSec += sc.durationSec
   }
 
-  script.subtitles = allSubs
+  // Global track = every scene cue at its scene's timeline position (the same builder writeScriptJson keeps in step)
+  script.subtitles = buildGlobalSubtitleTrack(script.scenes || [], fps)
   script.totalDurationInFrames = cursorFrame
   script.totalDurationSec = Number(totalSec.toFixed(4))
   return writeScriptJson(absDir, script).data
@@ -165,6 +177,23 @@ async function executeMultiAgentRunner(run, helpers) {
   loadEnv()
   const { signal, onChild, waitIfPaused, updateTask, appendLog } = helpers
   const spec = run.spec || {}
+  // Everything that made this film worse than a normal run (a model fallback, a failed QA check) is collected here,
+  // shown as a yellow log line right away and summed up in the completion message and the run summary.
+  const runWarnings = []
+  const warnUser = (stage, message) => {
+    runWarnings.push({ stage, message: String(message) })
+    appendLog(stage, String(message), 'warn')
+  }
+  const onLlmRetry = ({ waitMs, status, reason, attempt } = {}) => {
+    const sec = Math.max(1, Math.round((Number(waitMs) || 0) / 1000))
+    appendLog(
+      undefined,
+      reason === 'rate-limit'
+        ? `大模型接口限流（HTTP 429），${sec} 秒后自动重试（第 ${attempt} 次）…`
+        : `大模型接口暂时异常${status ? `（HTTP ${status}）` : ''}，${sec} 秒后自动重试…`,
+      'warn',
+    )
+  }
   // Split any (AI-polished) brief into audience-safe title/topic + AI-only director notes
   {
     const brief = splitDirectorBrief(spec)
@@ -182,7 +211,8 @@ async function executeMultiAgentRunner(run, helpers) {
   const absDir = resolve(spec.projectDir || run.projectDir)
   const { isDraftMode, effectiveMode: mode } = resolvePipelineMode(spec.mode)
   const engine = spec.engine === 'remotion' ? 'remotion' : 'html'
-  const style = spec.style || 'tech'
+  // the director stage may turn 「AI 自由匹配」 into a preset (or an AI-designed style based on one): re-read below
+  let style = spec.style || 'tech'
   const aspectRatio = spec.aspectRatio || 'auto'
 
   // Optional initial source import BEFORE resolving BGM & duration policy
@@ -197,6 +227,17 @@ async function executeMultiAgentRunner(run, helpers) {
     } catch {}
   }
   const initialAssetsSnap = readAssets(absDir)
+  // HTML engine: capture locked scenes' <template> blocks before the director rewrites index.html (first capture
+  // wins, so retries and later runs keep the implementation from the moment of locking)
+  if ((initialScriptSnap.engine || spec.engine) !== 'remotion') {
+    try {
+      syncLockedHtmlStore(absDir, initialScriptSnap)
+    } catch {}
+  }
+  // Cost protection (per-run paid-job cap, DSH_CLOUD_MAX_PAID_JOBS_PER_RUN) + project version history
+  const paidBudget = createPaidJobBudget({ runId: run.id, max: spec.maxPaidJobsPerRun })
+  const stageSnap = (stage, phase, author = 'ai') =>
+    safeProjectSnapshot(absDir, { label: `pipeline:${stage}:${phase}`, stage, author, kind: 'pipeline', runId: run.id })
   const uploadedMusicSnap = (initialAssetsSnap.items || []).filter((it) => it.role === 'music')
   const intentFullText = `${spec.rawTopic || ''} ${spec.directorNotes || ''} ${spec.goal || ''} ${initialScriptSnap.goal || ''}`
   const wantsUploadedBgmByPrompt = /(?:上传|自带|导入|个人|我的|现有|本机).{0,10}(?:bgm|配乐|音乐|背景音|歌曲)|(?:bgm|配乐|背景音).{0,12}(?:节拍|卡点|踩拍|踩死|突降|高潮|同步)/i.test(intentFullText)
@@ -229,11 +270,13 @@ async function executeMultiAgentRunner(run, helpers) {
   const durationPolicy = resolveTargetDurationPolicy({
     durationMode: spec.durationMode || initialScriptSnap.durationMode || 'auto',
     targetDurationSec: Number(spec.targetDurationSec) || Number(initialScriptSnap.targetDurationSec) || 0,
-    text: intentFullText,
+    // the user's wording only: a template's style recipe describes its source film ("平均3.42秒" once became 42 s)
+    text: stripPlazaTemplateGuidance(intentFullText),
     narrationMode: spec.narrationMode || initialScriptSnap.narrationMode || 'tts',
     hasVisualAssets: (initialAssetsSnap.items || []).some((it) => it.type === 'image' || it.type === 'video'),
     bgmDurationSec: Number(uploadedMusicSnap[0]?.durationSec || initialScriptSnap.bgm?.durationSec) || 0,
     referenceShotCount: Number(refStyleSnap?.pacingSignature?.targetShotCount || refStyleSnap?.shotCount || 0),
+    referenceDurationSec: Number(refStyleSnap?.durationSec || 0),
   })
   const effectiveDurationMode = durationPolicy.durationMode === 'custom' ? 'custom' : (spec.durationMode || initialScriptSnap.durationMode || 'auto')
   const effectiveTargetDurationSec = durationPolicy.enforced ? durationPolicy.targetSec : 0
@@ -257,6 +300,12 @@ async function executeMultiAgentRunner(run, helpers) {
   const speechTempo = Number(spec.speechTempo) || 1.0
   const allowPlaceholder = Boolean(spec.allowPlaceholder)
   const llmSummary = getSafeLlmConfigSummary()
+  // Billing tripwire for every injected LLM call: helpers with graceful fallbacks (schema director tiers, vision
+  // grounding, voice casting, AI BGM) must never re-call a provider that reported no balance / quota — after the
+  // first billing failure later calls fail without network and stage checkpoints stop the whole run.
+  const llmBilling = createBillingSentinel({ scope: 'llm', provider: llmSummary.model || '' })
+  const guardedLlm = llmBilling.wrap((p) => callLlmChat({ ...p, signal, onRetry: onLlmRetry }))
+  const llmBillingInfo = { scope: 'llm', provider: llmSummary.model || '' }
   appendLog(
     'director',
     `本机算力体检: ${hwProfile.cpu.threads}核 · ${hwProfile.memory.freeGB}/${hwProfile.memory.totalGB}GB 内存 · ${hwProfile.gpu.primaryName} | ${hwPolicy.reason}${hwPolicy.clampedFields.length ? ` [保护限幅: ${hwPolicy.clampedFields.join(' / ')}]` : ''}`,
@@ -272,6 +321,8 @@ async function executeMultiAgentRunner(run, helpers) {
       progress: 12,
       message: `策划导演 Agent 启动：正在整合主题「${spec.topic || '智能短片'}」与 Step 1 素材库...`,
     })
+    // Version history: capture the pre-run state (includes any manual edits since the last AI run)
+    stageSnap('director', 'before', 'user')
 
     const preserveExisting = Boolean(spec.preserveExistingScript && existsSync(join(absDir, 'script.json')))
     if (preserveExisting) {
@@ -373,6 +424,8 @@ async function executeMultiAgentRunner(run, helpers) {
       try {
         const curScript = readScriptJson(absDir).data
         curScript.durationMode = effectiveDurationMode
+        // 人物画风 picked for this run (studio form / MCP figureStyle): the director writes the cast for it
+        applyFigureStyleChoice(curScript, spec)
         if (effectiveTargetDurationSec > 0) {
           curScript.targetDurationSec = effectiveTargetDurationSec
           curScript.totalDurationSec = effectiveTargetDurationSec
@@ -381,7 +434,7 @@ async function executeMultiAgentRunner(run, helpers) {
         try {
           const groundRes = await groundVisualAssets({
             projectDir: absDir,
-            callLlmChatFn: (p) => callLlmChat({ ...p, signal }),
+            callLlmChatFn: guardedLlm,
             enableVision: mode === 'ai-coded' && llmSummary.configured,
             signal,
             onProgress: (pct, msg) => {
@@ -397,6 +450,7 @@ async function executeMultiAgentRunner(run, helpers) {
             appendLog('director', `已完成界面视觉坐标锚点定位：精确 DOM 侧车 ${groundRes.sidecarCount} 份 · 视觉识别 ${groundRes.visionCount} 份`)
           }
         } catch {}
+        llmBilling.throwIfTripped()
         const assetsManifest = readAssets(absDir)
         curScript.mediaDims = buildMediaDimsMap(assetsManifest, curScript)
         const schemaRes = await runSchemaDirectorWithDegradation({
@@ -417,8 +471,13 @@ async function executeMultiAgentRunner(run, helpers) {
           durationMode: effectiveDurationMode,
           targetDurationSec: effectiveTargetDurationSec,
           referenceStyle: refStyleSnap || curScript.referenceStyle || null,
-          callLlmChatFn: (p) => callLlmChat({ ...p, signal }),
+          callLlmChatFn: guardedLlm,
+          signal,
+          onLlmWait: ({ waitMs }) =>
+            appendLog('director', `大模型接口仍不可用，${Math.round((Number(waitMs) || 0) / 1000)} 秒后再试一次完整策划…`, 'warn'),
         })
+        // The schema director degrades through tiers on errors: a billing failure must stop here, not fall back
+        llmBilling.throwIfTripped()
         if (schemaRes?.resolved?.resolvedShots?.length >= 2) {
           const oldScenes = Array.isArray(curScript.scenes) ? curScript.scenes : []
           const visualPool = (assetsManifest?.items || []).filter((it) => it.type === 'image' || it.type === 'video')
@@ -487,11 +546,17 @@ async function executeMultiAgentRunner(run, helpers) {
                 shot.layout ||
                 oldSc.layout ||
                 (visualPool.length === 0
-                  ? (/历史|霸王|项羽|霍去病|卫青|汉武|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(`${spec.topic || ''} ${curScript.title || ''}`)
+                  ? (isHistoricalContent(`${spec.topic || ''} ${curScript.title || ''}`)
                       ? 'narrative-diorama'
                       : '3d-stage-opener')
                   : 'app-focus-shot'),
               kenBurns: shot.kenBurns || oldSc.kenBurns || 'zoom-in',
+              actionMode: shot.actionMode || oldSc.actionMode || undefined,
+              impactBeats: Array.isArray(shot.impactBeats) ? shot.impactBeats : oldSc.impactBeats,
+              vibeTools: Array.isArray(shot.vibeTools) ? shot.vibeTools : oldSc.vibeTools,
+              castIds: Array.isArray(shot.castIds) ? shot.castIds : oldSc.castIds,
+              atmosphere: shot.atmosphere || oldSc.atmosphere,
+              ambience: shot.ambience || oldSc.ambience,
               transition: shot.transition || oldSc.transition || (visualPool.length === 0 ? 'flash-cut' : 'iris-circle'),
               highlights: Array.isArray(shot.highlights) && shot.highlights.length > 0
                 ? shot.highlights.map((h) => normalizeNumeralsForDisplay(stripMetaInstructions(h))).filter(Boolean)
@@ -510,6 +575,10 @@ async function executeMultiAgentRunner(run, helpers) {
             }
           })
           curScript.scenes = updatedScenes
+          // the film's cast (演员表): one appearance per character for every shot (any genre)
+          if (Array.isArray(schemaRes.plan?.cast) && schemaRes.plan.cast.length) curScript.cast = normalizeCast(schemaRes.plan.cast)
+          if (normalizeFigureStyle(schemaRes.plan?.figureStyle)) curScript.figureStyle = normalizeFigureStyle(schemaRes.plan.figureStyle)
+          if (normalizeFigureStyleNote(schemaRes.plan?.figureStyleNote)) curScript.figureStyleNote = normalizeFigureStyleNote(schemaRes.plan.figureStyleNote)
           const genreAfterDir = resolveGenreSelection({
             genre: schemaRes.plan?.genre || curScript.genre || spec.genre || '',
             genreLabel: schemaRes.plan?.genreLabel || curScript.genreLabel || spec.genreLabel || '',
@@ -540,12 +609,35 @@ async function executeMultiAgentRunner(run, helpers) {
             model: llmSummary.model || '',
             llmUsed: Number(schemaRes.degradationTier || 4) <= 3,
           }
+          // the storyboard's beat grid: the AI-composed music is written at this tempo (see the BGM stage)
+          if (Number(schemaRes.degradationTier || 4) <= 3 && Number(schemaRes.plan?.bpm) > 0) curScript.planBpm = Number(schemaRes.plan.bpm)
+          else delete curScript.planBpm
+          // Human edit protection: locked scenes keep content + timing; user overrides win (3-way merge)
+          const directorMerge = reconcileUserEdits({ projectDir: absDir, prevScript: initialScriptSnap, nextScript: curScript, stage: 'llm-director' })
+          if (directorMerge.report) {
+            Object.assign(curScript, directorMerge.script)
+            appendLog('director', `人工修改保护：${summarizeEditMerge(directorMerge.report)}`)
+          }
           writeScriptJson(absDir, curScript)
           appendLog('director', `大模型导演调度完成 (${schemaRes.tierLabel || 'Schema Tier'} · ${updatedScenes.length} 幕${schemaRes.degradationTier > 1 ? ` · Tier1详情: ${schemaRes.trace?.[0]?.reason || 'unknown'}` : ''})`)
+          const tierNo = Number(schemaRes.degradationTier || 4)
+          if (tierNo >= 4) {
+            const why = schemaRes.llmOutage
+              ? `大模型接口持续限流或不可用（${String(schemaRes.llmOutage).slice(0, 90)}）`
+              : `大模型没有返回可用的分镜（${String(schemaRes.trace?.[0]?.reason || '未知原因').slice(0, 90)}）`
+            warnUser(
+              'director',
+              `⚠ ${why}，本次分镜改由规则引擎${schemaRes.briefBeatCount ? `按你需求里的 ${schemaRes.briefBeatCount} 个要点` : ''}生成（${updatedScenes.length} 幕），文案和节奏会比正常出片简单很多；建议稍后点「重新出片」。`,
+            )
+          } else if (tierNo >= 2) {
+            warnUser('director', `⚠ 大模型返回的分镜不完整，已降级为简化策划（${schemaRes.tierLabel || `Tier ${tierNo}`}），画面编排会比完整策划简单。`)
+          }
         }
       } catch (err) {
         if (err?.name === 'AbortError' || signal.aborted) throw createAbortError()
-        appendLog('director', `大模型导演增强已回退本地智能规划: ${err.message}`, 'warn')
+        // Billing errors (balance / quota) are never retried or silently degraded: stop the run
+        if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: llmSummary.model || '' })
+        warnUser('director', `⚠ 大模型策划失败，已回退本地规则规划：${err.message}`)
       }
     }
 
@@ -562,6 +654,7 @@ async function executeMultiAgentRunner(run, helpers) {
     if (spec.aiBadgeText !== undefined) sAfterDir.aiBadgeText = String(spec.aiBadgeText)
     if (spec.pacingMode) sAfterDir.pacingMode = String(spec.pacingMode)
     if (spec.visual3dMode) sAfterDir.visual3dMode = String(spec.visual3dMode)
+    if (spec.visualReview !== undefined) sAfterDir.visualReview = spec.visualReview !== false
     sAfterDir.fps = effectiveFps
     sAfterDir.lowSpecSafe = hwPolicy.lowSpecSafe
     sAfterDir.hardwarePolicy = {
@@ -571,13 +664,43 @@ async function executeMultiAgentRunner(run, helpers) {
       reason: hwPolicy.reason,
     }
     if (spec.avatarLayout) sAfterDir.avatarLayout = spec.avatarLayout
+    // per-shot atmosphere (particles), ambience (sound bed) and on-screen cast, read by the audio and coding stages
+    try {
+      applyFigureStyleChoice(sAfterDir, spec)
+      enrichScenesForVisuals(sAfterDir)
+      const figStyle = sAfterDir.figureStyle
+      const picked = normalizeFigureStyle(sAfterDir.figureStyleChoice)
+      const byUser = picked && picked !== 'auto' ? '，你指定的' : ''
+      const figText =
+        figStyle === 'custom'
+          ? `自定义「${sAfterDir.figureStyleNote || '按需求'}」（AI 自己设计角色，不套用人物库${byUser}）`
+          : figStyle === 'auto'
+            ? '未指定，由 AI 按作品气质决定'
+            : `${FIGURE_STYLE_ZH[figStyle] || figStyle}（全片统一，可直接用人物库${byUser}）`
+      appendLog('director', `🎨 人物画风：${figText}`)
+    } catch {}
+    // 演员表 ↔ 角色库: a person already in the character bank keeps its look; new cast members are saved to the project bank
+    try {
+      const sync = await syncCastWithCharacterBank({ projectDir: absDir, script: sAfterDir })
+      const parts = [...sync.linked.map((n) => `${n}（沿用角色库形象）`), ...sync.created.map((n) => `${n}（已存入角色库）`)]
+      if (parts.length) appendLog('director', `🧑‍🎨 演员表与角色库已打通：${parts.join('、')}`)
+    } catch (err) {
+      appendLog('director', `演员表同步角色库跳过：${String(err?.message || err).slice(0, 120)}`)
+    }
     writeScriptJson(absDir, sAfterDir)
+    stageSnap('director', 'after')
     updateTask('t-director', {
       status: 'completed',
       progress: 100,
       message: `策划完成：${sAfterDir.scenes?.length || 0} 幕分镜已生成 (${sAfterDir.width}x${sAfterDir.height})`,
     })
   }
+  // later stages (SFX, beat quantize, BGM mood, mastering) use the project's decided base preset (script.style is
+  // always a preset id; a custom AI / user style keeps its closest preset there)
+  try {
+    const decided = readScriptJson(absDir).data?.style
+    if (decided) style = String(decided)
+  } catch {}
 
   // =========================================================================
   // AGENT 2: 素材剪辑 Agent (editor)
@@ -589,6 +712,46 @@ async function executeMultiAgentRunner(run, helpers) {
       progress: 10,
       message: '素材剪辑 Agent 启动：正在调用 FFmpeg 智能裁切构图、调色增强与镜头对齐...',
     })
+
+    // Auto B-roll (opt-in via cloud config / spec.autoUseCloudBroll): user assets → free stock → paid (budget-capped)
+    {
+      const cloudCfgNow = loadCloudMediaConfig()
+      const wantsBroll = spec.autoUseCloudBroll !== undefined ? Boolean(spec.autoUseCloudBroll) : Boolean(cloudCfgNow.autoUseCloudBroll)
+      if (wantsBroll) try {
+        const sourcingPlan = resolveMediaSourcingPlan({
+          projectDir: absDir,
+          cloudConfig: cloudCfgNow,
+          autoUseCloudBroll: true,
+          maxPaidJobsPerRun: paidBudget.max,
+          mediaType: spec.brollMediaType === 'video' ? 'video' : 'image',
+        })
+        if (sourcingPlan.scenes.some((x) => x.needsMedia)) {
+          const sm = sourcingPlan.summary
+          updateTask('t-editor', {
+            status: 'running',
+            progress: 6,
+            message: `B-roll 素材调度：用户素材 ${sm.userAssets} 幕 · 免费素材库 ${sm.freeStock} 幕 · 付费生成 ${sm.paid} 幕（本次上限 ${paidBudget.max}）`,
+          })
+          const sourcingRes = await executeMediaSourcingPlan({
+            projectDir: absDir,
+            plan: sourcingPlan,
+            budget: paidBudget,
+            runId: run.id,
+            signal,
+            onLog: (msg, level) => appendLog('editor', msg, level === 'warn' ? 'warn' : 'info'),
+          })
+          appendLog(
+            'editor',
+            `B-roll 素材调度完成：补齐 ${sourcingRes.applied.length} 幕 · 跳过 ${sourcingRes.skipped.length} 幕 · 新提交付费任务 ${sourcingRes.paidSubmitted} 个（复用已付费结果 ${sourcingRes.paidReused} 个）`,
+          )
+        }
+      } catch (err) {
+        // Optional step: only cancellation and billing stops propagate (billing ends the whole run)
+        if (err?.name === 'AbortError' || signal.aborted) throw createAbortError()
+        if (isBillingError(err)) throw toBillingError(err, { scope: err?.scope || 'cloud', provider: err?.provider || '' })
+        appendLog('editor', `B-roll 素材调度已跳过: ${err?.message || err}`, 'warn')
+      }
+    }
 
     const curScript = readScriptJson(absDir).data
     const editRes = await executeCurateAndEditAssets({
@@ -614,6 +777,7 @@ async function executeMultiAgentRunner(run, helpers) {
       },
     })
 
+    stageSnap('editor', 'after')
     updateTask('t-editor', {
       status: 'completed',
       progress: 100,
@@ -634,6 +798,9 @@ async function executeMultiAgentRunner(run, helpers) {
     })
 
     let scriptNow = readScriptJson(absDir).data
+    // Human edit protection: remember locked scenes' sfxCues + voice fields before TTS / beat quantization
+    const lockedAudioSnap = snapshotLockedSceneAudio(scriptNow)
+    const lockedVoiceSource = lockedAudioSnap.lockedIds.length > 0 ? JSON.parse(JSON.stringify(scriptNow)) : null
     const assetsNow = readAssets(absDir)
     const fps = Number(scriptNow.fps) || 30
     const hostVideoAsset = (assetsNow.items || []).find((it) => it.role === 'host_video' && it.type === 'video')
@@ -773,24 +940,28 @@ async function executeMultiAgentRunner(run, helpers) {
             scriptData: scriptNow,
             genre: curGenreInfo.id,
             genreGuidance: buildGenreGuidance(curGenreInfo.id, curGenreInfo.label),
-            callLlmChatFn: (p) => callLlmChat({ ...p, signal }),
+            callLlmChatFn: guardedLlm,
           })
           if (castRes?.ok) {
             llmCastOk = true
             appendLog('audio', `AI 语义选音完成: 主讲 [${castRes.primaryVoiceName || castRes.primaryVoiceId}] · ${castRes.primaryReason || ''}`)
           }
         } catch (castErr) {
+          if (isBillingError(castErr)) throw toBillingError(castErr, llmBillingInfo)
           appendLog('audio', `AI 语义选音回退规则匹配: ${castErr?.message || castErr}`, 'warn')
         }
+        llmBilling.throwIfTripped()
       }
       if (!llmCastOk) {
         matchAllScenesInScript(absDir, { voiceId, forceAuto: false })
       }
+      if (lockedVoiceSource) reassertLockedScenes(absDir, lockedVoiceSource)
       scriptNow = readScriptJson(absDir).data
 
       const scenesToTts = (scriptNow.scenes || []).filter((sc) => {
         const hasExisting = sc.audioFile && existsSync(isAbsolute(sc.audioFile) ? sc.audioFile : resolve(absDir, sc.audioFile))
-        return !hasExisting || !spec.preserveExistingAudio
+        // Locked scenes keep their existing narration audio
+        return !hasExisting || (!spec.preserveExistingAudio && !isSceneLocked(sc))
       })
 
       for (let i = 0; i < scenesToTts.length; i++) {
@@ -830,7 +1001,7 @@ async function executeMultiAgentRunner(run, helpers) {
         message: '正在执行 AI 修音去静音、响度标准化与人声母带均衡...',
       })
       try {
-        await masterVoiceTracks({
+        const masterRes = await masterVoiceTracks({
           projectDir: absDir,
           useLlm: mode === 'ai-coded' && llmSummary.configured,
           speechTempo: 1.0,
@@ -839,8 +1010,12 @@ async function executeMultiAgentRunner(run, helpers) {
           onChild,
           onProgress: (msg) => appendLog('audio', msg),
         })
+        // The mastering helper falls back to DSP on LLM errors and only keeps the reason text
+        const masterBilling = masterRes?.mode !== 'ai-llm' ? billingErrorFromText(masterRes?.engineerSummary, llmBillingInfo) : null
+        if (masterBilling) throw masterBilling
       } catch (err) {
         if (err?.name === 'AbortError' || signal.aborted) throw createAbortError()
+        if (isBillingError(err)) throw toBillingError(err, llmBillingInfo)
         appendLog('audio', `修音阶段跳过未完成音轨: ${err.message}`, 'warn')
       }
 
@@ -856,7 +1031,13 @@ async function executeMultiAgentRunner(run, helpers) {
     })
 
     if (mode === 'ai-coded' && llmSummary.configured) {
-      await generateAiCodedSfxCues({ projectDir: absDir, style, signal }).catch(() => {})
+      llmBilling.throwIfTripped()
+      const sfxRes = await generateAiCodedSfxCues({ projectDir: absDir, style, signal }).catch((err) =>
+        isBillingError(err) ? { fallback: true, billingErr: toBillingError(err, llmBillingInfo) } : null,
+      )
+      // generateAiCodedSfxCues returns { fallback, reason } instead of throwing: never ignore a billing failure
+      const sfxBilling = sfxRes?.billingErr || (sfxRes?.fallback ? billingErrorFromText(sfxRes.reason, llmBillingInfo) : null)
+      if (sfxBilling) throw sfxBilling
     }
 
     const totalSec = Math.max(4, Number(scriptNow.totalDurationSec) || 12)
@@ -909,7 +1090,7 @@ async function executeMultiAgentRunner(run, helpers) {
           fps,
           targetDurationSec: effectiveTargetDurationSec,
         })
-        scriptNow.scenes = choreographBeatSfxCues(scriptNow.scenes, beatMeta, adaptiveOpts)
+        scriptNow.scenes = choreographBeatSfxCues(scriptNow.scenes, beatMeta, { ...adaptiveOpts, fps })
         scriptNow.subtitles = scriptNow.scenes.flatMap((sc) => sc.subtitles || [])
         const lastSc = scriptNow.scenes[scriptNow.scenes.length - 1]
         scriptNow.totalDurationInFrames = lastSc ? Number(lastSc.startFrame || 0) + Number(lastSc.durationInFrames || 0) : scriptNow.totalDurationInFrames
@@ -924,19 +1105,43 @@ async function executeMultiAgentRunner(run, helpers) {
           title: spec.topic || scriptNow.title || scriptNow.topic,
           style,
           totalDurationSec: totalSec + 1.0,
-          audioSpec: { ...(scriptNow.audioSpec || {}), mood: style, bpm: scriptNow.bgm?.bpm || 118 },
+          // the storyboard's beat grid (planBpm) wins over the placeholder track's tempo: shots were planned on it
+          audioSpec: { ...(scriptNow.audioSpec || {}), mood: style, bpm: Number(scriptNow.planBpm) || Number(scriptNow.bgm?.bpm) || 118 },
         }
         const bgmRes = await generateAiCodedBgmTrack({
           projectDir: absDir,
           script: bgmScriptInput,
-          callLlmChatFn: (p) => callLlmChat({ timeoutMs: 240_000, ...p, signal }),
+          callLlmChatFn: llmBilling.wrap((p) => callLlmChat({ timeoutMs: 240_000, ...p, signal, onRetry: onLlmRetry })),
         })
         scriptNow.bgm = { ...(scriptNow.bgm || {}), mode: 'llm-coded', source: 'llm-coded', path: bgmRes.relWavPath }
         writeScriptJson(absDir, scriptNow)
-        appendLog('audio', `AI 大模型编写 BGM 合成代码完成: ${bgmRes.relWavPath}`)
+        appendLog('audio', `AI 大模型编写 BGM 合成代码完成: ${bgmRes.relWavPath}${bgmRes.engineNote ? `（${String(bgmRes.engineNote).slice(0, 160)}）` : ''}`)
       } catch (err) {
-        appendLog('audio', `大模型编曲配乐回退本地合成引擎: ${err.message}`, 'warn')
+        if (isBillingError(err)) throw toBillingError(err, llmBillingInfo)
+        // The AI composer failed (after its own retry): render the local synth bed NOW — full film length, on the
+        // storyboard's tempo — and switch the mix to it. "Fell back" must mean the film has music: before, the
+        // mode stayed 'llm-coded' and the mixer picked up a failed attempt's silent bgm-llm.wav instead.
+        const fbBpm = Math.round(Number(scriptNow.planBpm) || Number(scriptNow.bgm?.bpm) || 118)
+        const fbReason = String(err?.message || err).slice(0, 120)
+        try {
+          generateBgmWav({
+            durationSec: totalSec + 1.2,
+            mood: scriptNow.audioSpec?.mood || scriptNow.bgm?.mood || style,
+            bpm: fbBpm,
+            audioSpec: null,
+            outPath: join(absDir, 'audio', 'bgm-generated.wav'),
+          })
+          bgmMode = 'generated'
+          scriptNow.bgmMode = bgmMode
+          scriptNow.audioSpec = { ...(scriptNow.audioSpec || {}), bgmMode }
+          scriptNow.bgm = { ...(scriptNow.bgm || {}), enabled: true, mode: 'generated', source: 'generated', path: 'audio/bgm-generated.wav', bpm: fbBpm }
+          writeScriptJson(absDir, scriptNow)
+          warnUser('audio', `⚠ 大模型编曲失败（${fbReason}），已改用本地合成配乐（${fbBpm} BPM，覆盖全片）`)
+        } catch (genErr) {
+          warnUser('audio', `⚠ 大模型编曲失败（${fbReason}），本地合成配乐也未能生成：${String(genErr?.message || genErr).slice(0, 120)}`)
+        }
       }
+      llmBilling.throwIfTripped()
     } else if (bgmMode === 'tts-engine') {
       try {
         const ttsBgm = await synthesizeTtsEngineAudioCue({
@@ -992,8 +1197,10 @@ async function executeMultiAgentRunner(run, helpers) {
         mode: qMode,
         fps,
         targetDurationSec: effectiveTargetDurationSec,
+        // beat counts were planned on the storyboard's tempo; an AI-composed track may come out at another one
+        planBpm: bgmMode !== 'uploaded' ? Number(postBgmScript.planBpm) || 0 : 0,
       })
-      postBgmScript.scenes = choreographBeatSfxCues(postBgmScript.scenes, grid, adaptiveAudioMeta)
+      postBgmScript.scenes = choreographBeatSfxCues(postBgmScript.scenes, grid, { ...adaptiveAudioMeta, fps })
       postBgmScript.subtitles = postBgmScript.scenes.flatMap((sc) => sc.subtitles || [])
       const lastSc = postBgmScript.scenes[postBgmScript.scenes.length - 1]
       postBgmScript.totalDurationInFrames = lastSc ? Number(lastSc.startFrame || 0) + Number(lastSc.durationInFrames || 0) : postBgmScript.totalDurationInFrames
@@ -1091,8 +1298,27 @@ async function executeMultiAgentRunner(run, helpers) {
       writeScriptJson(absDir, scriptForMix)
     }
 
+    // Human edit protection: locked scenes keep their sfxCues (scene-relative if the beat grid changed),
+    // and user overrides are re-applied after beat quantization (user changes win)
+    {
+      const sfxRestore = restoreLockedSceneSfx(scriptForMix, lockedAudioSnap)
+      const ovr = applyUserOverrides(scriptForMix)
+      if (sfxRestore.restored.length > 0 || ovr.applied.length > 0) {
+        writeScriptJson(absDir, scriptForMix)
+        if (ovr.applied.some((a) => (a.fields || []).some((f) => f === 'durationSec' || f === 'durationInFrames'))) {
+          Object.assign(scriptForMix, await recomputeCumulativeTimeline(absDir))
+        }
+        if (sfxRestore.restored.length > 0) {
+          appendLog(
+            'audio',
+            `已保留锁定场景 ${sfxRestore.restored.join(', ')} 的音效编排${sfxRestore.gridChanged ? '（节拍网格已变化，音效按场景内相对时间保留）' : ''}`,
+          )
+        }
+      }
+    }
+
     await ensureProjectAudioAssets(absDir, scriptForMix, assetsNow)
-    await mixVideoAudio({
+    const audioMix = await mixVideoAudio({
       projectDir: absDir,
       script: scriptForMix,
       assetsManifest: assetsNow,
@@ -1100,7 +1326,13 @@ async function executeMultiAgentRunner(run, helpers) {
       signal,
       onChild,
     })
+    if (audioMix?.bgmFallback) {
+      warnUser('audio', `⚠ 配乐文件是静音（${audioMix.bgmFallback.from || '未知'}），已自动改用本地合成配乐${audioMix.bgmFallback.bpm ? `（${audioMix.bgmFallback.bpm} BPM）` : ''}`)
+    } else if (audioMix && audioMix.bgmSource === 'none' && scriptForMix?.bgm?.enabled !== false) {
+      warnUser('audio', '⚠ 本次混音没有找到可用的背景音乐，成片只有音效')
+    }
 
+    stageSnap('audio', 'after')
     updateTask('t-audio', {
       status: 'completed',
       progress: 100,
@@ -1170,6 +1402,7 @@ async function executeMultiAgentRunner(run, helpers) {
       progress: 15,
       message: `动效质检 Agent 启动：正在生成 ${engine.toUpperCase()} 动效工程与透明数字人叠层...`,
     })
+    llmBilling.throwIfTripped()
 
     const curScript = readScriptJson(absDir).data
     curScript.mediaDims = buildMediaDimsMap(readAssets(absDir), curScript)
@@ -1177,6 +1410,16 @@ async function executeMultiAgentRunner(run, helpers) {
     if (enableAiCode && llmSummary.configured) {
       curScript.authoringMode = 'ai-coded'
     }
+    // HyperFrames HTML is regenerated as one page: locked scenes keep the <template data-scene-id> blocks captured
+    // when they were locked (store written at run start / earlier runs, before any rewrite of index.html)
+    let lockedHtmlBlocks = {}
+    if (engine === 'html' && getLockedSceneIds(curScript).size > 0) {
+      try {
+        lockedHtmlBlocks = syncLockedHtmlStore(absDir, curScript)
+      } catch {}
+    }
+    const lockedHtmlBefore = Object.keys(lockedHtmlBlocks).length > 0
+    const keepLockedHtmlBlocks = (html) => applyLockedHtmlStore(html, lockedHtmlBlocks)
     syncProjectCodeFromScript(absDir, curScript, { forceOverwrite: true })
 
     if (mode === 'ai-coded' && llmSummary.configured && enableAiCode) {
@@ -1193,13 +1436,18 @@ async function executeMultiAgentRunner(run, helpers) {
             String(curScript.genre || '').toLowerCase() === 'history-theater' ||
             String(curScript.genre || '').toLowerCase() === 'mv-lyric' ||
             curScript.narrationMode === 'subtitle-mv'
+          const tsxLlmOverride = spec.llmOverride && typeof spec.llmOverride === 'object' && Object.keys(spec.llmOverride).length > 0 ? spec.llmOverride : null
           repairRes = await authorBatchedRemotionScenes({
             absDir,
             lockedScript: curScript,
             llmConfig: spec.llmOverride || {},
+            callLlmChatFn: (p) =>
+              callLlmChat({ ...(tsxLlmOverride ? { overrideConfig: resolveLlmConfig(tsxLlmOverride) } : {}), signal, ...p, onRetry: onLlmRetry }),
             batchSize: isHeavyNarrative ? 4 : (curScript.scenes || []).length >= 16 ? 5 : 4,
             concurrency: Math.max(2, hwPolicy.batchCoderConcurrency || 3),
             maxRepairRounds: Math.max(1, Math.min(3, Number(llmSummary.maxRepairRounds) || 2)),
+            // 画面自检 (keyframes → multimodal review → one targeted rewrite); on unless the user switched it off
+            visualReview: spec.visualReview !== undefined ? spec.visualReview !== false : curScript.visualReview !== false,
             signal,
             onProgress: (_stage, pct, msg) => {
               updateTask('t-motion', {
@@ -1210,20 +1458,40 @@ async function executeMultiAgentRunner(run, helpers) {
               })
             },
           })
+          const ta = repairRes?.toolAudit
+          if (ta?.after?.shots) {
+            const fixed = ta.before && ta.before.violating > ta.after.violating ? `，定向返工后缺口 ${ta.before.violating} → ${ta.after.violating} 镜` : ''
+            appendLog('motion_qa', `🧰 工具调用核对（实际使用/计划）：${formatToolSummary(ta.after)}${fixed}`)
+            if (ta.after.violating > 0) warnUser('motion_qa', `⚠ 仍有 ${ta.after.violating} 个镜头没按计划使用指定工具（返工后仍未达标），这些镜头的人物/特效可能偏简单`)
+          }
+          if (repairRes?.visualReview) {
+            const vr = repairRes.visualReview
+            appendLog('motion_qa', `👀 ${summarizeVisualReview(vr)}`)
+            if (!vr.skipped && vr.majorScenes > vr.fixedScenes) warnUser('motion_qa', `⚠ 画面自检发现 ${vr.majorScenes - vr.fixedScenes} 个镜头的问题没能返工，建议在成片里重点查看这些镜头`)
+          }
+          if (repairRes?.lockedSceneIds?.length) {
+            appendLog('motion_qa', `人工锁定场景 ${repairRes.lockedSceneIds.join(', ')} 未重新生成 TSX（沿用锁定时的实现）`)
+          }
         } else {
-          const promptPkg = buildHtmlCoderSkillsPrompt({
-            plan: curScript,
-            timingContract: curScript,
-            width: curScript.width,
-            height: curScript.height,
-            aspectRatio: curScript.aspectRatio,
-          })
+          // a custom AI-designed / saved style reaches the HTML coder too (soft guide, deduped by its marker)
+          const promptPkg = withStyleGuide(
+            buildHtmlCoderSkillsPrompt({
+              plan: curScript,
+              timingContract: curScript,
+              width: curScript.width,
+              height: curScript.height,
+              aspectRatio: curScript.aspectRatio,
+            }),
+            curScript,
+            { engine: 'html' },
+          )
           const aiReply = await callLlmChat({
             system: promptPkg.system,
             messages: [{ role: 'user', content: promptPkg.user }],
             temperature: 0.3,
             maxTokens: 15000,
             signal,
+            onRetry: onLlmRetry,
           })
           const parsedFiles = extractJsonFromLlmText(aiReply.text)?.files
           if (parsedFiles && typeof parsedFiles === 'object') {
@@ -1234,6 +1502,9 @@ async function executeMultiAgentRunner(run, helpers) {
               initialFiles: parsedFiles,
               lockedScript: curScript,
               maxRepairRounds: Math.max(1, Math.min(3, Number(llmSummary.maxRepairRounds) || 2)),
+              protectFiles: lockedHtmlBefore
+                ? (map) => (typeof map['index.html'] === 'string' ? { ...map, 'index.html': keepLockedHtmlBlocks(map['index.html']).html } : map)
+                : undefined,
               signal,
               onProgress: (_stage, pct, msg) => {
                 updateTask('t-motion', {
@@ -1297,23 +1568,40 @@ async function executeMultiAgentRunner(run, helpers) {
             'motion_qa',
             `大模型 (${llmSummary.model}) 定制 TSX 动效代码通过沙箱、Lint 与 tsc 编译质检（成功模块: ${Number(repairRes.authoredBatchCount || 0)}/${Number(repairRes.totalBatches || 1)} 批，修复轮次: ${Math.max(0, (repairRes.repairHistory?.length || 1) - 1)}${repairRes.batchErrors?.length ? `，异常批次: ${repairRes.batchErrors.join('; ')}` : ''}）`,
           )
+          const missedBatches = Math.max(0, Number(repairRes.totalBatches || 1) - Number(repairRes.authoredBatchCount || 0))
+          if (engine === 'remotion' && (missedBatches > 0 || repairRes.isolatedBatches?.length)) {
+            warnUser(
+              'motion_qa',
+              `⚠ 有 ${Math.max(missedBatches, repairRes.isolatedBatches?.length || 0)} 批镜头的大模型动效代码没能通过检查，这些镜头改用内置版式${repairRes.batchErrors?.length ? `（${String(repairRes.batchErrors[0]).slice(0, 80)}）` : ''}。`,
+            )
+          }
         } else {
           curScript.authoringMode = 'schema-plan'
           writeScriptJson(absDir, curScript)
-          appendLog(
+          warnUser(
             'motion_qa',
-            `AI 动效代码自动修复后仍未通过质检，自动回退高稳内置模板: ${(repairRes?.errors || []).slice(0, 3).join('; ')}`,
-            'warn',
+            `⚠ AI 动效代码自动修复后仍未通过质检，整片回退内置模板：${(repairRes?.errors || []).slice(0, 3).join('; ')}`,
           )
           syncProjectCodeFromScript(absDir, readScriptJson(absDir).data, { forceOverwrite: true })
         }
       } catch (err) {
         if (err?.name === 'AbortError' || signal.aborted) throw createAbortError()
+        if (isBillingError(err)) throw toBillingError(err, { scope: 'llm', provider: llmSummary.model || '' })
         curScript.authoringMode = 'schema-plan'
         writeScriptJson(absDir, curScript)
-        appendLog('motion_qa', `大模型动效定制已回退高稳内置模板: ${err.message}`, 'warn')
+        warnUser('motion_qa', `⚠ 大模型动效定制失败，整片回退内置模板：${err.message}`)
         syncProjectCodeFromScript(absDir, readScriptJson(absDir).data, { forceOverwrite: true })
       }
+    }
+    if (lockedHtmlBefore && existsSync(join(absDir, 'index.html'))) {
+      // Final pass covers every path above (AI page, template fallback, forced re-sync)
+      try {
+        const htmlNow = readFileSync(join(absDir, 'index.html'), 'utf8')
+        const kept = keepLockedHtmlBlocks(htmlNow)
+        if (kept.html !== htmlNow) writeFileSync(join(absDir, 'index.html'), kept.html, 'utf8')
+        if (kept.restored.length > 0) appendLog('motion_qa', `人工锁定场景 ${kept.restored.join(', ')} 保留锁定时的 HTML 实现（未被重新生成覆盖）`)
+        if (kept.missing.length > 0) appendLog('motion_qa', `新页面缺少锁定场景 ${kept.missing.join(', ')} 的场景块，无法自动保留`, 'warn')
+      } catch {}
     }
 
     if (signal.aborted) throw createAbortError()
@@ -1324,6 +1612,13 @@ async function executeMultiAgentRunner(run, helpers) {
       message: '正在执行 video_lint 合规检测与九宫格视觉快照预检...',
     })
     const lintRes = await executeVideoLint({ projectDir: absDir })
+    // executeVideoLint reports `ok` + `errors` / `warnings` (there is no `passed` field)
+    const lintErrors = Array.isArray(lintRes?.errors) ? lintRes.errors : []
+    const lintWarnings = Array.isArray(lintRes?.warnings) ? lintRes.warnings : []
+    if (lintErrors.length > 0 || lintWarnings.length > 0) {
+      appendLog('motion_qa', `video_lint：${[...lintErrors, ...lintWarnings].slice(0, 3).join('；')}`, 'warn')
+    }
+    const lintLabel = lintErrors.length > 0 || lintRes?.ok === false ? '有问题' : lintWarnings.length > 0 ? '带警告' : '通过'
     let snapRes = null
     try {
       snapRes = await executeVideoSnapshot({ projectDir: absDir })
@@ -1331,10 +1626,11 @@ async function executeMultiAgentRunner(run, helpers) {
       if (err?.name === 'AbortError' || signal.aborted) throw createAbortError()
       appendLog('motion_qa', `九宫格预检跳过: ${err.message}`, 'warn')
     }
+    stageSnap('motion', 'after')
     updateTask('t-motion', {
       status: 'completed',
       progress: 100,
-      message: `动效质检完成：Lint ${lintRes.passed ? '通过' : '带警告'} · 九宫格快照${snapRes?.ok ? '已生成' : '略过'}`,
+      message: `动效质检完成：Lint ${lintLabel} · 九宫格快照${snapRes?.ok ? '已生成' : '略过'}`,
     })
   }
 
@@ -1365,13 +1661,47 @@ async function executeMultiAgentRunner(run, helpers) {
       },
     })
 
+    // shots designed too dark to read were lifted (black / white unchanged): say how many and how much
+    const expg = finalRender?.exposureGuard
+    if (expg?.applied) {
+      const lo = expg.fullRange ? 0 : 16
+      const span = expg.fullRange ? 255 : 219
+      const pct = (y) => (Number.isFinite(Number(y)) ? `${Math.round(((Number(y) - lo) / span) * 100)}%` : '?')
+      appendLog('motion_qa', `🔆 画面亮度保护：${(expg.lifted || []).length} 个过暗镜头已提亮（全片平均亮度 ${pct(expg.before?.meanY)} → ${pct(expg.after?.meanY)}，黑场与高光不变）`)
+    } else if (expg?.reason === 'error' && (expg.lifted || []).length) {
+      warnUser('motion_qa', `⚠ ${(expg.lifted || []).length} 个镜头画面偏暗，自动提亮未完成：${String(expg.error || '').slice(0, 140)}`)
+    }
+    const amb = finalRender?.ambience
+    if (amb?.kinds?.length) appendLog('motion_qa', `🌬 环境声底：${amb.kinds.map((k) => AMBIENCE_LABELS_ZH[k] || k).join('、')}（覆盖 ${Math.round(amb.coverageSec || 0)} 秒，随镜头切换交叉淡入淡出）`)
+
+    // AAC encoding overshoots the limited master: say so when the delivered audio was trimmed under −1 dBTP
+    const tpg = finalRender?.truePeakGuard
+    if (tpg?.applied && Number.isFinite(tpg.before?.truePeakDbtp) && Number.isFinite(tpg.after?.truePeakDbtp)) {
+      appendLog('motion_qa', `🎚 成片音频峰值保护：编码后真峰值 ${tpg.before.truePeakDbtp.toFixed(1)} dBTP → ${tpg.after.truePeakDbtp.toFixed(1)} dBTP（整体音量 ${tpg.gainDb} dB），避免平台转码削波`)
+    } else if (tpg?.reason === 'error') {
+      appendLog('motion_qa', `ℹ 成片音频峰值保护未执行：${String(tpg.error || '').slice(0, 160)}`)
+    }
+
+    // the automatic QA after the render: every failed check is a warning the user sees, never a silent "completed"
+    const qaRep = finalRender?.qaReport || finalRender?.qa || null
+    const qaFailed = qaRep && qaRep.passed === false ? (Array.isArray(qaRep.checks) ? qaRep.checks : []).filter((c) => c && c.passed === false) : []
+    for (const c of qaFailed.slice(0, 4)) {
+      warnUser('motion_qa', `⚠ 成片质检未通过：${c.name || c.id || '未命名检查'}${c.value ? ` — ${String(c.value).slice(0, 180)}` : ''}`)
+    }
+    if (qaRep && qaRep.passed === false && qaFailed.length === 0) warnUser('motion_qa', '⚠ 成片质检未通过（详见 output/qa_report.json）')
+    // checks that passed at the limit (severity "warning", e.g. flashes at exactly 3/s) are shown as hints, not failures
+    const qaHints = qaRep ? (Array.isArray(qaRep.checks) ? qaRep.checks : []).filter((c) => c && c.passed !== false && c.severity === 'warning') : []
+    for (const c of qaHints.slice(0, 4)) {
+      appendLog('motion_qa', `ℹ 质检提示（未超标）：${c.name || c.id || '未命名检查'}${c.value ? ` — ${String(c.value).slice(0, 180)}` : ''}`)
+    }
     updateTask('t-render', {
       status: 'completed',
       progress: 100,
-      message: `成品导出成功：${finalRender.resolution} · ${finalRender.durationSec}s (${Math.round((finalRender.fileSizeBytes || 0) / 1024)} KB)`,
+      message: `成品导出成功：${finalRender.resolution} · ${finalRender.durationSec}s (${Math.round((finalRender.fileSizeBytes || 0) / 1024)} KB)${qaRep ? (qaRep.passed === false ? ` · ⚠ 质检 ${Math.max(1, qaFailed.length)} 项未通过` : qaHints.length ? ` · 质检通过（${qaHints.length} 项提示）` : ' · 质检通过') : ''}`,
     })
   }
 
+  const qaFinal = finalRender?.qaReport || finalRender?.qa || null
   return {
     ok: true,
     projectDir: absDir,
@@ -1379,12 +1709,52 @@ async function executeMultiAgentRunner(run, helpers) {
     mode,
     outputPath: finalRender?.outputPath || join(absDir, 'output', 'final.mp4'),
     snapshotPath: finalRender?.snapshotPath || join(absDir, 'output', 'snapshot-3x3.png'),
-    qa: finalRender?.qaReport || finalRender?.qa || null,
+    qa: qaFinal,
+    qaPassed: qaFinal ? qaFinal.passed !== false : null,
+    warnings: runWarnings,
   }
 }
 
+/**
+ * Billing errors (HTTP 402 / insufficient balance / quota / 欠费 ...) from cloud media, LLM or TTS stop the
+ * whole run immediately with a clear Chinese message, are never retried automatically, and the Task Center
+ * run is marked as a billing stop (`run.errorKind = 'billing'`, `run.billingStop`).
+ * Exported for any Task Center runner (and tests): `runWithBillingGuard(runner, run, helpers)`.
+ */
+export async function runWithBillingGuard(runner, run, helpers) {
+  delete run.errorKind
+  delete run.billingStop
+  try {
+    return await runner(run, helpers)
+  } catch (err) {
+    if (err?.name !== 'AbortError' && !helpers?.signal?.aborted && isBillingError(err)) {
+      const billingErr = toBillingError(err, { scope: err?.scope || 'cloud', provider: err?.provider || '' })
+      run.errorKind = 'billing'
+      run.billingStop = {
+        at: new Date().toISOString(),
+        scope: billingErr.scope,
+        provider: billingErr.provider,
+        status: billingErr.status,
+        providerCode: billingErr.providerCode,
+        ledgerJobId: billingErr.ledgerJobId || '',
+        retryable: false,
+        message: billingErr.message,
+      }
+      const activeTask = (run.tasks || []).find((t) => t.status === 'running' || t.status === 'paused')
+      if (activeTask) helpers.updateTask(activeTask.id, { status: 'failed', message: billingErr.message, error: billingErr.message })
+      helpers.appendLog(activeTask?.stage || run.activeStage || 'director', `⛔ ${billingErr.message}`, 'error')
+      throw billingErr
+    }
+    throw err
+  }
+}
+
+function executeMultiAgentRunnerGuarded(run, helpers) {
+  return runWithBillingGuard(executeMultiAgentRunner, run, helpers)
+}
+
 // Register default runner factory so historical persisted runs remain retryable across daemon restarts
-taskManager.setDefaultRunnerFactory(() => executeMultiAgentRunner)
+taskManager.setDefaultRunnerFactory(() => executeMultiAgentRunnerGuarded)
 
 /**
  * Start a 4-Agent pipeline in the background (returns immediately with runId + initial status).
@@ -1404,7 +1774,7 @@ function createNormalizedPipelineRun(spec = {}) {
 
 export async function startPipelineBackground(spec = {}) {
   const run = createNormalizedPipelineRun(spec)
-  const started = await taskManager.startRun(run.id, executeMultiAgentRunner)
+  const started = await taskManager.startRun(run.id, executeMultiAgentRunnerGuarded)
   started.promise.catch(() => {})
   return started.run
 }
@@ -1414,7 +1784,7 @@ export async function startPipelineBackground(spec = {}) {
  */
 export async function runMultiAgentPipeline(spec = {}) {
   const run = createNormalizedPipelineRun(spec)
-  const started = await taskManager.startRun(run.id, executeMultiAgentRunner)
+  const started = await taskManager.startRun(run.id, executeMultiAgentRunnerGuarded)
   const completed = await started.promise
   const summary = completed?.resultSummary || {}
   return {

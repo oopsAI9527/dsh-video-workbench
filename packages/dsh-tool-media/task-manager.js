@@ -330,7 +330,13 @@ class CommandDeckTaskManager {
             ag.message = '已完成'
           }
         }
-        this.appendLog(runId, 'motion_qa', '✅ 协同作战流水线已全部完成！', 'info')
+        const warnCount = Array.isArray(summary?.warnings) ? summary.warnings.length : 0
+        this.appendLog(
+          runId,
+          'motion_qa',
+          warnCount ? `✅ 出片完成，但有 ${warnCount} 项需要注意（见上方黄色提示）` : '✅ 协同作战流水线已全部完成！',
+          warnCount ? 'warn' : 'info',
+        )
         this._syncDshJob(run)
         this._persistRun(run)
         return this._serializeRun(run)

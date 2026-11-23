@@ -49,6 +49,26 @@ export const BUILTIN_TTS_ENGINES = [
         },
       ]
     : []),
+  {
+    id: 'minimax-tts',
+    builtin: true,
+    kind: 'minimax-tts',
+    name: 'MiniMax Speech 云端情感语音 (T2A v2)',
+    shortName: 'MiniMax 云端语音',
+    vramBadge: '0GB 显存 · 云端高表现力',
+    description: '支持 speech-2.6-hd / speech-02-hd 及任意自定义模型 ID，无需本地显卡即可合成高表现力多情绪中文配音。',
+    supportsZeroShotClone: false,
+  },
+  {
+    id: 'doubao-tts',
+    builtin: true,
+    kind: 'doubao-tts',
+    name: '火山方舟 · 豆包语音大模型 TTS',
+    shortName: '豆包云端语音',
+    vramBadge: '0GB 显存 · 火山引擎云端',
+    description: '接入火山引擎 / 豆包语音合成 HTTP 接口 (openspeech.bytedance.com/api/v1/tts)，支持 AppID + Token + 自定义音色 voice_type。',
+    supportsZeroShotClone: false,
+  },
 ]
 
 export const QUICK_TTS_TEMPLATES = [
@@ -171,6 +191,19 @@ function defaultBuiltinOverridesFromEnv() {
       promptLang: process.env.GPTVOICE_PROMPT_LANG || 'zh',
       howToCut: process.env.GPTVOICE_HOW_TO_CUT || '凑四句一切',
     },
+    'minimax-tts': {
+      endpoint: (process.env.MINIMAX_TTS_ENDPOINT || 'https://api.minimaxi.com/v1/t2a_v2').replace(/\/+$/, ''),
+      model: process.env.MINIMAX_TTS_MODEL || 'speech-2.6-hd',
+      voiceId: process.env.MINIMAX_TTS_VOICE || 'male-qn-qingse',
+      apiKey: process.env.MINIMAX_API_KEY || '',
+    },
+    'doubao-tts': {
+      endpoint: (process.env.DOUBAO_TTS_ENDPOINT || 'https://openspeech.bytedance.com/api/v1/tts').replace(/\/+$/, ''),
+      appId: process.env.DOUBAO_TTS_APPID || '',
+      token: process.env.DOUBAO_TTS_TOKEN || '',
+      cluster: process.env.DOUBAO_TTS_CLUSTER || 'volcano_tts',
+      voiceType: process.env.DOUBAO_TTS_VOICE || 'zh_male_m392_conversation_wvae_bigtts',
+    },
   }
 }
 
@@ -190,6 +223,8 @@ export function loadTtsConfig(repoRoot = REPO_ROOT) {
     indextts25: { ...envBuiltins.indextts25, ...(saved.builtins?.indextts25 || {}) },
     indextts2: { ...envBuiltins.indextts2, ...(saved.builtins?.indextts2 || {}) },
     gptvoice: { ...envBuiltins.gptvoice, ...(saved.builtins?.gptvoice || {}) },
+    'minimax-tts': { ...envBuiltins['minimax-tts'], ...(saved.builtins?.['minimax-tts'] || {}) },
+    'doubao-tts': { ...envBuiltins['doubao-tts'], ...(saved.builtins?.['doubao-tts'] || {}) },
   }
   const customEngines = Array.isArray(saved.customEngines)
     ? saved.customEngines.filter((e) => e && typeof e === 'object' && e.id)
@@ -214,11 +249,22 @@ export function saveTtsConfig(nextInput = {}, repoRoot = REPO_ROOT) {
   const current = loadTtsConfig(repoRoot)
   const mergedBuiltins = { ...current.builtins }
   if (nextInput.builtins && typeof nextInput.builtins === 'object') {
-    for (const id of ['indextts25', 'indextts2', 'gptvoice']) {
+    for (const id of ['indextts25', 'indextts2', 'gptvoice', 'minimax-tts', 'doubao-tts']) {
       if (nextInput.builtins[id] && typeof nextInput.builtins[id] === 'object') {
+        const prevB = mergedBuiltins[id] || {}
         const patch = { ...nextInput.builtins[id] }
         if (typeof patch.endpoint === 'string') patch.endpoint = patch.endpoint.trim().replace(/\/+$/, '')
-        mergedBuiltins[id] = { ...mergedBuiltins[id], ...patch }
+        if (patch.clearApiKey === true) patch.apiKey = ''
+        else if ('apiKey' in patch && isMaskedPlaceholder(patch.apiKey)) patch.apiKey = prevB.apiKey || ''
+        if (patch.clearToken === true) patch.token = ''
+        else if ('token' in patch && isMaskedPlaceholder(patch.token)) patch.token = prevB.token || ''
+        delete patch.clearApiKey
+        delete patch.clearToken
+        delete patch.hasApiKey
+        delete patch.apiKeyMasked
+        delete patch.hasToken
+        delete patch.tokenMasked
+        mergedBuiltins[id] = { ...prevB, ...patch }
       }
     }
   }
@@ -361,7 +407,14 @@ export function resolveTtsEngineSpec(requestedEngine = '', repoRoot = REPO_ROOT)
       endpoint:
         builtin.kind === 'windows-sapi'
           ? ''
-          : overrides.endpoint || (builtin.id === 'gptvoice' ? 'http://127.0.0.1:9881' : 'http://127.0.0.1:9880'),
+          : overrides.endpoint ||
+            (builtin.id === 'gptvoice'
+              ? 'http://127.0.0.1:9881'
+              : builtin.id === 'minimax-tts'
+                ? 'https://api.minimaxi.com/v1/t2a_v2'
+                : builtin.id === 'doubao-tts'
+                  ? 'https://openspeech.bytedance.com/api/v1/tts'
+                  : 'http://127.0.0.1:9880'),
     }
   }
 
@@ -381,10 +434,21 @@ export function resolveTtsEngineSpec(requestedEngine = '', repoRoot = REPO_ROOT)
 export function getSafeTtsConfigSummary(repoRoot = REPO_ROOT) {
   const cfg = loadTtsConfig(repoRoot)
   const engines = [
-    ...BUILTIN_TTS_ENGINES.map((b) => ({
-      ...b,
-      ...(cfg.builtins[b.id] || {}),
-    })),
+    ...BUILTIN_TTS_ENGINES.map((b) => {
+      const ov = cfg.builtins[b.id] || {}
+      const out = { ...b, ...ov }
+      if (b.id === 'minimax-tts') {
+        out.hasApiKey = Boolean(String(ov.apiKey || '').trim())
+        out.apiKeyMasked = maskSecret(ov.apiKey)
+        out.apiKey = undefined
+      }
+      if (b.id === 'doubao-tts') {
+        out.hasToken = Boolean(String(ov.token || '').trim())
+        out.tokenMasked = maskSecret(ov.token)
+        out.token = undefined
+      }
+      return out
+    }),
     ...cfg.customEngines.map((c) => ({
       ...c,
       hasApiKey: Boolean(c.apiKey),

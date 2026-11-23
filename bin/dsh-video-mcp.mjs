@@ -29,6 +29,8 @@ export function createUniversalToolRegistry() {
   loadEnv()
   const toolsMap = new Map()
   const shimCtx = {
+    // not the real DSH host: lets the plugin tell DSH apart from MCP / standalone use
+    __dshVideoShim: true,
     tools: {
       register(def) {
         if (!def?.name || typeof def.execute !== 'function') return
@@ -163,6 +165,14 @@ export function startMcpStdioServer() {
 
     try {
       if (method === 'initialize') {
+        // Remember which agent hosts this server (Claude Code, Codex, opencode, OpenClaw, …): the plugin's default
+        // LLM mode 「跟随当前智能体」 and the web studio started from here use it. A value the user set wins.
+        const ci = params.clientInfo && typeof params.clientInfo === 'object' ? params.clientInfo : {}
+        const clientName = String(ci.name || ci.title || '').trim()
+        if (clientName && !String(process.env.DSH_VIDEO_HOST_AGENT || '').trim()) {
+          process.env.DSH_VIDEO_HOST_AGENT = clientName.slice(0, 80)
+          if (ci.version) process.env.DSH_VIDEO_HOST_AGENT_VERSION = String(ci.version).slice(0, 40)
+        }
         const clientVer = String(params.protocolVersion || '2024-11-05')
         return reply({
           protocolVersion: clientVer,

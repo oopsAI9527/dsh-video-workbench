@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import {
@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   closeSync,
+  readSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -33,7 +34,7 @@ const isDevWorkspace =
 
 /**
  * Writable runtime workspace/config root:
- * - In local git checkout dev mode: points to repo checkout (`D:\dsh-video-workbench`)
+ * - In local git checkout dev mode: points to the cloned repo folder itself
  * - When installed into DSH `node_modules`: defaults to `$DSH_VIDEO_HOME` or `~/.dsh/video-workbench`
  *   so updates never overwrite user configs/projects and pnpm's read-only store stays untouched.
  */
@@ -82,6 +83,14 @@ function findExecutableOnPath(cmdName) {
 }
 
 let envLoaded = false
+
+/**
+ * JSON for embedding inside an HTML `<script type="application/json">` tag: `<` becomes `\u003c` (the same JSON
+ * value), so user text such as `</script>` or `<!--` cannot end or break the tag.
+ */
+export function scriptJsonForHtml(data, space = 2) {
+  return JSON.stringify(data, null, space).replace(/</g, '\\u003c')
+}
 
 /**
  * Load `.env` from writable workspace root (never hardcodes personal paths).
@@ -273,6 +282,52 @@ export function resolveBinaries() {
   }
 }
 
+/*
+ * FFmpeg build differences. When neither FFMPEG_PATH nor a system ffmpeg exists, resolveBinaries() falls back to the
+ * npm-bundled @ffmpeg-installer build — a late-2018 FFmpeg (4.1-dev). Filter graphs must therefore work on it as well as on
+ * current releases: no `amix normalize`, no `adelay all`, no `apad whole_dur`, and an endless `apad` followed by `atrim`
+ * never terminates there. The helpers below hide those differences.
+ */
+const ffmpegFilterOptionCache = new Map()
+/** Option names of one FFmpeg filter in the given build (empty Set when the build cannot be queried). Cached. */
+export function ffmpegFilterOptions(ffmpegBin, filter) {
+  const key = `${ffmpegBin}\n${filter}`
+  if (ffmpegFilterOptionCache.has(key)) return ffmpegFilterOptionCache.get(key)
+  const opts = new Set()
+  try {
+    const out = execFileSync(ffmpegBin, ['-hide_banner', '-h', `filter=${filter}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      timeout: 8000,
+    })
+    for (const m of String(out || '').matchAll(/^\s{1,6}([a-z][a-z0-9_]*)\s+</gm)) opts.add(m[1])
+  } catch {}
+  ffmpegFilterOptionCache.set(key, opts)
+  return opts
+}
+export const ffmpegFilterHasOption = (ffmpegBin, filter, option) => ffmpegFilterOptions(ffmpegBin, filter).has(option)
+
+/**
+ * `amix` that sums its inputs without rescaling (`normalize=0`) on every FFmpeg version. Builds without `normalize` divide
+ * by the weight sum, which the trailing `volume` restores exactly — provided all inputs last equally long (pad them to the
+ * same length first, see ffmpegPadTo), otherwise those builds re-scale the remaining inputs each time one ends.
+ */
+export function ffmpegAmixNoRescale(ffmpegBin, inputs, { duration = 'longest', weights = null, dropoutTransition = null } = {}) {
+  const w = Array.isArray(weights) && weights.length === inputs ? weights.map((x) => Number(x)) : null
+  const parts = [`inputs=${inputs}`]
+  if (ffmpegFilterHasOption(ffmpegBin, 'amix', 'normalize')) parts.push('normalize=0')
+  parts.push(`duration=${duration}`)
+  if (dropoutTransition !== null && dropoutTransition !== undefined) parts.push(`dropout_transition=${dropoutTransition}`)
+  if (w) parts.push(`weights=${w.join('|')}`)
+  if (parts.includes('normalize=0')) return `amix=${parts.join(':')}`
+  const sum = w ? w.reduce((a, b) => a + b, 0) : inputs
+  return `amix=${parts.join(':')},volume=${Number(sum.toFixed(6))}`
+}
+
+/** Finite `apad` to at least `sec` seconds at `sampleRate` (works on every build; follow with `atrim=0:<sec>` to cut). */
+export const ffmpegPadTo = (sec, sampleRate) => `apad=whole_len=${Math.max(1, Math.round(Number(sec) * Number(sampleRate)))}`
+
 /**
  * Resolve local Chromium / Chrome / Edge binary for HTML frame capture and fallback Remotion rendering.
  */
@@ -354,13 +409,40 @@ export function createAbortError(message = '任务已手动停止 (Aborted)') {
   return err
 }
 
+/** Last `time=` position of an FFmpeg progress report in a (growing) stderr log, or '' when none was printed yet. */
+function readFfmpegProgressPosition(logFile) {
+  let fd
+  try {
+    const size = statSync(logFile).size
+    if (!size) return ''
+    const len = Math.min(size, 4096)
+    const buf = Buffer.alloc(len)
+    fd = openSync(logFile, 'r')
+    readSync(fd, buf, 0, len, size - len)
+    const hits = [...buf.toString('latin1').matchAll(/time=\s*(\d+:\d{2}:\d{2}(?:\.\d+)?)/g)]
+    return hits.length ? hits[hits.length - 1][1] : ''
+  } catch {
+    return ''
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch {}
+    }
+  }
+}
+
 /**
  * Spawn a child process using file-redirected stdio to avoid Windows sandbox pipe `EPERM`.
  * Supports AbortSignal cancellation and immediate process-tree cleanup.
  * Adapted from MIT-licensed `dsh-video-studio/dsh/ffmpeg.js`.
+ *
+ * `stallTimeoutMs` (opt-in, only for FFmpeg commands that print their progress report, i.e. without `-nostats` /
+ * `-v error`): kill the command once the report's `time=` position stops advancing for that long — FFmpeg can deadlock
+ * at the end of a filter graph while its main thread keeps printing the same report. Rejects with
+ * `err.code === 'ESTALLED'` so the caller can run the command again. `stallStartupMs` bounds the wait for the first
+ * `time=` (default: 4 × stallTimeoutMs, at least 60 s).
  */
 export function runCommandRedirected(bin, args = [], options = {}) {
-  const { cwd = REPO_ROOT, env = process.env, timeoutMs = 180_000, signal, onChild } = options
+  const { cwd = REPO_ROOT, env = process.env, timeoutMs = 180_000, signal, onChild, stallTimeoutMs = 0, stallStartupMs = 0 } = options
   if (signal?.aborted) {
     return Promise.reject(createAbortError())
   }
@@ -390,6 +472,11 @@ export function runCommandRedirected(bin, args = [], options = {}) {
 
     let settled = false
     let timer = null
+    let stallTimer = null
+    const stopStallWatch = () => {
+      if (stallTimer) clearInterval(stallTimer)
+      stallTimer = null
+    }
 
     const cleanupAndRead = () => {
       try { closeSync(stdoutFd) } catch {}
@@ -417,6 +504,7 @@ export function runCommandRedirected(bin, args = [], options = {}) {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      stopStallWatch()
       killProcessTree(child)
       cleanupAndRead()
       rejectPromise(createAbortError('子进程已响应停止指令并终止'))
@@ -427,6 +515,7 @@ export function runCommandRedirected(bin, args = [], options = {}) {
       timer = setTimeout(() => {
         if (settled) return
         settled = true
+        stopStallWatch()
         signal?.removeEventListener?.('abort', onAbort)
         killProcessTree(child)
         const { stdout, stderr } = cleanupAndRead()
@@ -434,10 +523,39 @@ export function runCommandRedirected(bin, args = [], options = {}) {
       }, timeoutMs)
     }
 
+    if (stallTimeoutMs > 0) {
+      const startupMs = stallStartupMs > 0 ? stallStartupMs : Math.max(60_000, stallTimeoutMs * 4)
+      let lastPos = ''
+      let lastChange = Date.now()
+      stallTimer = setInterval(() => {
+        if (settled) return stopStallWatch()
+        const pos = readFfmpegProgressPosition(stderrFile)
+        const now = Date.now()
+        if (pos && pos !== lastPos) {
+          lastPos = pos
+          lastChange = now
+          return
+        }
+        if (now - lastChange < (lastPos ? stallTimeoutMs : startupMs)) return
+        settled = true
+        stopStallWatch()
+        if (timer) clearTimeout(timer)
+        signal?.removeEventListener?.('abort', onAbort)
+        killProcessTree(child)
+        const { stdout, stderr } = cleanupAndRead()
+        const err = new Error(
+          `Command stalled (no progress for ${Math.round((now - lastChange) / 1000)} s${lastPos ? ` at time=${lastPos}` : ''}): ${bin}\n${String(stderr || stdout).slice(-2000)}`,
+        )
+        err.code = 'ESTALLED'
+        rejectPromise(err)
+      }, Math.min(1000, Math.max(200, Math.floor(stallTimeoutMs / 4))))
+    }
+
     child.on('error', (err) => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      stopStallWatch()
       signal?.removeEventListener?.('abort', onAbort)
       cleanupAndRead()
       rejectPromise(err)
@@ -447,6 +565,7 @@ export function runCommandRedirected(bin, args = [], options = {}) {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      stopStallWatch()
       signal?.removeEventListener?.('abort', onAbort)
       const { stdout, stderr } = cleanupAndRead()
       resolvePromise({ code: code ?? 0, stdout, stderr })
@@ -544,8 +663,9 @@ export async function probeAudioDuration(audioPath, fps = 30) {
 export const ASPECT_RATIO_PRESETS = {
   '16:9': { label: '16:9 横屏大片 (B站 / YouTube / 官网发布)', wRatio: 16, hRatio: 9 },
   '9:16': { label: '9:16 竖屏短视频 (抖音 / 快手 / 视频号)', wRatio: 9, hRatio: 16 },
-  '3:4': { label: '3:4 图文封面比例 (小红书)', wRatio: 3, hRatio: 4 },
+  '3:4': { label: '3:4 竖版 (小红书 / 图文笔记)', wRatio: 3, hRatio: 4 },
   '1:1': { label: '1:1 正方形 (朋友圈 / 信息流)', wRatio: 1, hRatio: 1 },
+  '4:3': { label: '4:3 复古横屏 (课件 / 访谈叙事)', wRatio: 4, hRatio: 3 },
 }
 
 export const QUALITY_PRESETS = {
@@ -570,6 +690,7 @@ export function resolveVideoDimensions({
   height,
   topic = '',
   assets = [],
+  targetPlatform = '',
 } = {}) {
   const rawQuality = String(quality || '1080p').toLowerCase()
   const resolvedQuality = QUALITY_PRESETS[rawQuality] ? rawQuality : rawQuality === 'custom' ? 'custom' : '1080p'
@@ -604,8 +725,12 @@ export function resolveVideoDimensions({
     } else if (/方屏|朋友圈卡片|1:1|正方形/.test(text)) {
       pickedRatio = '1:1'
       reason = 'AI 根据主题识别为信息流方屏场景，自动选择 1:1 比例'
+    } else if (String(targetPlatform || '').toLowerCase() === 'xiaohongshu') {
+      pickedRatio = '3:4'
+      reason = '首发平台为小红书（图文笔记多为 3:4 竖版），自动选择 3:4 比例'
     } else if (Array.isArray(assets) && assets.length > 0) {
       let portraitCount = 0
+      let tallCount = 0 // 3:4 / 4:5 photos (小红书图文) — part of portraitCount
       let squareCount = 0
       let landscapeCount = 0
       for (const a of assets) {
@@ -613,14 +738,21 @@ export function resolveVideoDimensions({
         const ah = Number(a?.height || 0)
         if (aw > 0 && ah > 0) {
           const r = aw / ah
-          if (r < 0.85) portraitCount++
-          else if (r > 1.18) landscapeCount++
+          if (r < 0.85) {
+            portraitCount++
+            if (r >= 0.68) tallCount++
+          } else if (r > 1.18) landscapeCount++
           else squareCount++
         }
       }
       if (portraitCount > landscapeCount && portraitCount >= squareCount) {
-        pickedRatio = '9:16'
-        reason = `AI 分析导入素材多为竖构图 (${portraitCount} 竖 vs ${landscapeCount} 横)，自动匹配 9:16`
+        // 3:4 photos stay uncropped in a 3:4 film; short-video platforms (抖音 / 快手 / 视频号) keep 9:16
+        const shortVideoPlatform = /douyin|kuaishou|bilibili/.test(String(targetPlatform || '').toLowerCase())
+        pickedRatio = tallCount * 2 > portraitCount && !shortVideoPlatform ? '3:4' : '9:16'
+        reason =
+          pickedRatio === '3:4'
+            ? `AI 分析导入素材多为 3:4 竖版图文构图 (${tallCount} 张)，自动匹配 3:4`
+            : `AI 分析导入素材多为竖构图 (${portraitCount} 竖 vs ${landscapeCount} 横)，自动匹配 9:16`
       } else if (squareCount > landscapeCount && squareCount > portraitCount) {
         pickedRatio = '1:1'
         reason = 'AI 分析导入素材以方形为主，自动匹配 1:1'
@@ -753,6 +885,24 @@ export function deriveVerbalSubtitleParts(narration, subChunks = null, subtitleT
   const fallbackSrc = displayNar || toSubtitleText(String(subtitleText || '').trim())
   if (!fallbackSrc) return []
   return segmentSubtitleLines(fallbackSrc, maxLineWidth)
+}
+
+/** Letters and digits of an on-screen text: punctuation, quotes, spacing, URLs and display-numeral spelling ignored. */
+const subtitleWordCore = (text) =>
+  toSubtitleText(sanitizeSpokenNarration(text))
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+
+/**
+ * True while stored subtitle chunks are still a line split of `narration` — the same words in the same order (only
+ * punctuation, quotes, spacing and display-numeral spelling may differ). Chunks cut from an older narration are stale:
+ * a re-dub must re-derive the lines from the new text instead of re-timing the old words
+ * (`deriveVerbalSubtitleParts` alone keeps chunks that still cover ~72 % of the narration, i.e. after a small edit).
+ */
+export function subChunksMatchNarration(subChunks, narration) {
+  if (!Array.isArray(subChunks) || subChunks.length === 0) return false
+  const chunks = subtitleWordCore(subChunks.map((c) => String(c ?? '')).join(''))
+  return Boolean(chunks) && chunks === subtitleWordCore(narration)
 }
 
 /**
@@ -963,7 +1113,116 @@ export function readScriptJson(projectOrFile) {
   return { scriptPath, projectDir: dirname(scriptPath), data }
 }
 
-export function writeScriptJson(projectOrFile, scriptData) {
+/** On-screen subtitle line width (display columns) for a canvas: portrait 11, square 13, landscape 16. */
+export function subtitleLineWidthFor(script) {
+  const w = Number(script?.width) || 1920
+  const h = Number(script?.height) || 1080
+  return w < h ? 11 : w === h ? 13 : 16
+}
+
+/** Length of one scene on the timeline — the one rule shared by `writeScriptJson` and the global subtitle track. */
+function resolveSceneSpan(scene, fps) {
+  const durationSec = Number(scene?.durationSec || 4)
+  const durationInFrames =
+    Number(scene?.durationInFrames) > 0 ? Number(scene.durationInFrames) : Math.max(1, Math.ceil(durationSec * fps))
+  return { durationSec, durationInFrames }
+}
+
+/**
+ * Time ordered subtitle lines inside one scene: each line gets a share of [offsetSec, offsetSec + spanSec] proportional
+ * to its spoken length (scene-local seconds and frames). offsetSec 0 + the scene length is the default scene timing;
+ * the voice lead-in + the measured voice length times a dubbed scene's lines.
+ */
+export function timeSubtitleParts(parts, { offsetSec = 0, spanSec = 0, fps = 30 } = {}) {
+  const f = Number(fps) > 0 ? Number(fps) : 30
+  const lines = (Array.isArray(parts) ? parts : []).map((c) => String(c || '').trim()).filter(Boolean)
+  if (lines.length === 0) return []
+  const span = Math.max(0, Number(spanSec) || 0)
+  const offset = Math.max(0, Number(offsetSec) || 0)
+  const weights = lines.map((c) => Math.max(2, c.replace(/[^\w\u4e00-\u9fa5]/g, '').length))
+  const sumW = weights.reduce((a, b) => a + b, 0) || 1
+  let cSec = 0
+  return lines.map((text, ci) => {
+    const isLast = ci === lines.length - 1
+    const seg = isLast ? Math.max(0.1, Number((span - cSec).toFixed(3))) : Number(((span * weights[ci]) / sumW).toFixed(3))
+    const s0 = Number(cSec.toFixed(3))
+    const s1 = Number((isLast ? span : cSec + seg).toFixed(3))
+    cSec = s1
+    const startSec = Number((offset + s0).toFixed(3))
+    const endSec = Number((offset + s1).toFixed(3))
+    return { index: ci + 1, text, startSec, endSec, startFrame: Math.floor(startSec * f), endFrame: Math.ceil(endSec * f) }
+  })
+}
+
+const finiteOrNull = (...vals) => {
+  for (const v of vals) {
+    if (v === null || v === undefined || v === '') continue
+    const n = Number(v)
+    if (Number.isFinite(n)) return n
+  }
+  return null
+}
+
+/**
+ * The global subtitle track (`script.subtitles`): every scene-local cue of `scene.subtitles`, placed at its scene's
+ * position on the timeline (cumulative scene lengths, the same rule `writeScriptJson` uses for `startFrame` /
+ * `startSec`) and clamped to its scene. The Remotion composition and the delivery export (SRT / VTT) prefer this track
+ * over the scene cues, so it is derived from the scenes — never edited on its own.
+ */
+export function buildGlobalSubtitleTrack(scenes = [], fps = 30) {
+  const f = Number(fps) > 0 ? Number(fps) : 30
+  const out = []
+  let frame0 = 0
+  let sec0 = 0
+  for (const scene of Array.isArray(scenes) ? scenes : []) {
+    if (!scene || typeof scene !== 'object') continue
+    const { durationSec, durationInFrames } = resolveSceneSpan(scene, f)
+    const s0 = Number(sec0.toFixed(3))
+    const rows = []
+    for (const sub of Array.isArray(scene.subtitles) ? scene.subtitles : []) {
+      const text = String(sub?.text ?? '').trim()
+      if (!text) continue
+      const localStartFrame = finiteOrNull(sub.startFrame)
+      const localEndFrame = finiteOrNull(sub.endFrame)
+      const ls = finiteOrNull(sub.localStartSec, sub.startSec, localStartFrame !== null ? localStartFrame / f : null)
+      const le = finiteOrNull(sub.localEndSec, sub.endSec, localEndFrame !== null ? localEndFrame / f : null)
+      if (ls === null || le === null) continue
+      const sf = Math.max(0, Math.min(durationInFrames, localStartFrame !== null ? Math.round(localStartFrame) : Math.floor(ls * f)))
+      const ef = Math.max(0, Math.min(durationInFrames, localEndFrame !== null ? Math.round(localEndFrame) : Math.ceil(le * f)))
+      if (ef <= sf) continue // the cue lies outside its (shortened) scene
+      const localStartSec = Number(Math.max(0, Math.min(durationSec, ls)).toFixed(3))
+      const localEndSec = Number(Math.max(localStartSec, Math.min(durationSec, le)).toFixed(3))
+      const startSec = Number((s0 + localStartSec).toFixed(3))
+      const endSec = Number((s0 + localEndSec).toFixed(3))
+      rows.push({
+        ...sub,
+        text,
+        sceneId: scene.id,
+        localStartSec,
+        localEndSec,
+        startSec,
+        endSec,
+        startFrame: frame0 + sf,
+        endFrame: frame0 + ef,
+        globalStartSec: startSec,
+        globalEndSec: endSec,
+        globalStartFrame: frame0 + sf,
+        globalEndFrame: frame0 + ef,
+      })
+    }
+    rows.sort((a, b) => a.startFrame - b.startFrame)
+    out.push(...rows)
+    frame0 += durationInFrames
+    sec0 += durationSec
+  }
+  return out
+}
+
+/**
+ * `options.trustedSceneText`: Set of trustedSceneTextKey(sceneId, field) — scene text the USER changed in this save
+ * (the editors' `POST script`); the brief-leak gate leaves it alone. AI writes never pass it.
+ */
+export function writeScriptJson(projectOrFile, scriptData, options = {}) {
   const scriptPath = resolveScriptJsonPath(projectOrFile)
   const projectDir = dirname(scriptPath)
   ensureWin11ProjectGuards(projectDir)
@@ -971,49 +1230,24 @@ export function writeScriptJson(projectOrFile, scriptData) {
   const fps = Number(scriptData.fps) > 0 ? Number(scriptData.fps) : 30
   const resolvedWidth = Number(scriptData.width) || 1920
   const resolvedHeight = Number(scriptData.height) || 1080
-  const subtitleMaxW = resolvedWidth < resolvedHeight ? 11 : resolvedWidth === resolvedHeight ? 13 : 16
+  const subtitleMaxW = subtitleLineWidthFor({ width: resolvedWidth, height: resolvedHeight })
   let currentFrame = 0
   let currentSec = 0
 
   // Final gate: production directives must never reach narration / subtitles / on-screen text
   try {
-    sanitizeScriptForRender(scriptData)
+    sanitizeScriptForRender(scriptData, { trusted: options.trustedSceneText || null })
   } catch {}
 
   if (Array.isArray(scriptData.scenes)) {
     scriptData.scenes = scriptData.scenes.map((scene, idx) => {
-      const durationSec = Number(scene.durationSec || 4)
-      const durationInFrames =
-        Number(scene.durationInFrames) > 0
-          ? Number(scene.durationInFrames)
-          : Math.max(1, Math.ceil(durationSec * fps))
+      const { durationSec, durationInFrames } = resolveSceneSpan(scene, fps)
       const startFrame = currentFrame
       const startSec = Number(currentSec.toFixed(3))
       currentFrame += durationInFrames
       currentSec += durationSec
 
-      const buildChunkedSubtitles = (chunks) => {
-        const cleanChunks = chunks.map((c) => String(c || '').trim()).filter(Boolean)
-        if (cleanChunks.length === 0) return []
-        const weights = cleanChunks.map((c) => Math.max(2, c.replace(/[^\w\u4e00-\u9fa5]/g, '').length))
-        const sumW = weights.reduce((a, b) => a + b, 0) || 1
-        let cSec = 0
-        return cleanChunks.map((text, ci) => {
-          const isLast = ci === cleanChunks.length - 1
-          const seg = isLast ? Math.max(0.1, Number((durationSec - cSec).toFixed(3))) : Number(((durationSec * weights[ci]) / sumW).toFixed(3))
-          const s0 = Number(cSec.toFixed(3))
-          const s1 = Number((isLast ? durationSec : cSec + seg).toFixed(3))
-          cSec = s1
-          return {
-            index: ci + 1,
-            text,
-            startSec: s0,
-            endSec: s1,
-            startFrame: Math.floor(s0 * fps),
-            endFrame: Math.ceil(s1 * fps),
-          }
-        })
-      }
+      const buildChunkedSubtitles = (chunks) => timeSubtitleParts(chunks, { offsetSec: 0, spanSec: durationSec, fps })
 
       const resolvedParts = deriveVerbalSubtitleParts(
         scene.narration ?? scene.text ?? '',
@@ -1069,6 +1303,12 @@ export function writeScriptJson(projectOrFile, scriptData) {
     })
   }
 
+  // The renderers prefer the global subtitle track over the scene cues: an existing track is re-derived from the scenes
+  // on every write, so a re-dub, voice mastering, a subtitle override or a duration / order edit can never leave it stale
+  if (Array.isArray(scriptData.subtitles) && scriptData.subtitles.length > 0 && Array.isArray(scriptData.scenes)) {
+    scriptData.subtitles = buildGlobalSubtitleTrack(scriptData.scenes, fps)
+  }
+
   scriptData.fps = fps
   scriptData.width = resolvedWidth
   scriptData.height = resolvedHeight
@@ -1080,7 +1320,9 @@ export function writeScriptJson(projectOrFile, scriptData) {
           : '9:16'
         : resolvedWidth === resolvedHeight
           ? '1:1'
-          : '16:9'
+          : Math.abs(resolvedWidth / resolvedHeight - 4 / 3) < 0.05
+            ? '4:3'
+            : '16:9'
   }
   scriptData.quality = scriptData.quality || (Math.min(resolvedWidth, resolvedHeight) <= 720 ? '720p' : '1080p')
   scriptData.engine = scriptData.engine === 'remotion' ? 'remotion' : 'html'
@@ -1099,9 +1341,11 @@ export function writeScriptJson(projectOrFile, scriptData) {
       const htmlContent = readFileSync(htmlPath, 'utf8')
       const scriptTagPattern = /(<script\s+id=["']dsh-script-data["']\s+type=["']application\/json["']>)([\s\S]*?)(<\/script>)/i
       if (scriptTagPattern.test(htmlContent)) {
+        // replacer FUNCTION: a replacement string would expand `$1` / `$'` / `$&` typed in narration (prices, quotes)
+        // and corrupt the page; scriptJsonForHtml escapes `<` so text like `</script>` cannot close the data tag
         const syncedHtml = htmlContent.replace(
           scriptTagPattern,
-          `$1\n${JSON.stringify(scriptData, null, 2)}\n  $3`,
+          (_m, open, _old, close) => `${open}\n${scriptJsonForHtml(scriptData)}\n  ${close}`,
         )
         if (syncedHtml !== htmlContent) {
           writeFileSync(htmlPath, syncedHtml, 'utf8')

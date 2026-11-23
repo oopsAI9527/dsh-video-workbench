@@ -23,6 +23,7 @@ import {
 } from '../shared/index.js'
 import { analyzeAudioBeatStructure } from './beat-analyzer.js'
 import { callLlmChat, extractJsonFromLlmText, getSafeLlmConfigSummary } from './llm-client.js'
+import { applyStyleDecision } from './style-presets.js'
 
 function getBrandKitPath(projectDir = '') {
   if (projectDir && existsSync(resolve(projectDir))) {
@@ -561,7 +562,15 @@ export async function analyzeReferenceVideo(options = {}) {
       data.referenceStyle = blueprint
       if (blueprint.genre && blueprint.genre !== 'other') data.genre = blueprint.genre
       if (blueprint.genreLabel) data.genreLabel = blueprint.genreLabel
-      if (blueprint.style) data.style = blueprint.style
+      // the reference's look becomes an explicit preset: style + theme switch together (a stale AI-designed palette in
+      // script.theme would otherwise still override the preset colours)
+      if (blueprint.style) {
+        try {
+          applyStyleDecision(data, { mode: 'preset', style: blueprint.style, profile: null })
+        } catch {
+          data.style = blueprint.style
+        }
+      }
       if (blueprint.narrationMode) data.narrationMode = blueprint.narrationMode
       if (blueprint.subtitleStyle) data.subtitleStyle = blueprint.subtitleStyle
       if (blueprint.pacingSignature?.recommendedPacingMode) {

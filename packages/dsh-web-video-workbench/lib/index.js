@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -37,19 +38,25 @@ import {
   resolveVideoDimensions,
   runCommandRedirected,
   saveHardwarePreferences,
+  SCRUBBED_SCENE_TEXT_KEYS,
   splitDirectorBrief,
+  trustedSceneTextKey,
   writeScriptJson,
 } from '../../shared/index.js'
 import {
   AVATAR_TEMPLATES,
   executeGenerateAvatar,
   getAvatarProviderSummary,
+  getLipsyncInstallerCatalog,
+  getLipsyncStatus,
+  installLipsyncEngine,
   probeVideoStream,
   saveAvatarConfig,
 } from '../../dsh-tool-avatar/index.js'
 import {
   addOrUpdateCustomTtsEngine,
   cloneRecordedVoice,
+  deleteImportedVoice,
   ensureDefaultReferenceVoices,
   executeGenerateSpeech,
   getActiveTtsEngineId,
@@ -76,9 +83,12 @@ import {
   analyzeAudioBeatStructure,
   analyzeReferenceVideo,
   applyPlazaTemplateToProject,
+  assistCloudMediaPrompt,
   callLlmChat,
   CLOUD_MEDIA_PRESETS,
+  commitStagedCloudAsset,
   detectGenre,
+  discardStagedCloudAsset,
   exportProjectMotionMd,
   extractJsonFromLlmText,
   generateCloudMediaAsset,
@@ -88,6 +98,7 @@ import {
   GENRE_PROFILES,
   listGenresForPrompt,
   listPlazaTemplates,
+  listStagedCloudAssets,
   loadBrandKit,
   exportPublishPack,
   generateAiCodedBgmTrack,
@@ -121,6 +132,51 @@ import {
   startPipelineBackground,
   taskManager,
 } from '../../dsh-tool-media/index.js'
+import { getVibeToolkitStatus } from '../../dsh-tool-media/vibe-toolkit-lib.js'
+import {
+  applyStyleDecision,
+  deleteStylePreset,
+  effectiveStyleMode,
+  listStylePresets,
+  MAX_STYLE_PRESETS,
+  prepareProjectStyleForRun,
+  renameStylePreset,
+  resolveStyleRequest,
+  saveStylePreset,
+  styleSelectionValue,
+} from '../../dsh-tool-media/style-presets.js'
+import { DELIVERY_ROUTES, handleDeliveryApiRequest, isDeliveryRoute } from './routes-delivery.js'
+import { handleProjectApiRequest, isProjectRoute, PROJECT_ROUTES } from './routes-project.js'
+import { COVER_ROUTES, handleCoverApiRequest, isCoverRoute } from './routes-cover.js'
+import { handlePlazaCommunityApiRequest, isPlazaCommunityRoute, PLAZA_COMMUNITY_ROUTES } from './routes-plaza.js'
+
+function describeStyleForPrompt(v) {
+  const s = String(v || '').trim()
+  if (!s || s === 'auto') return 'auto（AI 自由匹配：按主题从 6 个预设里挑选，都不合适时自创新风格）'
+  if (s.startsWith('user:')) {
+    const p = safeStylePresets().find((x) => x.value === s)
+    return p ? `用户的风格预设「${p.name}」${p.desc ? `（${p.desc}）` : ''}，基于 ${p.base}` : 'tech'
+  }
+  return s
+}
+
+// 「我的风格预设」 (style-presets.json in DSH_VIDEO_HOME): a broken file never breaks the state payload
+function safeStylePresets() {
+  try {
+    return listStylePresets()
+  } catch {
+    return []
+  }
+}
+const stylePresetsReply = (extra = {}) => ({ ok: true, ...extra, presets: safeStylePresets(), max: MAX_STYLE_PRESETS })
+
+function safeVibeToolkitStatus() {
+  try {
+    return getVibeToolkitStatus()
+  } catch {
+    return []
+  }
+}
 
 export const AUTHOR_INFO = Object.freeze({
   name: 'Merziller',
@@ -137,6 +193,23 @@ import {
 } from '../../dsh-preset-video/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Switchable AI war-room skins (self-contained HTML documents driven by the postMessage bridge, see warroom/BRIDGE.md)
+const WARROOM_DIR = join(__dirname, 'warroom')
+// Optional skin-development overlay: DSH_VIDEO_WARROOM_DIR=<abs dir> serves <dir>/<id>.html in place of the bundled skin
+function resolveWarroomSkinFile(id) {
+  const devDir = String(process.env.DSH_VIDEO_WARROOM_DIR || '').trim()
+  if (devDir && isAbsolute(devDir)) {
+    const devFile = join(devDir, `${id}.html`)
+    if (existsSync(devFile)) return devFile
+  }
+  return join(WARROOM_DIR, `${id}.html`)
+}
+const WARROOM_SKINS = [
+  { id: 'nova-deck', short: 'A', name: '星舰剪辑甲板', en: 'NOVA DECK', tone: 'dark' },
+  { id: 'ink-loom', short: 'B', name: '墨韵织机', en: 'INK LOOM', tone: 'dark' },
+  { id: 'prism-lab', short: 'C', name: '棱镜实验室', en: 'PRISM LAB', tone: 'light' },
+]
 
 const MIME_MAP = {
   '.html': 'text/html; charset=utf-8',
@@ -339,6 +412,7 @@ export async function polishTopicPrompt(body = {}, { fetchImpl } = {}) {
     hasVisualAssets: visualList.length > 0,
     bgmDurationSec: Number(musicItems[0]?.durationSec) || 0,
     referenceShotCount: Number(refStyle?.pacingSignature?.targetShotCount || refStyle?.shotCount || 0),
+    referenceDurationSec: Number(refStyle?.durationSec || 0),
   })
   const durationRuleLine = durationPolicy.enforced
     ? `6. **目标时长硬要求**：用户明确指定目标时长为 **${durationPolicy.label}**（底线 ${durationPolicy.minSec} 秒）！请务必把 \`contentOutline\` 拆解为 **${durationPolicy.outlineCountMin}~${durationPolicy.outlineCountMax} 条** 扎实充实的内容章节要点（保证后续分镜可自然展开到 **${durationPolicy.targetSec} 秒**${effectivePolishNarrationMode === 'subtitle-mv' ? `、共 **${durationPolicy.targetShotsMin}~${durationPolicy.targetShotsMax} 个高密度卡点分镜**` : `、约 ${durationPolicy.requiredCharsMin}~${durationPolicy.requiredCharsMax} 字口播`}），并在 \`directorNotes\` 中明确写明按 **${durationPolicy.targetSec} 秒** 完整铺陈，绝不能缩水！`
@@ -376,7 +450,8 @@ ${durationRuleLine}${bgmRuleLine}${refRuleLine}`
   const userMsg = JSON.stringify({
     userInput: rawPrompt,
     guessedGenre,
-    style: body.style || 'tech',
+    // 'auto' / 'user:<id>' in words the model understands (the director plan later picks / keeps the real style)
+    style: describeStyleForPrompt(body.style),
     aspectRatio: body.aspectRatio || 'auto',
     targetPlatform: body.targetPlatform || 'universal',
     pacingMode: body.pacingMode || 'auto',
@@ -603,7 +678,8 @@ function serveFileWithRange(req, filePath, contentType) {
 
 const ASYNC_JOBS = new Map()
 
-function createBackgroundJob(initialMessage, runner) {
+// runner(onProgress) → result. Optional doneMessage(result) replaces the generic '处理完成' (shown by the job poller).
+function createBackgroundJob(initialMessage, runner, { doneMessage } = {}) {
   const id = `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
   const job = { id, status: 'running', stage: 'init', progress: 4, message: initialMessage, result: null, error: '' }
   ASYNC_JOBS.set(id, job)
@@ -632,7 +708,11 @@ function createBackgroundJob(initialMessage, runner) {
       job.stage = 'done'
       job.progress = 100
       job.result = res
-      job.message = '处理完成'
+      let msg = '处理完成'
+      try {
+        if (typeof doneMessage === 'function') msg = String(doneMessage(res) || msg)
+      } catch {}
+      job.message = msg
     })
     .catch((err) => {
       job.status = 'error'
@@ -709,8 +789,10 @@ export async function handleWorkbenchApiRequest(req) {
         const manifest = readAssets(requestedProject)
         const refDir = join(requestedProject, 'reference')
         let referenceVideoRel = ''
-        if (data?.referenceStyle?.sourceRel && existsSync(join(requestedProject, data.referenceStyle.sourceRel))) {
-          referenceVideoRel = String(data.referenceStyle.sourceRel).replace(/\\/g, '/')
+        // the analyzer writes sourceRelPath; older scripts used sourceRel
+        const refSourceRel = data?.referenceStyle?.sourceRelPath || data?.referenceStyle?.sourceRel || ''
+        if (refSourceRel && existsSync(join(requestedProject, refSourceRel))) {
+          referenceVideoRel = String(refSourceRel).replace(/\\/g, '/')
         } else if (existsSync(refDir)) {
           const refVid = readdirSync(refDir).find((f) => /\.(mp4|mov|webm|mkv)$/i.test(f))
           if (refVid) referenceVideoRel = `reference/${refVid}`
@@ -756,6 +838,7 @@ export async function handleWorkbenchApiRequest(req) {
         ttsConfig: getSafeTtsConfigSummary(),
         ttsInstallCatalog: getTtsInstallerCatalog(),
         cloudMedia: getCloudMediaConfigSummary(),
+        stagedCloudAssets: requestedProject ? listStagedCloudAssets(requestedProject) : [],
         plazaBrand: PLAZA_BRAND,
         plazaCategories: PLAZA_CATEGORIES,
         plazaTemplates: plazaListing.templates,
@@ -768,6 +851,8 @@ export async function handleWorkbenchApiRequest(req) {
         hardwareProfile,
         hardwarePreferences,
         hardwarePolicy,
+        vibeToolkit: safeVibeToolkitStatus(),
+        stylePresets: safeStylePresets(),
         avatarTemplates: AVATAR_TEMPLATES,
         avatarProvider: getAvatarProviderSummary(),
         taskRuns: requestedProject ? taskManager.listRuns(requestedProject) : [],
@@ -789,7 +874,7 @@ export async function handleWorkbenchApiRequest(req) {
           requestedQuality: url.searchParams.get('quality') || '1080p',
           requestedFps: Number(url.searchParams.get('fps')) || 30,
         })
-        return jsonResponse({ ok: true, hardwareProfile, hardwarePreferences, hardwarePolicy })
+        return jsonResponse({ ok: true, hardwareProfile, hardwarePreferences, hardwarePolicy, vibeToolkit: safeVibeToolkitStatus() })
       }
       if (req.method === 'POST') {
         const body = await parseRequestJson(req)
@@ -802,7 +887,7 @@ export async function handleWorkbenchApiRequest(req) {
           requestedQuality: body.quality || '1080p',
           requestedFps: Number(body.fps) || 30,
         })
-        return jsonResponse({ ok: true, hardwareProfile, hardwarePreferences, hardwarePolicy })
+        return jsonResponse({ ok: true, hardwareProfile, hardwarePreferences, hardwarePolicy, vibeToolkit: safeVibeToolkitStatus() })
       }
     }
 
@@ -920,11 +1005,21 @@ export async function handleWorkbenchApiRequest(req) {
         width: body.width,
         height: body.height,
         topic: body.title || body.goal || '',
+        targetPlatform: body.targetPlatform || '',
       })
+      // 视觉风格: new projects default to 「AI 自由匹配」; the base preset is picked from the title by keyword rules
+      const createStyleText = `${body.title || ''} ${body.goal || ''}`
+      let createStyle
+      try {
+        createStyle = resolveStyleRequest({}, body.style || 'auto', { text: createStyleText })
+      } catch {
+        createStyle = resolveStyleRequest({}, 'auto', { text: createStyleText })
+      }
+      const createStyleFields = applyStyleDecision({}, createStyle, { record: false })
       const created = scaffoldVideoProject(projectDir, {
         title: body.title || '新建双引擎视频项目',
         engine: body.engine || 'html',
-        style: body.style || 'tech',
+        style: createStyleFields.style,
         audience: body.audience || '通用受众',
         goal: body.goal || '带有文案、配音、音效、动效、音乐与字幕的完整成片',
         voiceMode: body.voiceMode || 'auto',
@@ -932,6 +1027,11 @@ export async function handleWorkbenchApiRequest(req) {
       })
       const patched = writeScriptJson(projectDir, {
         ...created.script,
+        style: createStyleFields.style,
+        styleMode: createStyleFields.styleMode,
+        styleProfile: createStyleFields.styleProfile,
+        styleAuto: createStyleFields.styleAuto,
+        theme: createStyleFields.theme,
         width: dims.width,
         height: dims.height,
         aspectRatio: dims.aspectRatio,
@@ -992,7 +1092,20 @@ export async function handleWorkbenchApiRequest(req) {
       if (!body.projectDir || !body.script) {
         return jsonResponse({ ok: false, error: 'projectDir and script are required' }, 400)
       }
-      const saved = writeScriptJson(body.projectDir, body.script)
+      // scene text the user changed in this save is theirs: the brief-leak gate (meant for AI output) must not blank it
+      // (the editors record the override from this reply, so a scrubbed reply would lock the wrong text)
+      const trustedSceneText = new Set()
+      try {
+        const prevScenes = new Map(((readScriptJson(body.projectDir).data || {}).scenes || []).map((s) => [s && s.id, s]))
+        for (const sc of Array.isArray(body.script.scenes) ? body.script.scenes : []) {
+          if (!sc || !sc.id) continue
+          const prev = prevScenes.get(sc.id) || {}
+          for (const k of SCRUBBED_SCENE_TEXT_KEYS) {
+            if (typeof sc[k] === 'string' && sc[k] !== String(prev[k] ?? '')) trustedSceneText.add(trustedSceneTextKey(sc.id, k))
+          }
+        }
+      } catch {}
+      const saved = writeScriptJson(body.projectDir, body.script, { trustedSceneText })
       if (body.regenerateHtml !== false && body.regenerateCode !== false) {
         syncProjectCodeFromScript(saved.projectDir, saved.data)
       }
@@ -1052,7 +1165,7 @@ export async function handleWorkbenchApiRequest(req) {
             continue
           }
           if (!file?.name || typeof file.dataBase64 !== 'string') continue
-          const cleanB64 = file.dataBase64.replace(/^data:[^;]+;base64,/, '')
+          const cleanB64 = file.dataBase64.replace(/^data:.*?;base64,/, '')
           const buf = Buffer.from(cleanB64, 'base64')
           const savedPath = await saveUploadedAsset(projectDir, file.name, buf)
           savedPaths.push(savedPath)
@@ -1227,19 +1340,32 @@ export async function handleWorkbenchApiRequest(req) {
     if (pathname === '/api/video-workbench/voices/import' && req.method === 'POST') {
       const body = await parseRequestJson(req)
       const importPayload = { ...body }
+      let stagedPath = ''
       if (!importPayload.sourcePath && body.dataBase64 && body.fileName) {
         const uploadDir = join(REPO_ROOT, 'voice-packs', 'imported', '_uploads')
         mkdirSync(uploadDir, { recursive: true })
         const safeName = basename(String(body.fileName)).replace(/[<>:"/\\|?*]+/g, '_') || `voice-${Date.now()}.wav`
-        const stagedPath = join(uploadDir, `${Date.now()}-${safeName}`)
-        const cleanB64 = String(body.dataBase64).replace(/^data:[^;]+;base64,/, '')
+        stagedPath = join(uploadDir, `${Date.now()}-${safeName}`)
+        const cleanB64 = String(body.dataBase64).replace(/^data:.*?;base64,/, '')
         writeFileSync(stagedPath, Buffer.from(cleanB64, 'base64'))
         importPayload.sourcePath = stagedPath
         if (!importPayload.name) {
           importPayload.name = safeName.replace(/\.[^.]+$/, '')
         }
       }
-      const res = await importVoicePack(importPayload)
+      let res
+      try {
+        res = await importVoicePack(importPayload)
+      } finally {
+        // the import copied (or extracted) the upload into the voice library: drop the staged copy, which would otherwise
+        // pile up — and, with the default library location, be catalogued as a duplicate voice. Kept only when the
+        // caller asked to reference files in place.
+        if (stagedPath && importPayload.copyToVoicePacks !== false) {
+          try {
+            rmSync(stagedPath, { force: true })
+          } catch {}
+        }
+      }
       const catalog = getVoiceCatalog()
       return jsonResponse({
         ok: true,
@@ -1260,6 +1386,14 @@ export async function handleWorkbenchApiRequest(req) {
         voiceCatalog: catalog.voices,
         voiceCategories: catalog.categories,
       })
+    }
+
+    // 4b2. POST /api/video-workbench/voices/delete { voiceId } — remove a user-imported / cloned voice (built-ins refused)
+    if (pathname === '/api/video-workbench/voices/delete' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      const res = deleteImportedVoice(body.voiceId || body.id || '')
+      const catalog = getVoiceCatalog()
+      return jsonResponse({ ...res, voiceCatalog: catalog.voices, voiceCategories: catalog.categories }, res.ok ? 200 : 404)
     }
 
     // 4c. POST /api/video-workbench/voices/clone-preview (live audition of cloned/selected voice via IndexTTS-2.5)
@@ -1303,7 +1437,7 @@ export async function handleWorkbenchApiRequest(req) {
         fileName = body.fileName || fileName
         description = body.description || description
         if (typeof body.dataBase64 === 'string') {
-          buf = Buffer.from(body.dataBase64.replace(/^data:[^;]+;base64,/, ''), 'base64')
+          buf = Buffer.from(body.dataBase64.replace(/^data:.*?;base64,/, ''), 'base64')
         }
       } else {
         projectDir = url.searchParams.get('projectDir') || ''
@@ -1470,6 +1604,46 @@ export async function handleWorkbenchApiRequest(req) {
       })
     }
 
+    // 4h2. 「我的风格预设」: list / save the project's (AI-designed) style / rename / delete
+    if (pathname === '/api/video-workbench/style-presets' && req.method === 'GET') {
+      return jsonResponse(stylePresetsReply())
+    }
+    if (pathname === '/api/video-workbench/style-presets/save' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      let profile = body.profile && typeof body.profile === 'object' ? body.profile : null
+      if (!profile) {
+        if (!body.projectDir || !existsSync(join(resolve(body.projectDir), 'script.json'))) {
+          return jsonResponse({ ok: false, error: '请先打开一个工程' }, 400)
+        }
+        const { data } = readScriptJson(body.projectDir)
+        const mode = effectiveStyleMode(data)
+        profile = (mode === 'auto' || mode === 'user') && data.styleProfile ? data.styleProfile : null
+        if (!profile) return jsonResponse({ ok: false, error: '当前工程还没有 AI 设计的新风格：选择「AI 自由匹配」并生成一次，AI 自创风格后才能保存为预设' }, 400)
+      }
+      try {
+        return jsonResponse(stylePresetsReply({ preset: saveStylePreset({ name: body.name, profile }) }))
+      } catch (err) {
+        return jsonResponse({ ok: false, error: err.message }, 400)
+      }
+    }
+    if (pathname === '/api/video-workbench/style-presets/rename' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      try {
+        return jsonResponse(stylePresetsReply({ preset: renameStylePreset(String(body.id || ''), body.name) }))
+      } catch (err) {
+        return jsonResponse({ ok: false, error: err.message }, 400)
+      }
+    }
+    if (pathname === '/api/video-workbench/style-presets/delete' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      try {
+        deleteStylePreset(String(body.id || ''))
+      } catch (err) {
+        return jsonResponse({ ok: false, error: err.message }, 400)
+      }
+      return jsonResponse(stylePresetsReply({ removed: String(body.id || '') }))
+    }
+
     // 4i. GET /api/video-workbench/safe-zone (Geometric platform safe-zone geometry & collisions)
     if (pathname === '/api/video-workbench/safe-zone' && req.method === 'GET') {
       const projectDir = url.searchParams.get('projectDir') || ''
@@ -1634,16 +1808,55 @@ export async function handleWorkbenchApiRequest(req) {
 
       if (action === 'update-format') {
         const { data } = readScriptJson(projectDir)
-        const manifest = readAssets(projectDir)
-        const visuals = (manifest.items || []).filter((i) => i.type === 'image' || i.type === 'video')
-        const dims = resolveVideoDimensions({
-          aspectRatio: body.aspectRatio || data.requestedAspectRatio || 'auto',
-          quality: body.quality || data.quality || '1080p',
-          width: body.width,
-          height: body.height,
-          topic: data.topic || data.title || '',
-          assets: visuals,
-        })
+        // Re-resolve the canvas only when the request changes it (or the project has none yet). Other settings and the
+        // war room's debounced brief saves must keep the canvas: with aspect 'auto', re-resolving against the current
+        // assets flipped a 16:9 project to 9:16 as soon as portrait images had been imported.
+        const hasValue = (v) => v !== undefined && v !== null && v !== ''
+        // a new 首发平台 on an 'auto' canvas also re-resolves it (小红书 → 3:4)
+        const platformChange =
+          hasValue(body.targetPlatform) && body.targetPlatform !== data.targetPlatform && String(body.aspectRatio || data.requestedAspectRatio || 'auto') === 'auto'
+        const formatChange = ['aspectRatio', 'quality', 'width', 'height'].some((k) => hasValue(body[k])) || platformChange
+        let dims
+        if (formatChange || !data.width || !data.height) {
+          const manifest = readAssets(projectDir)
+          const visuals = (manifest.items || []).filter((i) => i.type === 'image' || i.type === 'video')
+          dims = resolveVideoDimensions({
+            aspectRatio: body.aspectRatio || data.requestedAspectRatio || 'auto',
+            quality: body.quality || data.quality || '1080p',
+            width: body.width,
+            height: body.height,
+            topic: data.topic || data.title || '',
+            assets: visuals,
+            targetPlatform: body.targetPlatform || data.targetPlatform || '',
+          })
+        } else {
+          dims = {
+            width: data.width,
+            height: data.height,
+            aspectRatio: data.aspectRatio,
+            requestedAspectRatio: data.requestedAspectRatio,
+            quality: data.quality,
+            reason: data.dimensionReason,
+          }
+        }
+        // 视觉风格: 'auto' (AI 自由匹配) | preset | 'user:<id>' (我的风格预设) → style (always the base preset) +
+        // styleMode / styleProfile / theme. Re-picking the current 「AI 自由匹配」 / preset changes nothing (a re-picked
+        // 我的预设 refreshes the project's copy from the saved preset).
+        let styleFields = null
+        if (body.style && !(styleSelectionValue(data) === body.style && !String(body.style).startsWith('user:'))) {
+          let decision
+          try {
+            decision = resolveStyleRequest(data, body.style, {
+              text: `${data.topic || data.title || ''} ${data.directorNotes || ''} ${data.goal || ''}`,
+              genre: data.genre || '',
+              genreLabel: data.genreLabel || '',
+            })
+          } catch (err) {
+            return jsonResponse({ ok: false, action, error: err.message }, 400)
+          }
+          const sc = applyStyleDecision({ theme: data.theme }, decision, { record: false })
+          styleFields = { style: sc.style, styleMode: sc.styleMode, styleProfile: sc.styleProfile, styleAuto: sc.styleAuto, theme: sc.theme }
+        }
         const updated = writeScriptJson(projectDir, {
           ...data,
           width: dims.width,
@@ -1662,9 +1875,12 @@ export async function handleWorkbenchApiRequest(req) {
           ...(body.narrationMode ? { narrationMode: body.narrationMode } : {}),
           ...(body.pacingMode ? { pacingMode: body.pacingMode } : {}),
           ...(body.visual3dMode ? { visual3dMode: body.visual3dMode } : {}),
+          ...(body.visualReview !== undefined ? { visualReview: body.visualReview !== false } : {}),
+          ...(['auto', 'silhouette', 'papercut', 'puppet', 'ink', 'flat', 'stick', 'custom'].includes(body.figureStyleChoice) ? { figureStyleChoice: body.figureStyleChoice } : {}),
+          ...(body.figureStyleChoiceNote !== undefined ? { figureStyleChoiceNote: String(body.figureStyleChoiceNote ?? '').replace(/["“”'`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 40) } : {}),
           ...(body.durationMode !== undefined ? { durationMode: body.durationMode === 'custom' ? 'custom' : 'auto' } : {}),
           ...(body.targetDurationSec !== undefined ? { targetDurationSec: Math.max(0, Math.min(600, Math.round(Number(body.targetDurationSec) || 0))) } : {}),
-          ...(body.style ? { style: body.style } : {}),
+          ...(styleFields || {}),
           ...(body.fps ? { fps: Number(body.fps) || 30 } : {}),
           ...(body.voiceId ? { defaultVoiceId: body.voiceId } : {}),
           ...(body.engine ? { engine: body.engine } : {}),
@@ -1766,6 +1982,17 @@ export async function handleWorkbenchApiRequest(req) {
     if (pathname === '/api/video-workbench/pipeline/start' && req.method === 'POST') {
       const body = await parseRequestJson(req)
       if (!body.projectDir) return jsonResponse({ ok: false, error: 'projectDir is required' }, 400)
+      // 视觉风格: resolve 'auto' / 'user:<id>' against the project and persist it before the run — every pipeline stage
+      // then works with the base preset (an AI run's plan call may still design a new style for an auto project)
+      try {
+        body.style = prepareProjectStyleForRun({
+          projectDir: body.projectDir,
+          style: body.style,
+          text: `${body.topic || ''} ${body.directorNotes || ''} ${body.userPrompt || body.goal || ''}`,
+          genre: body.genre || '',
+          genreLabel: body.genreLabel || '',
+        }).style
+      } catch {}
       const run = await startPipelineBackground(body)
       return jsonResponse({
         ok: true,
@@ -1793,7 +2020,7 @@ export async function handleWorkbenchApiRequest(req) {
         extractVoiceClone = Boolean(body.extractVoiceClone)
         cloneName = body.cloneName || ''
         if (typeof body.dataBase64 === 'string') {
-          binBuf = Buffer.from(body.dataBase64.replace(/^data:[^;]+;base64,/, ''), 'base64')
+          binBuf = Buffer.from(body.dataBase64.replace(/^data:.*?;base64,/, ''), 'base64')
         }
       } else {
         projectDir = url.searchParams.get('projectDir') || ''
@@ -1814,6 +2041,22 @@ export async function handleWorkbenchApiRequest(req) {
       const safeName = `${Date.now().toString(36)}-${basename(fileName).replace(/[^a-zA-Z0-9._\u4e00-\u9fa5-]/g, '_')}`
       const destAbs = join(recDir, safeName)
       writeFileSync(destAbs, binBuf)
+
+      // Browser (MediaRecorder) WebM has no Duration / Cues: probes report 0 s and players cannot seek it.
+      // Remux once with stream copy (no re-encode) so the file carries its real duration; keep the original on failure.
+      if (/\.(webm|mkv)$/i.test(safeName)) {
+        const remuxed = destAbs.replace(/(\.[^.]+)$/, '.remux$1')
+        try {
+          const { ffmpeg } = resolveBinaries()
+          const rr = await runCommandRedirected(ffmpeg, ['-y', '-v', 'error', '-i', destAbs, '-map', '0', '-c', 'copy', remuxed], {
+            timeoutMs: 60_000,
+          })
+          if (rr.code === 0 && existsSync(remuxed) && statSync(remuxed).size > 0) renameSync(remuxed, destAbs)
+        } catch {}
+        try {
+          if (existsSync(remuxed)) rmSync(remuxed, { force: true })
+        } catch {}
+      }
 
       const probe = await probeVideoStream(destAbs).catch(() => ({ durationSec: 0, width: 0, height: 0 }))
       const audioProbe = await probeAudioDuration(destAbs, 30).catch(() => ({ durationSec: 0 }))
@@ -2013,6 +2256,20 @@ export async function handleWorkbenchApiRequest(req) {
     if (pathname === '/api/video-workbench/avatar/generate' && req.method === 'POST') {
       const body = await parseRequestJson(req)
       if (!body.projectDir) return jsonResponse({ ok: false, error: 'projectDir is required' }, 400)
+      if (body.async) {
+        // Lip-sync can take minutes: optional background job (poll /api/video-workbench/jobs?id=...)
+        const { async: _async, ...avatarArgs } = body
+        const job = createBackgroundJob('🤖 正在生成数字人（唇形同步 + 透明通道合成）...', async (onProgress) => {
+          const res = await executeGenerateAvatar({ ...avatarArgs, onProgress })
+          return {
+            ...res,
+            previewUrl: res.relPath
+              ? `/api/video-workbench/asset?projectDir=${encodeURIComponent(body.projectDir)}&rel=${encodeURIComponent(res.relPath)}&t=${Date.now()}`
+              : '',
+          }
+        })
+        return jsonResponse({ ok: true, async: true, jobId: job.id, job })
+      }
       const res = await executeGenerateAvatar(body)
       const updatedScript = existsSync(join(resolve(body.projectDir), 'script.json'))
         ? readScriptJson(body.projectDir).data
@@ -2030,13 +2287,40 @@ export async function handleWorkbenchApiRequest(req) {
     // 6h-2. GET/POST /api/video-workbench/avatar/config (External MuseTalk / LatentSync config)
     if (pathname === '/api/video-workbench/avatar/config') {
       if (req.method === 'GET') {
-        return jsonResponse({ ok: true, avatarProvider: getAvatarProviderSummary() })
+        const lipsync = await getLipsyncStatus({ deep: false }).catch((err) => ({ ready: false, reason: err.message }))
+        return jsonResponse({ ok: true, avatarProvider: getAvatarProviderSummary(), lipsync })
       }
       if (req.method === 'POST') {
         const body = await parseRequestJson(req)
         const updated = saveAvatarConfig(body)
         return jsonResponse({ ok: true, avatarProvider: updated })
       }
+    }
+
+    // 6h-2b. GET /api/video-workbench/avatar/lipsync (lip-sync engine status / doctor; ?deep=1 loads Python + CUDA)
+    if (pathname === '/api/video-workbench/avatar/lipsync' && req.method === 'GET') {
+      const deep = ['1', 'true', 'yes'].includes(String(url.searchParams.get('deep') || '').toLowerCase())
+      const status = await getLipsyncStatus({ deep, force: deep })
+      return jsonResponse({ ok: true, lipsync: status, installer: getLipsyncInstallerCatalog() })
+    }
+
+    // 6h-2c. POST /api/video-workbench/avatar/lipsync/install (optional one-click MuseTalk installer, background job)
+    if (pathname === '/api/video-workbench/avatar/lipsync/install' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      const job = createBackgroundJob('📦 正在安装本地唇形同步引擎 (MuseTalk 1.5)...', async (onProgress) => {
+        return await installLipsyncEngine({
+          engineId: body.engineId || 'musetalk',
+          installDir: body.installDir || '',
+          cacheDir: body.cacheDir || '',
+          mirror: body.mirror || 'cn',
+          pythonBin: body.pythonBin || '',
+          reuseTorch: body.reuseTorch === false ? 'no' : 'auto',
+          withEvalModels: body.withEvalModels !== false,
+          writeEnv: body.writeEnv !== false,
+          onProgress,
+        })
+      })
+      return jsonResponse({ ok: true, async: true, jobId: job.id, job })
     }
 
     // 6h-3. POST /api/video-workbench/polish-topic (AI polish user short prompt into rich director brief; supports 10-min async job)
@@ -2115,7 +2399,7 @@ export async function handleWorkbenchApiRequest(req) {
         isAsync = body.async !== false
         localPath = body.localPath || body.videoPath || ''
         if (typeof body.dataBase64 === 'string') {
-          binBuf = Buffer.from(body.dataBase64.replace(/^data:[^;]+;base64,/, ''), 'base64')
+          binBuf = Buffer.from(body.dataBase64.replace(/^data:.*?;base64,/, ''), 'base64')
         }
       } else {
         projectDir = url.searchParams.get('projectDir') || ''
@@ -2215,7 +2499,7 @@ export async function handleWorkbenchApiRequest(req) {
         const body = await parseRequestJson(req)
         fileName = body.fileName || fileName
         if (typeof body.dataBase64 === 'string') {
-          buf = Buffer.from(body.dataBase64.replace(/^data:[^;]+;base64,/, ''), 'base64')
+          buf = Buffer.from(body.dataBase64.replace(/^data:.*?;base64,/, ''), 'base64')
         }
       } else {
         fileName = url.searchParams.get('fileName') || fileName
@@ -2258,20 +2542,38 @@ export async function handleWorkbenchApiRequest(req) {
 
     if (pathname === '/api/video-workbench/cloud-media/generate' && req.method === 'POST') {
       const body = await parseRequestJson(req)
-      const jobId = `cloud-${body.category || 'media'}-${Date.now()}`
-      const job = createJob(jobId, `☁️ 云端 AI 生成 (${body.category || 'image'})`, { projectDir: body.projectDir || '' })
-      ;(async () => {
-        try {
-          const res = await generateCloudMediaAsset({
-            ...body,
-            onProgress: (ev) => updateJob(jobId, { progress: ev.progress || 40, message: ev.message || '云端生成中...' }),
-          })
-          updateJob(jobId, { status: 'completed', progress: 100, message: `✅ 云端生成并入库完成：${res.path}`, result: res })
-        } catch (err) {
-          updateJob(jobId, { status: 'error', progress: 100, message: `云端生成失败: ${err?.message || err}`, error: err?.message || String(err) })
-        }
-      })()
-      return jsonResponse({ ok: true, jobId, job })
+      const stageOnly = body.stageOnly !== false
+      // Runs on the shared background-job registry polled by GET jobs?id= (status running → done | error).
+      // (This route used createJob/updateJob, which were never defined, so every request threw.)
+      const job = createBackgroundJob(
+        `☁️ 云端 AI 生成 (${body.category || 'image'})：任务已提交…`,
+        (onProgress) => generateCloudMediaAsset({ ...body, stageOnly, onProgress }),
+        { doneMessage: (res) => (res?.staged ? '✨ 已生成至预览验收区，请先查看/试听满意后再确认入库' : `✅ 云端生成并入库完成：${res?.path || ''}`) },
+      )
+      return jsonResponse({ ok: true, jobId: job.id, job })
+    }
+
+    if (pathname === '/api/video-workbench/cloud-media/assist-prompt' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      const res = await assistCloudMediaPrompt(body)
+      return jsonResponse(res)
+    }
+
+    if (pathname === '/api/video-workbench/cloud-media/staging' && req.method === 'GET') {
+      const projectDir = url.searchParams.get('projectDir') || ''
+      return jsonResponse({ ok: true, items: projectDir ? listStagedCloudAssets(projectDir) : [] })
+    }
+
+    if (pathname === '/api/video-workbench/cloud-media/staging/commit' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      const res = await commitStagedCloudAsset(body)
+      return jsonResponse(res)
+    }
+
+    if (pathname === '/api/video-workbench/cloud-media/staging/discard' && req.method === 'POST') {
+      const body = await parseRequestJson(req)
+      const res = discardStagedCloudAsset(body)
+      return jsonResponse(res)
     }
 
     // 6g. 影核广场 · CinePulse Hub (Built-in & Community MOTION.md Template Plaza)
@@ -2284,8 +2586,57 @@ export async function handleWorkbenchApiRequest(req) {
     if (pathname === '/api/video-workbench/plaza/template' && req.method === 'GET') {
       const id = url.searchParams.get('id') || ''
       const detail = getPlazaTemplate(id)
-      const { dirPath, coverAbsPath, ...pubTpl } = detail.template
+      const { dirPath, coverAbsPath, previewAbsPath, ...pubTpl } = detail.template
       return jsonResponse({ ok: true, template: pubTpl, motionMd: detail.motionMd, sceneCount: detail.script?.scenes?.length || 0 })
+    }
+
+    // Playable sample clip of a plaza template (HTTP Range, so the player can seek and show its progress bar)
+    if (pathname === '/api/video-workbench/plaza/preview' && req.method === 'GET') {
+      const id = url.searchParams.get('id') || ''
+      let detail = null
+      try {
+        detail = getPlazaTemplate(id)
+      } catch {
+        return new Response('Template Not Found', { status: 404 })
+      }
+      const file = detail.template?.previewAbsPath
+      if (!file || !existsSync(file)) {
+        return new Response('Preview Not Found', { status: 404 })
+      }
+      const ext = extname(file).toLowerCase()
+      return serveFileWithRange(req, file, MIME_MAP[ext] || 'video/mp4')
+    }
+
+    // War-room skins: 3 switchable full-viewport skin documents (contract: lib/warroom/BRIDGE.md)
+    if (pathname === '/api/video-workbench/warroom/skins' && req.method === 'GET') {
+      return jsonResponse({
+        ok: true,
+        skins: WARROOM_SKINS.map((s) => ({ ...s, available: existsSync(resolveWarroomSkinFile(s.id)) })),
+      })
+    }
+    // Native panel kit shared by all skins (built from lib/warroom/kit/src → lib/warroom/kit.js + kit.css); a skin
+    // loads it relatively ("kit.js"), which resolves here when the skin is served from /warroom/skin
+    if ((pathname === '/api/video-workbench/warroom/kit.js' || pathname === '/api/video-workbench/warroom/kit.css') && req.method === 'GET') {
+      const isCss = pathname.endsWith('.css')
+      const file = join(WARROOM_DIR, isCss ? 'kit.css' : 'kit.js')
+      const type = isCss ? 'text/css; charset=utf-8' : 'application/javascript; charset=utf-8'
+      if (!existsSync(file)) return new Response(isCss ? '/* kit.css missing */' : '/* kit.js missing */', { status: 404, headers: { 'Content-Type': type, 'Cache-Control': 'no-store' } })
+      return new Response(readFileSync(file), { status: 200, headers: { 'Content-Type': type, 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' } })
+    }
+    if (pathname === '/api/video-workbench/warroom/skin' && req.method === 'GET') {
+      const id = String(url.searchParams.get('id') || '')
+      const skin = WARROOM_SKINS.find((s) => s.id === id)
+      const file = skin ? resolveWarroomSkinFile(skin.id) : ''
+      if (!file || !existsSync(file)) {
+        return new Response(
+          `<!doctype html><meta charset="utf-8"><title>皮肤不存在</title><body style="margin:0;display:grid;place-items:center;height:100vh;background:#0b0f1a;color:#cbd5e1;font:14px 'Microsoft YaHei UI',system-ui,sans-serif">作战大屏皮肤「${skin ? skin.name : '未知'}」未安装，请切换到其他大屏或重新安装插件。</body>`,
+          { status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } },
+        )
+      }
+      return new Response(readFileSync(file), {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' },
+      })
     }
 
     if (pathname === '/api/video-workbench/plaza/cover' && req.method === 'GET') {
@@ -2309,7 +2660,7 @@ export async function handleWorkbenchApiRequest(req) {
 
     if (pathname === '/api/video-workbench/plaza/publish' && req.method === 'POST') {
       const body = await parseRequestJson(req)
-      const res = publishProjectToPlaza(body)
+      const res = await publishProjectToPlaza(body)
       return jsonResponse({ ...res, plaza: listPlazaTemplates() })
     }
 
@@ -2321,7 +2672,8 @@ export async function handleWorkbenchApiRequest(req) {
       let rel = ''
       try {
         const { data } = readScriptJson(absProject)
-        if (data?.referenceStyle?.sourceRel) rel = data.referenceStyle.sourceRel
+        // the analyzer writes sourceRelPath; older scripts used sourceRel
+        rel = data?.referenceStyle?.sourceRelPath || data?.referenceStyle?.sourceRel || ''
       } catch {}
       let refFile = rel ? resolve(absProject, rel) : ''
       if (!refFile || !existsSync(refFile)) {
@@ -2367,6 +2719,10 @@ export async function handleWorkbenchApiRequest(req) {
       return serveFileWithRange(req, targetFile, contentType)
     }
 
+    if (isDeliveryRoute(pathname)) return await handleDeliveryApiRequest(req, url)
+    if (isProjectRoute(pathname)) return await handleProjectApiRequest(req, url, { createBackgroundJob })
+    if (isCoverRoute(pathname)) return await handleCoverApiRequest(req, url, { createBackgroundJob })
+    if (isPlazaCommunityRoute(pathname)) return await handlePlazaCommunityApiRequest(req, url, { createBackgroundJob })
     return jsonResponse({ ok: false, error: `Route not found: ${pathname}` }, 404)
   } catch (err) {
     return jsonResponse({ ok: false, error: err?.message || String(err) }, 500)
@@ -2376,6 +2732,9 @@ export async function handleWorkbenchApiRequest(req) {
 export const name = 'dsh-web-video-workbench'
 
 export function apply(ctx) {
+  // Loaded by the real DSH client (not the MCP server's / standalone studio's shim): the host agent is DSH, which the
+  // default LLM mode 「跟随当前智能体」 follows. A value already set (by the user or an MCP client) wins.
+  if (ctx && !ctx.__dshVideoShim && !String(process.env.DSH_VIDEO_HOST_AGENT || '').trim()) process.env.DSH_VIDEO_HOST_AGENT = 'dsh'
   try {
     listVideoProjects()
   } catch {}
@@ -2405,6 +2764,7 @@ export function apply(ctx) {
       { path: '/api/video-workbench/qa', methods: ['POST'] },
       { path: '/api/video-workbench/voices/import', methods: ['POST'] },
       { path: '/api/video-workbench/voices/clone-upload', methods: ['POST'] },
+      { path: '/api/video-workbench/voices/delete', methods: ['POST'] },
       { path: '/api/video-workbench/voices/clone-preview', methods: ['POST'] },
       { path: '/api/video-workbench/voices/match', methods: ['POST'] },
       { path: '/api/video-workbench/bgm/upload', methods: ['POST'] },
@@ -2413,6 +2773,10 @@ export function apply(ctx) {
       { path: '/api/video-workbench/publish-pack', methods: ['POST'] },
       { path: '/api/video-workbench/vendor/import', methods: ['POST'] },
       { path: '/api/video-workbench/safe-zone', methods: ['GET'] },
+      { path: '/api/video-workbench/style-presets', methods: ['GET'] },
+      { path: '/api/video-workbench/style-presets/save', methods: ['POST'] },
+      { path: '/api/video-workbench/style-presets/rename', methods: ['POST'] },
+      { path: '/api/video-workbench/style-presets/delete', methods: ['POST'] },
       { path: '/api/video-workbench/action', methods: ['POST'] },
       { path: '/api/video-workbench/tasks', methods: ['GET'] },
       { path: '/api/video-workbench/tasks/control', methods: ['POST'] },
@@ -2424,6 +2788,8 @@ export function apply(ctx) {
       { path: '/api/video-workbench/teleprompter/generate', methods: ['POST'] },
       { path: '/api/video-workbench/avatar/generate', methods: ['POST'] },
       { path: '/api/video-workbench/avatar/config', methods: ['GET', 'POST'] },
+      { path: '/api/video-workbench/avatar/lipsync', methods: ['GET'] },
+      { path: '/api/video-workbench/avatar/lipsync/install', methods: ['POST'] },
       { path: '/api/video-workbench/polish-topic', methods: ['POST'] },
       { path: '/api/video-workbench/tts/install-options', methods: ['GET'] },
       { path: '/api/video-workbench/tts/install', methods: ['POST'] },
@@ -2436,14 +2802,27 @@ export function apply(ctx) {
       { path: '/api/video-workbench/motion-md', methods: ['POST'] },
       { path: '/api/video-workbench/cloud-media', methods: ['GET', 'POST'] },
       { path: '/api/video-workbench/cloud-media/generate', methods: ['POST'] },
+      { path: '/api/video-workbench/cloud-media/assist-prompt', methods: ['POST'] },
+      { path: '/api/video-workbench/cloud-media/staging', methods: ['GET'] },
+      { path: '/api/video-workbench/cloud-media/staging/commit', methods: ['POST'] },
+      { path: '/api/video-workbench/cloud-media/staging/discard', methods: ['POST'] },
       { path: '/api/video-workbench/plaza/templates', methods: ['GET'] },
       { path: '/api/video-workbench/plaza/template', methods: ['GET'] },
       { path: '/api/video-workbench/plaza/cover', methods: ['GET'] },
+      { path: '/api/video-workbench/plaza/preview', methods: ['GET'] },
+      { path: '/api/video-workbench/warroom/skins', methods: ['GET'] },
+      { path: '/api/video-workbench/warroom/skin', methods: ['GET'] },
+      { path: '/api/video-workbench/warroom/kit.js', methods: ['GET'] },
+      { path: '/api/video-workbench/warroom/kit.css', methods: ['GET'] },
       { path: '/api/video-workbench/plaza/apply', methods: ['POST'] },
       { path: '/api/video-workbench/plaza/publish', methods: ['POST'] },
       { path: '/api/video-workbench/skin/upload', methods: ['POST'] },
       { path: '/api/video-workbench/skin', methods: ['GET'] },
       { path: '/api/video-workbench/asset', methods: ['GET'] },
+      ...DELIVERY_ROUTES,
+      ...PROJECT_ROUTES,
+      ...COVER_ROUTES,
+      ...PLAZA_COMMUNITY_ROUTES,
     ]
     for (const r of routes) {
       try {

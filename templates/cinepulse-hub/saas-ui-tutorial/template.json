@@ -84,5 +84,7 @@
   "author": "Merziller",
   "plaza": "影核广场 · CinePulse Hub",
   "coverFile": "cover.png",
-  "updatedAt": "2026-11-19T19:13:21.064Z"
+  "updatedAt": "2026-11-19T19:13:21.064Z",
+  "previewFile": "preview.mp4",
+  "previewDurationSec": 14.37
 }

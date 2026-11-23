@@ -125,7 +125,11 @@ export function parseDurationFromText(text = '') {
   const secMatches = [...s.matchAll(/(至少|不少于|超过|大于|≥|>=|时长(?:为|约|需要|要|在)?)?\s*(\d{2,3})\s*(?:秒钟|秒|s\b|sec)\s*(以上|左右|上下|起)?/gi)]
   for (const m of secMatches) {
     const around = s.slice(Math.max(0, (m.index || 0) - 8), Math.min(s.length, (m.index || 0) + m[0].length + 8))
-    if (/每镜|单镜|每幕|\/\s*镜|钩子|前\d+秒|片尾|最后/.test(around)) continue
+    if (/每镜|单镜|每幕|\/\s*镜|钩子|前\d+秒|片尾|最后|平均|均长|最短|最长|每个镜头|每段|每拍/.test(around)) continue
+    // the digits must be a whole number: "3.42秒" / "154.05秒" are decimals (per-shot averages), not a 42 s / 5 s target
+    const numAt = (m.index || 0) + m[0].indexOf(m[2])
+    const prevCh = s[numAt - 1] || ''
+    if (/[\d.．]/.test(prevCh)) continue
     const base = Number(m[2])
     if (base >= 15 && base <= 600) {
       const isAtLeast = Boolean((m[1] && /至少|不少于|超过|大于|≥|>=/.test(m[1])) || (m[3] && /以上|起/.test(m[3])))
@@ -161,6 +165,8 @@ export function resolveTargetDurationPolicy({
   hasVisualAssets = false,
   bgmDurationSec = 0,
   referenceShotCount = 0,
+  // duration of the film the reference shot count belongs to (a template film / an analysed reference video)
+  referenceDurationSec = 0,
 } = {}) {
   const normMode = String(durationMode || 'auto').trim().toLowerCase() === 'custom' ? 'custom' : 'auto'
   const explicitSec = clampDurationSec(targetDurationSec)
@@ -204,7 +210,15 @@ export function resolveTargetDurationPolicy({
     maxSec = Math.min(360, Math.round(targetSec * 1.5))
   }
 
-  const refShots = Number(referenceShotCount) > 6 ? Math.min(72, Math.round(Number(referenceShotCount))) : 0
+  // A reference keeps its cut density, not its absolute shot count: 53 shots of a 123 s template film become ~28
+  // shots of a 65 s film (when the reference film's duration is known and differs by more than 20 %).
+  const refShotsRaw = Number(referenceShotCount) > 6 ? Math.round(Number(referenceShotCount)) : 0
+  const refSec = Number(referenceDurationSec) || 0
+  const refShotsScaled =
+    refShotsRaw && refSec >= 10 && targetSec > 0 && Math.abs(targetSec / refSec - 1) > 0.2
+      ? Math.round((refShotsRaw * targetSec) / refSec)
+      : refShotsRaw
+  const refShots = refShotsScaled > 6 ? Math.min(72, refShotsScaled) : 0
   const shotsPerMin = isSubtitleMv ? 24 : (pacingProfile?.shotsPerMin || (isDynamicPacing ? 22 : 12))
   const avgSecPerShot = Math.max(1.8, Math.min(8.5, 60 / Math.max(6, shotsPerMin)))
   const rawShots = refShots || Math.max(6, Math.round(targetSec / avgSecPerShot))
@@ -236,7 +250,7 @@ export function resolveTargetDurationPolicy({
 
   const promptDirective = enforced || isSubtitleMv
     ? isSubtitleMv
-      ? `【纯音乐高燃卡点分镜密度硬约束】：本片为免配音纯音乐卡点 MV（目标时长 ${enforced ? label : `约 ${formatDurationLabel(targetSec)}`}）！必须规划 **${targetShotsMin}~${targetShotsMax} 个高密度快切分镜**（参考爆款历史燃剪 34~52 镜标准：常规镜 2~4 拍约 1.5~3.2s，高潮突降点 drops 与战局转折穿插 0.5 拍/1 拍爆燃闪切），各镜 durationSec 之和落在 **${minSec}~${maxSec} 秒**，严禁只拆十几二十个缓慢拖沓的镜头！`
+      ? `【纯音乐高燃卡点分镜密度硬约束】：本片为免配音纯音乐卡点 MV（目标时长 ${enforced ? label : `约 ${formatDurationLabel(targetSec)}`}）！必须规划 **${targetShotsMin}~${targetShotsMax} 个高密度快切分镜**（参考爆款历史燃剪的节奏：常规镜 2~4 拍约 1.5~3.2s，高潮突降点 drops 与战局转折穿插 0.5 拍/1 拍爆燃闪切），各镜 durationSec 之和落在 **${minSec}~${maxSec} 秒**，严禁只拆十几二十个缓慢拖沓的镜头！`
       : `【目标时长硬约束（必须达标，严禁缩水！）】：本片目标总时长为 **${label}**（硬底线不得低于 **${minSec} 秒**）！按正常中文解说语速（每秒约 4.1 字 + 幕间呼吸停顿）换算，全片必须规划 **${targetShotsMin}~${targetShotsMax} 个分镜**，全部镜头 \`narration\` 旁白总字数必须达到 **${requiredCharsMin}~${requiredCharsMax} 个汉字**（平均每镜约 ${Math.max(16, Math.round(requiredCharsMin / Math.max(1, targetShotsMax)))}~${Math.max(28, Math.round(requiredCharsMax / Math.max(1, targetShotsMin)))} 字、单镜 durationSec 合计落在 **${minSec}~${maxSec} 秒**），讲透完整内容与细节，绝不允许只写几百字导致成片缩水成 50 秒！`
     : '【时长策略：AI 自由匹配】：根据题材深度、素材丰富度与叙事节奏自由规划最舒适的完整时长（不强行压缩、也不注水凑数）。'
 

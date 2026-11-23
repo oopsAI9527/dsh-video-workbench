@@ -11,6 +11,7 @@ import {
 } from '../packages/shared/index.js'
 import { executeGenerateAvatar } from '../packages/dsh-tool-avatar/index.js'
 import {
+  deleteImportedVoice,
   ensureTtsServer,
   executeGenerateSpeech,
   getVoiceCatalog,
@@ -435,8 +436,9 @@ async function runSelfTest() {
     const sysPrompt = String(body?.system || '')
     const userPrompt = String(body?.messages?.[body.messages.length - 1]?.content || '')
 
-    // AI-Coded Audio BGM DSP script call
-    if (sysPrompt.includes('DSP') || userPrompt.includes('synthesizeBgm')) {
+    // AI-Coded Audio BGM DSP script call (the scene coder prompt also mentions DSP in its Vibecoding toolkit notes,
+    // so route on the audio contract itself rather than the bare word)
+    if (userPrompt.includes('synthesizeBgm') || sysPrompt.includes('synthesizeBgm') || (sysPrompt.includes('DSP') && !sysPrompt.includes('Remotion'))) {
       const codeStr = `function synthesizeBgm(ctx) {
   const N = ctx.totalSamples;
   for (let i = 0; i < N; i++) {
@@ -923,16 +925,15 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = { 'sc
   if (!auditionJson.ok || !String(auditionJson.audioDataUrl || '').startsWith('data:audio/wav;base64,')) {
     throw new Error(`Cloned voice audition API failed: ${JSON.stringify(auditionJson)}`)
   }
-  // Remove synthetic test clone from persistent catalog/disk so user's clean library stays untouched
-  const userCatFile = join(REPO_ROOT, 'voice-packs', 'catalog.json')
-  if (existsSync(userCatFile)) {
+  // Remove the synthetic test voices from the user's real voice library (VOICE_PACKS_DIR): catalog entry + folder
+  for (const testVoiceId of [cloneUpJson.voice.id, 'imported-custom-narrator']) {
     try {
-      const parsedCat = JSON.parse(readFileSync(userCatFile, 'utf8'))
-      parsedCat.voices = (parsedCat.voices || []).filter((v) => v.id !== cloneUpJson.voice.id && v.id !== 'imported-custom-narrator')
-      writeFileSync(userCatFile, JSON.stringify(parsedCat, null, 2) + '\n', 'utf8')
+      deleteImportedVoice(testVoiceId)
     } catch {}
   }
-  rmSync(join(REPO_ROOT, 'voice-packs', 'imported', cloneUpJson.voice.id), { recursive: true, force: true })
+  if (getVoiceCatalog().voices.some((v) => v.id === cloneUpJson.voice.id || v.id === 'imported-custom-narrator')) {
+    throw new Error('self-test voices were not removed from the voice library')
+  }
 
   // P1.1 Schema Plan Mode + Tier 1-4 Graceful Degradation
   const tier4Res = await runSchemaDirectorWithDegradation({
@@ -1681,29 +1682,48 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
     throw new Error(`Root bundle index.js failed to mount full stack: tools=${bundleTools.length}, presets=${bundlePresets.length}, routes=${bundleRoutes.length}, webui=${bundleWebui.length}`)
   }
   let capturedLoaderDef = null
+  // The host renders nothing but the war-room skin iframe (棱镜实验室 by default; the classic React UI is gone).
+  // Effects and refs are recorded so the postMessage bridge (skin → host actions) can be driven below.
+  const sandboxStore = {}
+  const sandboxStorage = { getItem: (k) => (k in sandboxStore ? sandboxStore[k] : null), setItem: (k, v) => { sandboxStore[k] = String(v) } }
+  const recordedEffects = []
+  const recordedRefs = []
+  const windowListeners = {}
   const mockReact = {
     createElement: (type, props, ...children) => ({ type, props, children }),
     Component: class { constructor(props) { this.props = props || {} } },
     useState: (v) => [typeof v === 'function' ? v() : v, () => {}],
-    useEffect: () => {},
-    useRef: (v) => ({ current: v }),
+    useEffect: (fn) => { recordedEffects.push(fn) },
+    useRef: (v) => {
+      const r = { current: v }
+      recordedRefs.push(r)
+      return r
+    },
     useMemo: (fn) => fn(),
     useCallback: (fn) => fn,
   }
   const clientSandbox = {
     window: {
       __ModuleLoader__: { load: (def) => { capturedLoaderDef = def } },
-      addEventListener: () => {},
+      addEventListener: (type, fn) => { (windowListeners[type] = windowListeners[type] || []).push(fn) },
       removeEventListener: () => {},
       dispatchEvent: () => {},
-      localStorage: { getItem: () => null, setItem: () => {} },
+      focus: () => {},
+      localStorage: sandboxStorage,
       innerWidth: 1440,
+      location: { origin: 'http://127.0.0.1:4399' },
+      // the bridge's `api` proxy goes through connFetch → window.fetch → the real plugin router
+      fetch: (url, init = {}) => handleWorkbenchApiRequest(new Request(`http://127.0.0.1:4399${url}`, init)),
     },
-    document: { querySelector: () => null, createElement: () => ({ style: {} }), head: { appendChild: () => {} } },
-    localStorage: { getItem: () => null, setItem: () => {} },
+    document: { querySelector: () => null, createElement: () => ({ style: {} }), head: { appendChild: () => {} }, activeElement: null },
+    localStorage: sandboxStorage,
     navigator: { clipboard: {} },
     CustomEvent: class {},
     URL,
+    URLSearchParams,
+    Request,
+    Response,
+    ArrayBuffer,
     console,
     setTimeout,
     clearTimeout,
@@ -1777,9 +1797,38 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
     }
     return acc
   }
-  const mainBtns = findButtons(mainEl)
-  const backChatBtn = mainBtns.find((b) => JSON.stringify(b).includes('DeepSeek 对话'))
-  backChatBtn?.props?.onClick?.()
+  findButtons(mainEl)
+  // Drive the skin bridge like the iframe would: wire the message listener, point the (still unmounted) skin-frame
+  // ref at a fake skin window and send actions. backToChat must hand the DSH layout back to the chat panel.
+  const fakeSkinWin = { posted: [], postMessage(msg) { this.posted.push(msg) } }
+  for (const fx of recordedEffects) {
+    if (String(fx).includes("'dsh-vw/ready'")) fx()
+  }
+  for (const r of recordedRefs) if (r.current === null) r.current = { contentWindow: fakeSkinWin, blur: () => {} }
+  const sendSkinAction = async (id, action, payload = {}) => {
+    for (const fn of windowListeners.message || []) fn({ source: fakeSkinWin, data: { type: 'dsh-vw/action', v: 1, id, action, payload } })
+    for (let i = 0; i < 200 && !fakeSkinWin.posted.some((m) => m.type === 'dsh-vw/result' && m.id === id); i++) await new Promise((r) => setTimeout(r, 10))
+    return fakeSkinWin.posted.find((m) => m.type === 'dsh-vw/result' && m.id === id) || null
+  }
+  const bridgeBack = await sendSkinAction('t-back', 'backToChat')
+  const bridgeDeny = await sendSkinAction('t-deny', 'api', { method: 'GET', path: 'projects/delete' })
+  const bridgeGet = await sendSkinAction('t-get', 'api', { method: 'GET', path: 'tts-config' })
+  const bridgeClassic = await sendSkinAction('t-classic', 'setSkin', { skin: 'classic' })
+  const bridgeUpDeny = await sendSkinAction('t-updeny', 'upload', { path: 'voices/import', data: new ArrayBuffer(4) })
+  const kitDir = join(REPO_ROOT, 'packages', 'dsh-web-video-workbench', 'lib', 'warroom')
+  const kitJs = existsSync(join(kitDir, 'kit.js')) ? readFileSync(join(kitDir, 'kit.js'), 'utf8') : ''
+  const kitCss = existsSync(join(kitDir, 'kit.css')) ? readFileSync(join(kitDir, 'kit.css'), 'utf8') : ''
+  try {
+    new vmModule.Script(kitJs, { filename: 'kit.js' })
+  } catch (err) {
+    throw new Error(`war-room panel kit (lib/warroom/kit.js) does not compile: ${err.message}`)
+  }
+  const kitPanelIds = ['studio', 'projects', 'newProject', 'help', 'tasks', 'plaza', 'keys', 'voices', 'cloud', 'avatar', 'hardware', 'teleprompter', 'reference', 'brand', 'export', 'history']
+  const missingKitPanels = kitPanelIds.filter((id) => !new RegExp(`PK\\.panel\\(\\s*['"]${id}['"]`).test(kitJs))
+  const missingKitSteps = ['assets', 'director', 'scenes', 'delivery'].filter((id) => !new RegExp(`PK\\.studioStep\\(\\s*['"]${id}['"]`).test(kitJs))
+  const skinDocs = ['nova-deck', 'ink-loom', 'prism-lab'].map((id) => [id, readFileSync(join(kitDir, `${id}.html`), 'utf8')])
+  const skinsWithoutKit = skinDocs.filter(([, html]) => !html.includes('kit.js') || !html.includes('kit.css')).map(([id]) => id)
+  const skinsOfferingClassic = skinDocs.filter(([, html]) => /['"]classic['"]/.test(html)).map(([id]) => id)
   if (
     !mainEntry ||
     hasOverlaySlot ||
@@ -1787,14 +1836,35 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
     !sidebarEntry ||
     sidebarSvg?.type !== 'svg' ||
     toolViewCount < 5 ||
-    !wbClientSrc.includes('AI 一键润色提示词') ||
-    !wbClientSrc.includes('纯音乐卡点 (免TTS)') ||
-    !wbClientSrc.includes('直接上传本机已录视频/音频入库') ||
-    !wbClientSrc.includes('成片原画时间轴') ||
+    !bridgeBack?.ok ||
+    bridgeDeny?.ok !== false ||
+    !String(bridgeDeny?.error || '').includes('面板接口未开放') ||
+    !bridgeGet?.ok ||
+    bridgeGet?.data?.body?.ok !== true ||
+    bridgeClassic?.ok !== false ||
+    bridgeUpDeny?.ok !== false ||
     !wbClientSrc.includes('DEFAULT_TTS_ENGINES_FALLBACK') ||
-    wbClientSrc.includes("slots.inject('shell.overlay'")
+    wbClientSrc.includes("slots.inject('shell.overlay'") ||
+    !wbClientSrc.includes('/api/video-workbench/warroom/skin?id=') ||
+    !wbClientSrc.includes("const WARROOM_DEFAULT_SKIN = 'prism-lab'") ||
+    wbClientSrc.includes('WARROOM_CLASSIC') ||
+    wbClientSrc.includes('const warRoomView') ||
+    wbClientSrc.includes('const studioWorkbenchView') ||
+    !wbClientSrc.includes("case 'backToChat'") ||
+    !wbClientSrc.includes('handleBackToChat()') ||
+    !wbClientSrc.includes("type: 'dsh-vw/state'") ||
+    !kitCss.includes('#pk-root') ||
+    missingKitPanels.length ||
+    missingKitSteps.length ||
+    skinsWithoutKit.length ||
+    skinsOfferingClassic.length
   ) {
-    throw new Error(`DSH client slot / UI check failed: main=${Boolean(mainEntry)}, hasOverlaySlot=${hasOverlaySlot}, panelAfterClick=${activePanelMock}, toolViews=${toolViewCount}`)
+    throw new Error(
+      `DSH client slot / war-room bridge / panel kit check failed: main=${Boolean(mainEntry)}, hasOverlaySlot=${hasOverlaySlot}, panelAfterBack=${activePanelMock}, ` +
+        `toolViews=${toolViewCount}, back=${JSON.stringify(bridgeBack)}, deny=${JSON.stringify(bridgeDeny)}, get=${bridgeGet?.ok}/${bridgeGet?.data?.status}, ` +
+        `classic=${JSON.stringify(bridgeClassic)}, uploadDeny=${JSON.stringify(bridgeUpDeny)}, missingPanels=${missingKitPanels.join(',')}, ` +
+        `missingSteps=${missingKitSteps.join(',')}, skinsWithoutKit=${skinsWithoutKit.join(',')}, skinsOfferingClassic=${skinsOfferingClassic.join(',')}`,
+    )
   }
 
   // 16f. Per-scene keyframe thumbnail extraction (`output/scene-thumbs/*.jpg`) & state integration
@@ -2001,6 +2071,18 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
   ) {
     throw new Error(`Custom genre pass-through assertion failed: ${JSON.stringify({ customPolishedRes, splitCustom, customGenreSel, customGuidance })}`)
   }
+  // stringified missing values left by an old skin bug never reach the brief / the AI prompt
+  {
+    const { formatDirectorBrief: fmtBrief } = await import('../packages/shared/meta-guard.js')
+    const stale = splitDirectorBrief({ topic: '【作品标题】秋日咖啡馆新品宣传\n【一句话】undefined\n【内容要点】\n1. 新品特写\n2. 门店氛围', directorNotes: 'null' })
+    const staleFmt = fmtBrief({ goal: 'undefined', userPrompt: '为社区咖啡馆做一支秋季新品宣传片', directorNotes: '暖色调', contentOutline: ['新品特写'] })
+    // a brief flattened to one line, as found in a real project
+    const staleFlat = fmtBrief({ goal: '【作品标题】秋日咖啡馆新品宣传【体裁】产品宣发【一句话】undefined【导演备注（仅供 AI 制作，不会出现在视频里）】温暖治愈' })
+    if (/undefined|null/.test(JSON.stringify(stale)) || stale.displayTitle !== '秋日咖啡馆新品宣传' || !staleFmt.includes('【一句话】为社区咖啡馆') || /undefined/.test(staleFmt) ||
+      /undefined|【一句话】/.test(staleFlat) || !staleFlat.includes('【体裁】产品宣发【导演备注')) {
+      throw new Error(`Stale "undefined" brief cleanup failed: ${JSON.stringify({ stale, staleFmt, staleFlat })}`)
+    }
+  }
 
   const repairedFreeform = repairFreeformPlan(
     {
@@ -2049,7 +2131,12 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
     !freeRemotionPrompt.system.includes('深海透明解剖图鉴动画') ||
     !freeRemotionPrompt.user.includes('深海透明解剖图鉴动画') ||
     !freeHtmlPrompt.system.includes('深海透明解剖图鉴动画') ||
-    !freeHtmlPrompt.user.includes('深海透明解剖图鉴动画')
+    !freeHtmlPrompt.user.includes('深海透明解剖图鉴动画') ||
+    // 视效偏好 defaults to 「AI 按需自由创作」 and the ready-made imports are never a closed list
+    !freeRemotionPrompt.system.includes('AI 按需自由创作') ||
+    freeRemotionPrompt.system.includes('严格以此为准') ||
+    !freeRemotionPrompt.system.includes('自由编写') ||
+    !freeHtmlPrompt.system.includes('AI 按需自由创作')
   ) {
     throw new Error(`Freeform-stage liberation assertion failed: repaired=${JSON.stringify(repairedFreeform.shots.map((s) => s.layout))}, t2=${tier2Modern.plan?.shots?.[0]?.layout}`)
   }
@@ -2746,20 +2833,71 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
   }
   const pubTestRoot = join(REPO_ROOT, '.tmp', 'v050-plaza-pub')
   rmSync(pubTestRoot, { recursive: true, force: true })
-  const plazaPubRes = publishProjectToPlaza({
+  mkdirSync(pubTestRoot, { recursive: true })
+  // tiny synthetic film (picture + tone) so the publish step must cut a playable sample clip
+  const plazaSynthMp4 = join(pubTestRoot, 'synthetic-final.mp4')
+  {
+    const { ffmpeg: ffSynth } = resolveBinaries()
+    const synth = await runCommandRedirected(ffSynth, [
+      '-v', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=30',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+      '-t', '3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+      '-metadata', `comment=${['C:', 'Users', 'someone', 'secret-project'].join('/')}`, plazaSynthMp4,
+    ])
+    if (synth.code !== 0) throw new Error(`v0.5.4 plaza synthetic clip failed: ${synth.stderr}`)
+  }
+  const plazaPubRes = await publishProjectToPlaza({
     projectDir: demoPromoDir,
     templateId: 'self-test-promo-tpl',
     name: '自检发布模板',
     targetRoot: pubTestRoot,
+    previewSource: plazaSynthMp4,
+    previewDurationSec: 2,
   })
   if (!plazaPubRes.ok || !existsSync(plazaPubRes.motionMdPath)) {
     throw new Error('v0.5.0 CinePulse Hub publish template failed!')
+  }
+  const pubPreviewFile = join(pubTestRoot, 'self-test-promo-tpl', 'preview.mp4')
+  if (!plazaPubRes.hasPreview || plazaPubRes.template?.previewFile !== 'preview.mp4' || !existsSync(pubPreviewFile)) {
+    throw new Error(`v0.5.4 plaza publish did not cut a playable sample clip: ${plazaPubRes.previewNote || ''}`)
+  }
+  if (readFileSync(pubPreviewFile).toString('latin1').includes('secret-project')) {
+    throw new Error('v0.5.4 plaza sample clip leaked source metadata (local path)!')
+  }
+
+  // Every built-in template ships a playable sample clip, streamed with HTTP Range (seekable progress bar)
+  const builtinWithPreview = plazaList.templates.filter((t) => t.source === 'builtin' && t.hasPreview && t.previewUrl)
+  if (builtinWithPreview.length < 5) {
+    throw new Error(`v0.5.4 影核广场 built-in templates without sample clip: ${plazaList.templates.filter((t) => !t.hasPreview).map((t) => t.id).join(', ')}`)
+  }
+  if (plazaList.templates.some((t) => t.previewAbsPath || t.dirPath || t.coverAbsPath)) {
+    throw new Error('v0.5.4 plaza listing leaks local absolute paths!')
+  }
+  const previewRangeRes = await handleWorkbenchApiRequest(
+    new Request(`http://127.0.0.1:4399${builtinWithPreview[0].previewUrl}`, { headers: { Range: 'bytes=0-1023' } }),
+  )
+  const previewRangeBody = Buffer.from(await previewRangeRes.arrayBuffer())
+  if (
+    previewRangeRes.status !== 206 ||
+    !/^bytes 0-1023\/\d+$/.test(previewRangeRes.headers.get('content-range') || '') ||
+    !/video\/mp4/.test(previewRangeRes.headers.get('content-type') || '') ||
+    previewRangeBody.length !== 1024
+  ) {
+    throw new Error(`v0.5.4 plaza preview route is not a seekable Range stream (status ${previewRangeRes.status})`)
+  }
+  const previewTraversal = await handleWorkbenchApiRequest(
+    new Request(`http://127.0.0.1:4399/api/video-workbench/plaza/preview?id=${encodeURIComponent('../../packages')}`),
+  )
+  if (previewTraversal.status !== 404) {
+    throw new Error(`v0.5.4 plaza preview route must refuse path traversal (status ${previewTraversal.status})`)
   }
   rmSync(plazaApplyDir, { recursive: true, force: true })
   rmSync(pubTestRoot, { recursive: true, force: true })
 
   // Verify silent windowless launchers & UI features exist
   const clientV050 = readFileSync(join(REPO_ROOT, 'packages', 'dsh-web-video-workbench', 'lib', 'client.js'), 'utf8')
+  const kitV050 = readFileSync(join(REPO_ROOT, 'packages', 'dsh-web-video-workbench', 'lib', 'warroom', 'kit.js'), 'utf8')
   const runnerV050 = readFileSync(join(REPO_ROOT, 'scripts', 'dsh-runner.mjs'), 'utf8')
   if (
     !existsSync(join(REPO_ROOT, 'start-workbench.vbs')) ||
@@ -2767,9 +2905,12 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
     !runnerV050.includes('isDaemonLauncher') ||
     !runnerV050.includes('windowsHide: true') ||
     !clientV050.includes('影核广场') ||
-    !clientV050.includes('左右分屏对比参考视频') ||
-    !clientV050.includes('多轨时间轴微调') ||
-    !clientV050.includes('可选云端 AI 生图 / 生视频 / 音乐与音频中心')
+    !/plaza\/apply/.test(kitV050) ||
+    !/plaza\/publish/.test(kitV050) ||
+    !/reference\/video/.test(kitV050) ||
+    !/reference\/upload/.test(kitV050) ||
+    !/scene-overrides\/batch/.test(kitV050) ||
+    !/cloud-media\/generate/.test(kitV050)
   ) {
     throw new Error('v0.5.0 silent daemon launcher or UI plaza/compare/timeline/cloud controls missing!')
   }
@@ -2782,8 +2923,392 @@ export const BATCH_01_SCENES: Record<string, React.FC<CustomSceneProps>> = {
     throw new Error(`v0.5.0 expected >= 32 MCP tools with cloud & plaza tools (got ${mcpToolNames.length})`)
   }
   console.log(
-    `[24/24] v0.5.0 影核广场 · CinePulse Hub (${plazaList.templates.length} templates + apply/publish) + Silent Windowless Daemon + Reference Compare + 4-Track Timeline + ${mcpToolNames.length} MCP Tools Verified!`,
+    `[24/25] v0.5.0 影核广场 · CinePulse Hub (${plazaList.templates.length} templates + apply/publish) + Silent Windowless Daemon + Reference Compare + 4-Track Timeline + ${mcpToolNames.length} MCP Tools Verified!`,
   )
+
+  // =========================================================================
+  // 25. v0.5.1 Combat SFX + Keyframe Camera VFX + Multi-Color Subtitles +
+  //     MiniMax Music 3 + AI Prompt Assist + Staging Preview + Cloud TTS + Topbar/Skin Cleanup
+  // =========================================================================
+  const {
+    assistCloudMediaPrompt,
+    listStagedCloudAssets,
+    commitStagedCloudAsset,
+    discardStagedCloudAsset,
+  } = await import('../packages/dsh-tool-media/cloud-media.js')
+  const { loadTtsConfig, saveTtsConfig, getSafeTtsConfigSummary } = await import('../packages/dsh-tool-local-tts/tts-config.js')
+
+  // 25a. Cold-weapon combat SFX synthesis + zero chime sanitization in history-theater
+  for (const combatSfx of ['metal_clash', 'blade_whoosh', 'war_drum', 'heavy_impact', 'horse_gallop', 'arrow_zip']) {
+    const buf = synthSfxV050(combatSfx)
+    if (!buf?.L?.length || !buf?.R?.length) throw new Error(`v0.5.1 combat DSP primitive failed: ${combatSfx}`)
+  }
+  const sanitizedHist = resolveAdaptiveAudioProfile({
+    genre: 'history-theater',
+    audioProfile: { sfxPalette: { opener: ['shimmer_swell'], internal: ['chime', 'sparkle'] } },
+  })
+  const allHistSfx = Object.values(sanitizedHist.sfxPalette || {}).flat()
+  if (
+    allHistSfx.some((k) => ['chime', 'shimmer_swell', 'sparkle'].includes(k)) ||
+    !allHistSfx.includes('metal_clash') ||
+    sanitizedHist.targetLufs > -9.5 ||
+    sanitizedHist.targetLufs < -11.5
+  ) {
+    throw new Error(`v0.5.1 history-theater combat SFX sanitization or targetLufs failed: ${JSON.stringify(sanitizedHist)}`)
+  }
+  const combatChoreo = choreoV050(
+    [
+      { id: 'scene-01', title: '拔剑破阵斩匈奴', narration: '十八岁率八百铁骑斩杀单于', startSec: 0, durationSec: 3.0, transition: 'slash-wipe' },
+    ],
+    { beats: [{ time: 0, strong: true }, { time: 0.67, strong: false }, { time: 1.33, strong: true }, { time: 2.0, strong: true }], drops: [{ time: 1.33 }] },
+    { genre: 'history-theater' },
+  )
+  const combatTypes = combatChoreo.flatMap((s) => (s.sfxCues || []).map((c) => c.type))
+  if (!combatTypes.includes('metal_clash') || combatTypes.includes('chime') || combatTypes.includes('shimmer_swell')) {
+    throw new Error(`v0.5.1 combat choreography expected metal_clash & zero chimes, got: ${combatTypes.join(',')}`)
+  }
+
+  // 25b. Remotion & HTML5 keyframe camera VFX + multi-color large subtitles
+  const remGenSrcV051 = readFileSync(join(REPO_ROOT, 'packages', 'dsh-tool-media', 'remotion-generator.js'), 'utf8')
+  const htmlGenSrcV051 = readFileSync(join(REPO_ROOT, 'packages', 'dsh-tool-media', 'html-generator.js'), 'utf8')
+  if (
+    !remGenSrcV051.includes('evaluateSceneCameraRig') ||
+    !remGenSrcV051.includes('#FF3B30') ||
+    !remGenSrcV051.includes('#FFD84D') ||
+    !htmlGenSrcV051.includes('fx-strobe') ||
+    !htmlGenSrcV051.includes('#FF3B30')
+  ) {
+    throw new Error('v0.5.1 Remotion/HTML5 camera keyframes or multi-color subtitle markers missing!')
+  }
+
+  // 25c. MiniMax Music 3 preset + AI Prompt Assist (audio/image/video) + Staging Preview isolation
+  const mmMusicPreset = CLOUD_MEDIA_PRESETS.audio.find((p) => p.id === 'minimax-music')
+  if (!mmMusicPreset || mmMusicPreset.defaultModel !== 'music-3.0') {
+    throw new Error(`v0.5.1 expected MiniMax Music 3 defaultModel=music-3.0, got ${mmMusicPreset?.defaultModel}`)
+  }
+  for (const cat of ['audio', 'image', 'video']) {
+    const assistRes = await assistCloudMediaPrompt({
+      category: cat,
+      topic: '霍去病封狼居胥',
+      style: 'cinematic',
+      callLlmChatFn: async () => ({
+        model: 'mock-llm',
+        text: JSON.stringify({
+          prompt: `专业 ${cat} 提示词：大漠黄昏逆光铁骑冲锋`,
+          lyrics: cat === 'audio' ? '[Chorus]\n封狼居胥铁骑长驱' : '',
+          tags: 'epic, war drums',
+          title: '封狼居胥',
+        }),
+      }),
+    })
+    if (!assistRes.ok || !assistRes.prompt.includes(cat)) {
+      throw new Error(`v0.5.1 assistCloudMediaPrompt failed for ${cat}`)
+    }
+  }
+
+  const stageTmpDir = join(REPO_ROOT, '.tmp', 'v051-staging-test')
+  rmSync(stageTmpDir, { recursive: true, force: true })
+  mkdirSync(stageTmpDir, { recursive: true })
+  writeScriptJson(stageTmpDir, { title: '暂存验收测试', engine: 'remotion', scenes: [{ id: 'scene-01', title: 'S1', durationSec: 3 }] })
+  const fakePngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+  const stagedImg = await generateCloudMediaAsset({
+    projectDir: stageTmpDir,
+    category: 'image',
+    prompt: '铁骑剪影海报',
+    stageOnly: true,
+    providerOverride: { providerId: 'openai-image', protocol: 'openai-image', baseUrl: 'https://mock.img.local/v1', endpoint: '/images/generations', model: 'gpt-image-1', apiKey: 'sk-mock' },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      text: async () => JSON.stringify({ data: [{ b64_json: fakePngB64 }] }),
+    }),
+  })
+  const beforeCommitAssets = readAssets(stageTmpDir).items || []
+  const stagedList = listStagedCloudAssets(stageTmpDir)
+  if (!stagedImg.ok || !stagedImg.staged || beforeCommitAssets.length !== 0 || stagedList.length !== 1) {
+    throw new Error(`v0.5.1 staging isolation failed: assets=${beforeCommitAssets.length}, staged=${stagedList.length}`)
+  }
+  const committed = await commitStagedCloudAsset({
+    projectDir: stageTmpDir,
+    stagingId: stagedImg.stagingItem.stagingId,
+    sceneId: 'scene-01',
+  })
+  const afterCommitAssets = readAssets(stageTmpDir).items || []
+  const afterCommitStaged = listStagedCloudAssets(stageTmpDir)
+  if (!committed.ok || afterCommitAssets.length !== 1 || afterCommitStaged.length !== 0) {
+    throw new Error(`v0.5.1 staging commit failed: assets=${afterCommitAssets.length}, staged=${afterCommitStaged.length}`)
+  }
+  const stagedToDiscard = await generateCloudMediaAsset({
+    projectDir: stageTmpDir,
+    category: 'image',
+    prompt: '待丢弃草图',
+    stageOnly: true,
+    providerOverride: { providerId: 'openai-image', protocol: 'openai-image', baseUrl: 'https://mock.img.local/v1', endpoint: '/images/generations', model: 'gpt-image-1', apiKey: 'sk-mock' },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      text: async () => JSON.stringify({ data: [{ b64_json: fakePngB64 }] }),
+    }),
+  })
+  discardStagedCloudAsset({ projectDir: stageTmpDir, stagingId: stagedToDiscard.stagingItem.stagingId })
+  if (listStagedCloudAssets(stageTmpDir).length !== 0) {
+    throw new Error('v0.5.1 staging discard failed!')
+  }
+  rmSync(stageTmpDir, { recursive: true, force: true })
+
+  // 25d. Cloud TTS built-in engines (minimax-tts + doubao-tts) secret masking
+  const ttsTmpRepo = join(REPO_ROOT, '.tmp', 'v051-cloud-tts-cfg')
+  rmSync(ttsTmpRepo, { recursive: true, force: true })
+  mkdirSync(ttsTmpRepo, { recursive: true })
+  saveTtsConfig(
+    {
+      builtins: {
+        'minimax-tts': { model: 'speech-2.6-hd', apiKey: 'mm-secret-test-9999', voiceId: 'male-qn-qingse' },
+        'doubao-tts': { appId: 'app-12345', token: 'db-secret-tok-8888', cluster: 'volcano_tts', voiceType: 'zh_male_test' },
+      },
+    },
+    ttsTmpRepo,
+  )
+  const ttsSafeSummary = getSafeTtsConfigSummary(ttsTmpRepo)
+  const ttsSafeStr = JSON.stringify(ttsSafeSummary)
+  const mmEng = ttsSafeSummary.engines.find((e) => e.id === 'minimax-tts')
+  const dbEng = ttsSafeSummary.engines.find((e) => e.id === 'doubao-tts')
+  if (
+    !mmEng || !dbEng || !mmEng.hasApiKey || !dbEng.hasToken ||
+    ttsSafeStr.includes('mm-secret-test-9999') || ttsSafeStr.includes('db-secret-tok-8888')
+  ) {
+    throw new Error('v0.5.1 Cloud TTS (minimax-tts / doubao-tts) config or secret masking failed!')
+  }
+  rmSync(ttsTmpRepo, { recursive: true, force: true })
+
+  // 25e. Frontend UI (native war-room panels): AI engine settings + AI prompt assist + staging review + no legacy skins
+  if (
+    !/PK\.panel\(\s*['"]keys['"]/.test(kitV050) ||
+    !/llm-test/.test(kitV050) ||
+    !/tts-test/.test(kitV050) ||
+    !/cloud-media\/assist-prompt/.test(kitV050) ||
+    !/confirmStaging/.test(kitV050) ||
+    !/discardStaging/.test(kitV050) ||
+    !clientV050.includes('minimax-tts') ||
+    !clientV050.includes('doubao-tts') ||
+    clientV050.includes('SKIN_PRESETS') ||
+    clientV050.includes('showSkinModal')
+  ) {
+    throw new Error('v0.5.1 Frontend UI verification failed (AI Hub / Prompt Assist / Staging Preview / Skin cleanup)!')
+  }
+  console.log(
+    '[25/25] v0.5.1 Combat SFX + Keyframe Camera VFX + Multi-Color Subtitles + MiniMax Music 3 + AI Prompt Assist + Staging Preview + Cloud TTS (MiniMax/Doubao) + Unified AI Hub & Topbar Fix Verified!',
+  )
+  console.log('======================================================================')
+
+  // =========================================================================
+  // 26. v0.5.2 Picture-Driven, Beat-Locked Combat Choreography
+  //     (sound follows what the shot shows, every hit on the measured grid, events shared with the VFX)
+  // =========================================================================
+  {
+    const { choreographBeatSfxCues: choreo052, classifySceneActionMode, explainSceneActionMode, createMusicalGrid } = await import('../packages/dsh-tool-media/beat-analyzer.js')
+    const { analyzeBeatsFromSamples, BT_SR } = await import('../packages/dsh-tool-media/beat-tracker-core.js')
+    const bpm052 = 90
+    const step052 = 60 / bpm052
+    const beats052 = Array.from({ length: 60 }, (_, i) => ({ time: Number((0.62 + i * step052).toFixed(4)), strong: i % 4 === 0, index: i }))
+    const fps052 = 30
+    const mk = (id, title, narration, startSec, durationSec, extra = {}) => ({
+      id, title, narration, startSec, durationSec,
+      durationInFrames: Math.round(durationSec * fps052), transition: 'glitch-cut', ...extra,
+    })
+    // a) Lines-only shots (no blueprint): narration evidence decides
+    const scenes052 = [
+      mk('s1', '平阳旧门', '你从平阳府的暗处走来', 0.62, 2.0 + 0.001),
+      mk('s2', '直撞敌阵', '你迎着敌阵纵马而入，短兵相接', 2.62, 2.67),
+      mk('s3', '八百轻骑', '你只带800轻骑向北', 5.29, 2.67),
+      mk('s4', '封狼居胥', '你在狼居胥封土祭天', 7.96, 2.67),
+    ]
+    const out052 = choreo052(scenes052, { beats: beats052, drops: [], bpm: bpm052 }, { genre: 'history-theater', fps: fps052, narrationMode: 'subtitle-mv' })
+    const allCues = out052.flatMap((s) => s.sfxCues.map((c) => ({ ...c, abs: s.startSec + c.offsetSec })))
+    const bad = allCues.filter((c) => ['chime', 'sparkle', 'shimmer_swell', 'pop_soft', 'tick', 'suck', 'riser', 'swoosh', 'glitch'].includes(c.type))
+    const clashes = allCues.filter((c) => c.type.startsWith('metal_clash'))
+    const grid = (t) => Math.min(...beats052.flatMap((b) => [Math.abs(t - b.time), Math.abs(t - (b.time + step052 / 2)), Math.abs(t - (b.time + step052 / 4)), Math.abs(t - (b.time + (3 * step052) / 4))]))
+    const offGrid = clashes.filter((c) => grid(c.abs) > 0.004)
+    const gallop = allCues.find((c) => c.type === 'horse_gallop')
+    if (
+      bad.length > 0 ||
+      out052[0].actionMode !== 'clean' || out052[0].sfxCues.length !== 0 ||
+      out052[1].actionMode !== 'clash-flurry' || clashes.length < 5 || offGrid.length > 0 ||
+      out052[2].actionMode !== 'cavalry' || !gallop || Math.abs(gallop.leadSec - step052 / 4) > 0.002 || grid(gallop.abs) > 0.004 ||
+      out052[3].actionMode !== 'clean' || out052[3].sfxCues.length !== 0 ||
+      out052.some((s) => s.transition === 'glitch-cut' || s.transition === 'iris-circle') ||
+      !out052[1].actionEvents.some((e) => e.role === 'clash' && e.killStep >= 5) ||
+      classifySceneActionMode({ title: '长眠', narration: '你长眠在茂陵的风里' }, { genreKey: 'history-theater' }) !== 'clean'
+    ) {
+      throw new Error(`v0.5.2 beat-locked choreography failed: bad=${bad.map((b) => b.type)} clashes=${clashes.length} offGrid=${offGrid.length} modes=${out052.map((s) => s.actionMode)}`)
+    }
+    // b) The blueprint (what the coder draws) outranks poetic titles; negations silence a shot
+    const bp = (title, narration, visualBlueprint, archetype = 'hero-stand', actionMode) => ({ title, narration, visualBlueprint, stageSpec: { archetype }, actionMode })
+    const cases = [
+      [bp('敌阵失色', '你让敌阵顷刻失色', '反打敌军骑手剪影，战马侧身急转，前景旗杆斜倒但不表现兵刃接触。摄影机快速后撤，保持这一镜无额外金属声。', 'duel-confront', 'single-clash'), 'clean'],
+      [bp('2028级首功', '你以2028级首功震朝野', '镜头转到军功竹简，2028以暖金大字悬于简牍上方。数字一次显现，不做击杀计数或把全军战果表现成个人斩杀。', 'hero-numeral', 'clash-flurry'), 'clean'],
+      [bp('撕开敌阵', '你把敌阵撕成两半', '高俯视下汉骑楔形从中央穿透。这一镜展示骑流突破而非兵刃接触，因此不用金属连击。', 'cavalry-rush', 'clash-flurry'), 'cavalry'],
+      [bp('两军对冲', '你与万骑迎面相撞', '左右骑群在低机位对称逼近。镜头推入即将接触的矛尖之间，第4拍末只到交锋前一瞬，将真正撞击留给下一镜drop。', 'duel-confront', 'clash-flurry'), 'cavalry'],
+      [bp('撞开锋线', '你让长矛撞开锋线', '两根长矛在前景相撞并弯出张力。一次低金属撞击绑定接触帧，禁止叠成无来源连打。', 'slash-climax', 'clash-flurry'), 'single-clash'],
+      [bp('汉旗穿阵', '你让汉旗穿过敌阵', '前景两组骑手兵刃交错，后景敌阵被骑流切开。四次可见格挡安排在半拍位置，金属声只绑定对应武器碰撞。', 'slash-climax', 'clash-flurry'), 'clash-flurry'],
+      [bp('饮马瀚海', '你把马蹄带到瀚海', '低位水岸映出深蓝天空，战马低头触水，主将牵缰站在右侧；水波由马鼻接触处真实扩散。', 'hero-stand', 'cavalry'), 'clean'],
+      [bp('矛指敌营', '你先向敌营亮出长矛', '少年在沙脊抬矛，摄影机沿矛杆推向矛尖；最后一拍汉骑前倾待发，不提前添加接战声。', 'duel-confront', 'single-clash'), 'clean'],
+    ]
+    const wrong = cases.filter(([sc, want]) => explainSceneActionMode(sc, { genreKey: 'history-theater', idx: 3 }).mode !== want)
+    if (wrong.length) {
+      throw new Error(`v0.5.2 blueprint-driven action classification wrong: ${wrong.map(([sc, want]) => `${sc.title}→${explainSceneActionMode(sc, { genreKey: 'history-theater', idx: 3 }).mode} (want ${want})`).join('; ')}`)
+    }
+    // c) Explicit counts / beat addresses: "四次可见格挡" → 4 parries; impactBeats from the director are honoured
+    const parry = choreo052(
+      [mk('p1', '汉旗穿阵', '你让汉旗穿过敌阵', 2.62, 2.67, { visualBlueprint: cases[5][0].visualBlueprint, stageSpec: { archetype: 'slash-climax' }, transition: 'flash-cut' })],
+      { beats: beats052, bpm: bpm052 },
+      { genre: 'history-theater', fps: fps052 },
+    )[0]
+    const planned = choreo052(
+      [mk('q1', '短兵相接', '你冲在最前面', 2.62, 2.67, { visualBlueprint: '主将长矛连续格开三柄来刃并反手劈落，火星随每次兵刃交击迸出。', impactBeats: [0, 1, 1.5, 3.5], transition: 'flash-cut' })],
+      { beats: beats052, bpm: bpm052 },
+      { genre: 'history-theater', fps: fps052 },
+    )[0]
+    const parryHits = parry.sfxCues.filter((c) => c.type.startsWith('metal_clash')).length
+    const plannedHits = planned.sfxCues.filter((c) => c.type.startsWith('metal_clash')).map((c) => Number(((c.offsetSec) / step052).toFixed(2)))
+    if (parryHits !== 4 || JSON.stringify(plannedHits) !== JSON.stringify([0, 1, 1.5, 3.5]) || !planned.sfxCues.some((c) => c.type === 'metal_clash_heavy')) {
+      throw new Error(`v0.5.2 explicit contact count / impactBeats not honoured: parry=${parryHits} planned=${JSON.stringify(plannedHits)}`)
+    }
+    // d) Hits snap onto the music's own transient (onsets) within ±22 ms, never further
+    const gridSnap = createMusicalGrid({ beats: beats052, bpm: bpm052, onsets: [{ time: 3.2985, strength: 0.8 }, { time: 3.9, strength: 0.9 }] })
+    if (Math.abs(gridSnap.snap(gridSnap.timeAt(4)) - 3.2985) > 1e-6 || Math.abs(gridSnap.snap(3.62) - 3.62) > 1e-6) {
+      throw new Error('v0.5.2 onset snapping out of tolerance')
+    }
+    // e) Tracker precision on a synthetic 90 BPM groove (kick on beats, hats on the "and"): ≤ 6 ms drift end-to-end
+    const sr = BT_SR
+    const dur = 60
+    const pcm = new Float32Array(Math.floor(dur * sr))
+    const truePhase = 0.437
+    for (let k = 0; ; k++) {
+      const t0 = truePhase + k * step052
+      if (t0 > dur - 0.5) break
+      for (let i = 0; i < 0.22 * sr; i++) {
+        const idx = Math.round(t0 * sr) + i
+        if (idx >= pcm.length) break
+        const tt = i / sr
+        pcm[idx] += (k % 4 === 0 ? 0.9 : 0.6) * Math.sin(2 * Math.PI * (50 + 90 * Math.exp(-tt * 40)) * tt) * Math.exp(-tt * 9)
+      }
+      const th = t0 + step052 / 2
+      for (let i = 0; i < 0.05 * sr; i++) {
+        const idx = Math.round(th * sr) + i
+        if (idx >= pcm.length) break
+        pcm[idx] += Math.sin(i * 1.7) * Math.sin(i * 0.37) * 0.25 * Math.exp(-i / (0.01 * sr))
+      }
+    }
+    const tr = analyzeBeatsFromSamples(pcm)
+    const lastTrue = truePhase + Math.floor((dur - 0.5 - truePhase) / step052) * step052
+    const lastTracked = tr.beats.reduce((best, b) => (Math.abs(b.time - lastTrue) < Math.abs(best - lastTrue) ? b.time : best), -1)
+    if (Math.abs(tr.bpm - 90) > 0.05 || Math.abs(tr.phaseSec - truePhase) > 0.006 || Math.abs(lastTracked - lastTrue) > 0.006) {
+      throw new Error(`v0.5.2 beat tracker precision regression: bpm=${tr.bpm} phase=${tr.phaseSec} lastErr=${((lastTracked - lastTrue) * 1000).toFixed(1)}ms`)
+    }
+    // f) Crisp steel, tempo-locked hooves, beat-locked transition sweep
+    const dspSteel = synthSfxV050('metal_clash_hi')
+    let peak052 = 0
+    for (const v of dspSteel.L) peak052 = Math.max(peak052, Math.abs(v))
+    const gallopBuf = synthSfxV050('horse_gallop', { d: step052, durationMs: 4 * step052 * 1000 })
+    const sweepBuf = synthSfxV050('slash_sweep')
+    if (!dspSteel.L.length || dspSteel.L.length > 0.4 * 48000 || peak052 < 0.5 || gallopBuf.L.length < 4 * step052 * 48000 || !sweepBuf.L.length) {
+      throw new Error('v0.5.2 combat DSP variants invalid (steel too long / silent, gallop or sweep missing)')
+    }
+    console.log(`[26/26] v0.5.2 Picture-Driven Beat-Locked Choreography OK (blueprint negations honoured, ${clashes.length} melee clashes on the exact half/quarter grid, 4 counted parries, director impactBeats kept, tracker ${tr.bpm} BPM / phase err ${((tr.phaseSec - truePhase) * 1000).toFixed(1)} ms, tempo-locked hooves + crisp steel)!`)
+  }
+
+  // 27. Vibecoding toolkit (8 tools): status, deterministic Remotion libs, SuperCollider safety gate + fallback
+  {
+    const vibe = await import('../packages/dsh-tool-media/vibe-toolkit-lib.js')
+    const scb = await import('../packages/dsh-tool-media/supercollider-bridge.js')
+    const coder = await import('../packages/dsh-tool-media/audio-coder.js')
+    const status = vibe.getVibeToolkitStatus()
+    const ids = status.map((t) => t.id).join(',')
+    if (ids !== 'threejs,animejs,tweenjs,ammojs,tsl-textures,supercollider,remotion,ffmpeg') {
+      throw new Error(`Vibecoding toolkit must list the 8 tools in order, got: ${ids}`)
+    }
+    const missing = status.filter((t) => !t.optional && !t.available).map((t) => t.name)
+    if (missing.length) {
+      throw new Error(`Vibecoding toolkit dependencies missing: ${missing.join(', ')} (run pnpm install)`)
+    }
+    const vibeProj = join(REPO_ROOT, '.tmp', 'e2e-vibe-toolkit')
+    rmSync(vibeProj, { recursive: true, force: true })
+    mkdirSync(vibeProj, { recursive: true })
+    const written = vibe.writeVibeToolkitRemotionLib(vibeProj)
+    for (const f of ['vibe-tween.tsx', 'vibe-anime.tsx', 'vibe-physics.tsx', 'vibe-tsl.tsx', 'vibe-modules.d.ts']) {
+      if (!existsSync(join(vibeProj, 'src', 'lib', f))) throw new Error(`Vibecoding lib not emitted: src/lib/${f}`)
+    }
+    if (!existsSync(join(vibeProj, 'public', 'ammo.wasm.js')) || !existsSync(join(vibeProj, 'public', 'ammo.wasm.wasm'))) {
+      throw new Error('Ammo.js runtime (ammo.wasm.js / ammo.wasm.wasm) was not staged into public/')
+    }
+    const tweenSrc = readFileSync(join(vibeProj, 'src', 'lib', 'vibe-tween.tsx'), 'utf8')
+    const animeSrc = readFileSync(join(vibeProj, 'src', 'lib', 'vibe-anime.tsx'), 'utf8')
+    if (!/createTimeline\(\s*\{[^}]*autoplay:\s*false/.test(animeSrc) || !/\.seek\(/.test(animeSrc) || !/tween\.module\.js/.test(tweenSrc)) {
+      throw new Error('Vibecoding libs must drive Anime.js / Tween.js from the Remotion frame (paused timeline + seek)')
+    }
+    // Anime.js v4 API contract used by vibe-anime.tsx (stagger(target, index, targets[]), easing factories)
+    const anime = await import('animejs')
+    const stag = anime.stagger(80, { from: 'center', total: 12 })(null, 3, Array.from({ length: 12 }), 0, null)
+    if (Number(stag) !== 200 || typeof anime.eases.outElastic(1, 0.6) !== 'function' || typeof anime.createTimeline !== 'function') {
+      throw new Error(`Anime.js API drifted (stagger=${stag}); update vibe-anime.tsx`)
+    }
+    const guide = vibe.buildVibeToolkitCoderGuide(status)
+    for (const mod of ["'../lib/vibe-tween'", "'../lib/vibe-anime'", "'../lib/vibe-physics'", "'../lib/vibe-tsl'"]) {
+      if (!guide.includes(mod)) throw new Error(`Coder guide does not document ${mod}`)
+    }
+    // AI tool matching: per-scene recommendations, director hints win, nothing mandatory, custom code allowed
+    const pick = vibe.selectVibeTools({
+      topic: '宇宙科普',
+      scenes: [
+        { id: 'a', title: '青铜行星', visualBlueprint: '青铜质感的行星缓慢自转' },
+        { id: 'b', title: '数据榜单', visualBlueprint: '柱状图依次弹出' },
+        { id: 'c', title: '落石', visualBlueprint: '碎石坠落散落一地' },
+        { id: 'd', title: '片尾', visualBlueprint: '淡出' },
+        { id: 'e', title: '提示', vibeTools: ['tweenjs', 'not-a-tool'] },
+      ],
+      status,
+    })
+    if (!pick.perScene.a?.includes('tsl-textures') || !pick.perScene.b?.includes('animejs') || !pick.perScene.c?.includes('ammojs') || pick.perScene.d || pick.perScene.e?.join(',') !== 'tweenjs') {
+      throw new Error(`Vibecoding tool matching wrong: ${JSON.stringify(pick.perScene)}`)
+    }
+    const pickedGuide = vibe.buildVibeToolkitCoderGuide(status, pick)
+    // tools are planned per shot (toolPlan.must is audited), yet custom code always stays allowed
+    if (!pickedGuide.includes('按镜头规划调用') || !pickedGuide.includes('toolPlan.must') || !pickedGuide.includes('自由编写') || !pickedGuide.includes('本批次计划用到的工具')) {
+      throw new Error('Coder guide must explain the per-shot tool plan and keep custom code allowed')
+    }
+    // 导演参数 → 视效偏好 is only a soft hint: every option keeps the tools optional and free code allowed
+    const prefAuto = vibe.buildVisualFxPreferenceGuide()
+    const prefOn = vibe.buildVisualFxPreferenceGuide('on')
+    const prefOff = vibe.buildVisualFxPreferenceGuide('off')
+    if (!prefAuto.includes('AI 按需自由创作') || !prefAuto.includes('直接写代码') || !prefOn.includes('自由编码') || !prefOff.includes('纯 2D') || !prefOff.includes('自由编写')) {
+      throw new Error('视效偏好 must stay a soft hint that keeps free coding allowed')
+    }
+    // SuperCollider: LLM-written NRT code must stay pure synthesis
+    if (scb.validateSuperColliderBody(scb.SC_SAMPLE_CLASH_BODY) !== null) throw new Error('SuperCollider sample score was rejected by the safety gate')
+    for (const bad of ['~score = []; "rm -rf ~".unixCmd;', '~score = []; File.open("x", "w");', '~score = []; Server.default.boot;', '~score = [[0, [\\b_write, 0, "x.wav"]]];', '~score = []; thisProcess.platform;']) {
+      if (!scb.validateSuperColliderBody(bad)) throw new Error(`SuperCollider safety gate let through: ${bad}`)
+    }
+    const scPrompt = coder.buildSuperColliderBgmSystemPrompt({ bpm: 90, durationSec: 24, mood: 'epic' })
+    if (!scPrompt.includes('~score') || !scPrompt.includes('BPM 90') || !scPrompt.includes("['/d_recv'")) {
+      throw new Error('SuperCollider BGM prompt is missing the NRT score contract')
+    }
+    const sc = scb.detectSuperCollider({ refresh: true })
+    let scNote = 'SuperCollider not installed → JS DSP fallback'
+    if (sc.available) {
+      const scWav = join(vibeProj, 'sc-clash.wav')
+      const scRes = await scb.renderSuperColliderNrt({ body: scb.SC_SAMPLE_CLASH_BODY, outWav: scWav, durationSec: 0.6 })
+      if (!scRes.ok || statSync(scWav).size < 1000) throw new Error(`SuperCollider NRT render failed: ${scRes.reason || ''} ${scRes.error || ''}`)
+      scNote = `SuperCollider ${sc.version || ''} NRT render OK`
+    } else {
+      const res = await scb.renderSuperColliderNrt({ body: scb.SC_SAMPLE_CLASH_BODY, outWav: join(vibeProj, 'sc.wav'), durationSec: 0.5 })
+      if (res.ok || res.reason !== 'not-installed') throw new Error('SuperCollider bridge must report not-installed so callers fall back to JS DSP')
+    }
+    rmSync(vibeProj, { recursive: true, force: true })
+    console.log(`[27/27] v0.5.3 Vibecoding Toolkit OK (${status.filter((t) => t.available).length}/8 ready: ${status.map((t) => `${t.name}${t.available ? '✓' : '·'}`).join(' ')}; ${scNote}; ${['tween', 'anime', 'physics', 'tsl'].filter((k) => written?.[k]).length} deterministic libs emitted, Ammo WASM ${written?.ammoReady ? 'staged' : 'missing'})!`)
+  }
   console.log('======================================================================')
 }
 

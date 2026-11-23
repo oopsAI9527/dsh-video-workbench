@@ -30,6 +30,8 @@ export function verifyCordisPluginMounting() {
   const registeredStaticModules = []
 
   const mockCtx = {
+    // not the real DSH host: lets the plugin tell DSH apart from MCP / standalone use
+    __dshVideoShim: true,
     tools: {
       register(def) {
         registeredTools.push({
@@ -82,248 +84,78 @@ export function verifyCordisPluginMounting() {
   }
 }
 
-async function main() {
-  loadEnv()
-  const rawArgs = process.argv.slice(2)
-  // Handle `pnpm.cmd dsh video ...` or `node dsh-runner.mjs video ...`
-  const args = rawArgs[0] === 'dsh' ? rawArgs.slice(1) : rawArgs
-  const profileName = args[0] && !args[0].startsWith('-') ? args[0] : 'video'
-  const flags = new Set(args.filter((a) => a.startsWith('-')))
+/** Standalone browser shell that boots React 18 + client.js (the war-room host) — shared with the UI e2e test. */
+// ---------------------------------------------------------------------------------------------------------------
+// Local-only API guard + safe forwarding (shared with scripts/tests/warroom-ui.e2e.mjs, so the acceptance test runs the
+// exact code the studio runs). Any web page the user visits can send requests to 127.0.0.1: browsers attach `Origin`
+// to every cross-origin POST (also `mode: 'no-cors'`) and `Sec-Fetch-Site` to every request, and DNS rebinding changes
+// `Host`. Only the studio's own pages may call the API; local tools that send neither header (CLI, tests, MCP helpers)
+// keep working.
+export const API_FORBIDDEN_MESSAGE = '仅允许工作台自己的页面调用本地接口（已拒绝来自其他网站的请求）'
+export const MAX_API_BODY_BYTES = 2 * 1024 * 1024 * 1024 // 2 GiB; larger files: import them by local path instead
 
-  const profileSetup = setupDshVideoProfile()
-  const projectsInfo = listVideoProjects()
-  const cordisMount = verifyCordisPluginMounting()
+/** '' when the request may use the local API, else the reason ('host' | 'origin' | 'site'). */
+export function apiRequestRejection(req, port) {
+  const host = String(req.headers.host || '').trim().toLowerCase()
+  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return 'host'
+  const origin = req.headers.origin
+  if (origin !== undefined && origin !== `http://127.0.0.1:${port}` && origin !== `http://localhost:${port}`) return 'origin'
+  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase()
+  if (site === 'cross-site' || site === 'same-site') return 'site'
+  return ''
+}
 
-  console.log('======================================================================')
-  console.log(`🎬 DeepSeek Harness Video Workbench — Profile: [${profileName}]`)
-  console.log('======================================================================')
-  console.log(`• Profile Config : ${profileSetup.profilePatchPath}`)
-  console.log(`• Desktop Mount  : ${profileSetup.desktopMounted ? `Mounted (${profileSetup.desktopPatchPath})` : 'Isolated (.dsh-home)'}`)
-  console.log(`• Registered Preset : ${cordisMount.presets.map((p) => `${p.name} (${p.id})`).join(', ')}`)
-  console.log(`• Registered Tools  : ${cordisMount.tools.join(', ')}`)
-  console.log(`• Registered Routes : ${cordisMount.routes.map((r) => r.path).join(', ')}`)
-  console.log(`• Active Projects   : ${projectsInfo.projects.map((p) => `${p.name} [${p.engine}]`).join(', ')}`)
+export function sendJson(res, status, body) {
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store')
+  res.end(JSON.stringify(body))
+}
 
-  if (flags.has('--dump-config')) {
-    const patchContent = readFileSync(profileSetup.profilePatchPath, 'utf8')
-    console.log('\n--- [cordis.patch.yml (profile: video)] ---')
-    console.log(patchContent.trim())
-    console.log('-------------------------------------------')
-    return
-  }
-
-  // Try probing DSH CLI if available and requested
-  const dshAppRoot = resolveEnvPath('DSH_APP_ROOT', '')
-  const dshCliCmd = dshAppRoot ? join(dshAppRoot, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd') : ''
-
-  if (flags.has('--dsh-native') && dshCliCmd && existsSync(dshCliCmd)) {
-    console.log(`\n🚀 Launching native DSH CLI with profile '${profileName}'...`)
-    const res = await runCommandRedirected(
-      'cmd.exe',
-      ['/d', '/s', '/c', `"${dshCliCmd}" --profile ${profileName} --version`],
-      {
-        env: { ...process.env, DSH_HOME: profileSetup.dshHome },
-        timeoutMs: 30_000,
-      },
-    )
-    console.log('DSH CLI Output:', (res.stdout || res.stderr).trim())
-  }
-
-  // Start HTTP Verification / Standalone Preview Server for `dsh-web-video-workbench`
-  const RUNNER_VERSION = 'v9'
-  const basePort = Number(process.env.DSH_VIDEO_PORT || 4399)
-  const daemonInfoPath = join(REPO_ROOT, '.tmp', 'workbench-daemon.json')
-  const daemonLogPath = join(REPO_ROOT, '.tmp', 'workbench-daemon.log')
-  const shouldStop = flags.has('--stop')
-  const shouldStatus = flags.has('--status')
-  const isDaemonLauncher = (flags.has('--daemon') || flags.has('--bg')) && !flags.has('--daemon-child')
-  const isDaemonChild = flags.has('--daemon-child')
-  const smokeMode = !isDaemonLauncher && !isDaemonChild && !shouldStop && !shouldStatus && (flags.has('--smoke') || flags.has('--verify') || !flags.has('--keep-alive'))
-  const shouldOpenBrowser = flags.has('--open')
-
-  const openBrowserSilently = (targetUrl) => {
-    try {
-      if (process.platform === 'win32') {
-        spawn('cmd.exe', ['/c', 'start', '', targetUrl], { detached: true, stdio: 'ignore', windowsHide: true }).unref()
-      } else if (process.platform === 'darwin') {
-        spawn('open', [targetUrl], { detached: true, stdio: 'ignore' }).unref()
-      } else {
-        spawn('xdg-open', [targetUrl], { detached: true, stdio: 'ignore' }).unref()
+/**
+ * Forward one `/api/video-workbench/*` request to the plugin router. Never rejects: an upload cut off by the user
+ * (closed tab, cancelled recording, network drop) used to reject the async listener and end the whole studio process
+ * together with every running render / TTS job.
+ */
+export async function forwardApiRequest(req, res, url, handler) {
+  try {
+    const chunks = []
+    let size = 0
+    for await (const chunk of req) {
+      size += chunk.length
+      if (size > MAX_API_BODY_BYTES) {
+        sendJson(res, 413, { ok: false, error: '上传内容超过 2 GB，请改用「从本地路径导入」' })
+        req.destroy()
+        return
       }
-    } catch {}
-  }
-
-  const probeExisting = async () => {
-    const ports = []
-    if (existsSync(daemonInfoPath)) {
-      try {
-        const saved = JSON.parse(readFileSync(daemonInfoPath, 'utf8'))
-        if (saved?.port) ports.push(Number(saved.port))
-      } catch {}
+      chunks.push(chunk)
     }
-    if (!ports.includes(basePort)) ports.push(basePort)
-    for (const p of ports) {
-      try {
-        const probeRes = await fetch(`http://127.0.0.1:${p}/api/video-workbench/runner-info`, {
-          signal: AbortSignal.timeout(1200),
-        })
-        if (probeRes.ok) {
-          const info = await probeRes.json()
-          if (info?.ok) return { port: p, info }
-        }
-      } catch {}
-    }
-    return null
-  }
-
-  if (shouldStatus) {
-    const existing = await probeExisting()
-    if (existing) {
-      console.log(`✅ 后台静默服务运行中: ${existing.info.url} (PID ${existing.info.pid} · ${existing.info.version})`)
-      console.log(`   日志文件: ${daemonLogPath}`)
-    } else {
-      console.log('⚪ 当前未检测到运行中的 DSH Video Workbench 后台服务。')
-    }
-    return
-  }
-
-  if (shouldStop) {
-    let stopped = false
-    const existing = await probeExisting()
-    if (existing) {
-      try {
-        const stopResp = await fetch(`http://127.0.0.1:${existing.port}/api/video-workbench/runner-stop`, {
-          method: 'POST',
-          signal: AbortSignal.timeout(2500),
-        })
-        if (stopResp.ok) stopped = true
-      } catch {}
-      if (!stopped && existing.info?.pid) {
-        try {
-          process.kill(Number(existing.info.pid))
-          stopped = true
-        } catch {}
-      }
-    }
-    if (existsSync(daemonInfoPath)) {
-      try {
-        const saved = JSON.parse(readFileSync(daemonInfoPath, 'utf8'))
-        if (!stopped && saved?.pid) {
-          try {
-            process.kill(Number(saved.pid))
-            stopped = true
-          } catch {}
-        }
-        unlinkSync(daemonInfoPath)
-      } catch {}
-    }
-    console.log(stopped ? '🛑 已安全停止 DSH Video Workbench 后台静默服务。' : '⚪ 未发现需要停止的后台服务。')
-    return
-  }
-
-  // Check if an existing runner is already active
-  if (!smokeMode && !isDaemonChild) {
-    const existing = await probeExisting()
-    if (existing && existing.info?.version === RUNNER_VERSION && existing.info?.repoRoot === REPO_ROOT) {
-      console.log(`\n✅ Active DSH Video Workbench (${RUNNER_VERSION}) already listening at: ${existing.info.url}`)
-      if (shouldOpenBrowser) openBrowserSilently(existing.info.url)
-      return
-    }
-  }
-
-  // Silent Windowless Daemon Launcher (hides Windows CMD window completely!)
-  if (isDaemonLauncher) {
-    mkdirSync(join(REPO_ROOT, '.tmp'), { recursive: true })
-    const logFd = openSync(daemonLogPath, 'a')
-    const selfPath = fileURLToPath(import.meta.url)
-    const childArgs = [selfPath, profileName, '--keep-alive', '--daemon-child']
-    const child = spawn(process.execPath, childArgs, {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DSH_VIDEO_PORT: String(basePort) },
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', logFd, logFd],
+    const webReq = new Request(url.href, {
+      method: req.method,
+      headers: req.headers,
+      body: ['GET', 'HEAD'].includes(req.method || 'GET') ? undefined : Buffer.concat(chunks),
     })
-    child.unref()
-    try { closeSync(logFd) } catch {}
-
-    // Poll until background HTTP server is ready (up to 15s)
-    let readyInfo = null
-    for (let attempt = 0; attempt < 50; attempt++) {
-      await new Promise((r) => setTimeout(r, 300))
-      const probed = await probeExisting()
-      if (probed?.info?.ok) {
-        readyInfo = probed.info
-        break
-      }
+    const webRes = await handler(webReq)
+    res.statusCode = webRes.status
+    webRes.headers.forEach((v, k) => res.setHeader(k, v))
+    res.end(Buffer.from(await webRes.arrayBuffer()))
+  } catch (err) {
+    const aborted = req.aborted || err?.code === 'ECONNRESET' || /aborted/i.test(String(err?.message || ''))
+    if (!aborted) console.error('[runner] API request failed:', url.pathname, err?.stack || err)
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        sendJson(res, aborted ? 400 : 500, { ok: false, error: aborted ? '请求在传输中被中断' : String(err?.message || err) })
+      } catch {}
+    } else {
+      try {
+        res.destroy()
+      } catch {}
     }
-    const finalUrl = readyInfo?.url || `http://127.0.0.1:${basePort}`
-    console.log(`✅ DSH Video Workbench 已转入后台静默运行（无黑窗）: ${finalUrl} (PID ${readyInfo?.pid || child.pid})`)
-    console.log(`   日志路径: ${daemonLogPath}`)
-    console.log('   停止服务: 运行 stop-workbench.cmd 或 `node ./bin/dsh-video-cli.mjs studio --stop`')
-    if (shouldOpenBrowser) openBrowserSilently(finalUrl)
-    return
   }
+}
 
-  let actualPort = basePort
-  const server = createServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort}`)
-    if (url.pathname === '/api/video-workbench/runner-info') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8')
-      res.setHeader('Cache-Control', 'no-store')
-      res.end(
-        JSON.stringify({
-          ok: true,
-          version: RUNNER_VERSION,
-          pid: process.pid,
-          port: actualPort,
-          url: `http://127.0.0.1:${actualPort}`,
-          repoRoot: REPO_ROOT,
-          daemonMode: isDaemonChild,
-          logPath: daemonLogPath,
-        }),
-      )
-      return
-    }
-    if (url.pathname === '/api/video-workbench/runner-stop' && req.method === 'POST') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8')
-      res.end(JSON.stringify({ ok: true, stopping: true, pid: process.pid }))
-      setTimeout(() => {
-        try { if (existsSync(daemonInfoPath)) unlinkSync(daemonInfoPath) } catch {}
-        try { server.close() } catch {}
-        process.exit(0)
-      }, 120)
-      return
-    }
-    if (url.pathname.startsWith('/api/video-workbench/')) {
-      const chunks = []
-      for await (const chunk of req) chunks.push(chunk)
-      const bodyBuf = Buffer.concat(chunks)
-      const webReq = new Request(url.href, {
-        method: req.method,
-        headers: req.headers,
-        body: ['GET', 'HEAD'].includes(req.method || 'GET') ? undefined : bodyBuf,
-      })
-      const webRes = await handleWorkbenchApiRequest(webReq)
-      res.statusCode = webRes.status
-      webRes.headers.forEach((v, k) => res.setHeader(k, v))
-      const arrayBuf = await webRes.arrayBuffer()
-      res.end(Buffer.from(arrayBuf))
-      return
-    }
-
-    if (url.pathname === '/client.js') {
-      const clientJsPath = join(REPO_ROOT, 'packages', 'dsh-web-video-workbench', 'lib', 'client.js')
-      res.setHeader('Content-Type', 'application/javascript; charset=utf-8')
-      res.setHeader('Cache-Control', 'no-store')
-      res.end(readFileSync(clientJsPath, 'utf8'))
-      return
-    }
-
-    // Serve standalone interactive preview shell hosting `dsh-web-video-workbench` (`client.js`)
-    res.setHeader('Content-Type', 'text/html; charset=utf-8')
-    res.setHeader('Cache-Control', 'no-store')
-    res.end(`<!DOCTYPE html>
+export function standaloneShellHtml(profileName = 'video') {
+  return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
@@ -436,7 +268,252 @@ async function main() {
     }
   </script>
 </body>
-</html>`)
+</html>`
+}
+
+async function main() {
+  loadEnv()
+  const rawArgs = process.argv.slice(2)
+  // Handle `pnpm.cmd dsh video ...` or `node dsh-runner.mjs video ...`
+  const args = rawArgs[0] === 'dsh' ? rawArgs.slice(1) : rawArgs
+  const profileName = args[0] && !args[0].startsWith('-') ? args[0] : 'video'
+  const flags = new Set(args.filter((a) => a.startsWith('-')))
+
+  const profileSetup = setupDshVideoProfile()
+  const projectsInfo = listVideoProjects()
+  const cordisMount = verifyCordisPluginMounting()
+
+  console.log('======================================================================')
+  console.log(`🎬 DeepSeek Harness Video Workbench — Profile: [${profileName}]`)
+  console.log('======================================================================')
+  console.log(`• Profile Config : ${profileSetup.profilePatchPath}`)
+  console.log(`• Desktop Mount  : ${profileSetup.skipped ? 'Unchanged (DSH_VIDEO_SKIP_PROFILE_MOUNT=1)' : profileSetup.desktopMounted ? `Mounted (${profileSetup.desktopPatchPath})` : 'Isolated (.dsh-home)'}`)
+  console.log(`• Registered Preset : ${cordisMount.presets.map((p) => `${p.name} (${p.id})`).join(', ')}`)
+  console.log(`• Registered Tools  : ${cordisMount.tools.join(', ')}`)
+  console.log(`• Registered Routes : ${cordisMount.routes.map((r) => r.path).join(', ')}`)
+  console.log(`• Active Projects   : ${projectsInfo.projects.map((p) => `${p.name} [${p.engine}]`).join(', ')}`)
+
+  if (flags.has('--dump-config')) {
+    const patchContent = readFileSync(profileSetup.profilePatchPath, 'utf8')
+    console.log('\n--- [cordis.patch.yml (profile: video)] ---')
+    console.log(patchContent.trim())
+    console.log('-------------------------------------------')
+    return
+  }
+
+  // Try probing DSH CLI if available and requested
+  const dshAppRoot = resolveEnvPath('DSH_APP_ROOT', '')
+  const dshCliCmd = dshAppRoot ? join(dshAppRoot, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd') : ''
+
+  if (flags.has('--dsh-native') && dshCliCmd && existsSync(dshCliCmd)) {
+    console.log(`\n🚀 Launching native DSH CLI with profile '${profileName}'...`)
+    const res = await runCommandRedirected(
+      'cmd.exe',
+      ['/d', '/s', '/c', `"${dshCliCmd}" --profile ${profileName} --version`],
+      {
+        env: { ...process.env, DSH_HOME: profileSetup.dshHome },
+        timeoutMs: 30_000,
+      },
+    )
+    console.log('DSH CLI Output:', (res.stdout || res.stderr).trim())
+  }
+
+  // Start HTTP Verification / Standalone Preview Server for `dsh-web-video-workbench`
+  const RUNNER_VERSION = 'v9'
+  const basePort = Number(process.env.DSH_VIDEO_PORT || 4399)
+  const daemonInfoPath = join(REPO_ROOT, '.tmp', 'workbench-daemon.json')
+  // DSH_VIDEO_RUNNER_ISOLATED=1 (tests, a second preview of the same checkout): never reuse the studio that is already
+  // running and never write / delete the shared daemon-info file, so the user's running studio is left alone
+  const isolatedRun = process.env.DSH_VIDEO_RUNNER_ISOLATED === '1'
+  const daemonLogPath = join(REPO_ROOT, '.tmp', 'workbench-daemon.log')
+  const shouldStop = flags.has('--stop')
+  const shouldStatus = flags.has('--status')
+  const isDaemonLauncher = (flags.has('--daemon') || flags.has('--bg')) && !flags.has('--daemon-child')
+  const isDaemonChild = flags.has('--daemon-child')
+  const smokeMode = !isDaemonLauncher && !isDaemonChild && !shouldStop && !shouldStatus && (flags.has('--smoke') || flags.has('--verify') || !flags.has('--keep-alive'))
+  const shouldOpenBrowser = flags.has('--open')
+
+  const openBrowserSilently = (targetUrl) => {
+    try {
+      if (process.platform === 'win32') {
+        spawn('cmd.exe', ['/c', 'start', '', targetUrl], { detached: true, stdio: 'ignore', windowsHide: true }).unref()
+      } else if (process.platform === 'darwin') {
+        spawn('open', [targetUrl], { detached: true, stdio: 'ignore' }).unref()
+      } else {
+        spawn('xdg-open', [targetUrl], { detached: true, stdio: 'ignore' }).unref()
+      }
+    } catch {}
+  }
+
+  const probeExisting = async () => {
+    const ports = []
+    if (existsSync(daemonInfoPath)) {
+      try {
+        const saved = JSON.parse(readFileSync(daemonInfoPath, 'utf8'))
+        if (saved?.port) ports.push(Number(saved.port))
+      } catch {}
+    }
+    if (!ports.includes(basePort)) ports.push(basePort)
+    for (const p of ports) {
+      try {
+        const probeRes = await fetch(`http://127.0.0.1:${p}/api/video-workbench/runner-info`, {
+          signal: AbortSignal.timeout(1200),
+        })
+        if (probeRes.ok) {
+          const info = await probeRes.json()
+          if (info?.ok) return { port: p, info }
+        }
+      } catch {}
+    }
+    return null
+  }
+
+  if (shouldStatus) {
+    const existing = await probeExisting()
+    if (existing) {
+      console.log(`✅ 后台静默服务运行中: ${existing.info.url} (PID ${existing.info.pid} · ${existing.info.version})`)
+      console.log(`   日志文件: ${daemonLogPath}`)
+    } else {
+      console.log('⚪ 当前未检测到运行中的 DSH Video Workbench 后台服务。')
+    }
+    return
+  }
+
+  if (shouldStop) {
+    let stopped = false
+    const existing = await probeExisting()
+    if (existing) {
+      try {
+        const stopResp = await fetch(`http://127.0.0.1:${existing.port}/api/video-workbench/runner-stop`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(2500),
+        })
+        if (stopResp.ok) stopped = true
+      } catch {}
+      if (!stopped && existing.info?.pid) {
+        try {
+          process.kill(Number(existing.info.pid))
+          stopped = true
+        } catch {}
+      }
+    }
+    if (existsSync(daemonInfoPath)) {
+      try {
+        const saved = JSON.parse(readFileSync(daemonInfoPath, 'utf8'))
+        if (!stopped && saved?.pid) {
+          try {
+            process.kill(Number(saved.pid))
+            stopped = true
+          } catch {}
+        }
+        unlinkSync(daemonInfoPath)
+      } catch {}
+    }
+    console.log(stopped ? '🛑 已安全停止 DSH Video Workbench 后台静默服务。' : '⚪ 未发现需要停止的后台服务。')
+    return
+  }
+
+  // Check if an existing runner is already active
+  if (!smokeMode && !isDaemonChild && !isolatedRun) {
+    const existing = await probeExisting()
+    if (existing && existing.info?.version === RUNNER_VERSION && existing.info?.repoRoot === REPO_ROOT) {
+      console.log(`\n✅ Active DSH Video Workbench (${RUNNER_VERSION}) already listening at: ${existing.info.url}`)
+      if (shouldOpenBrowser) openBrowserSilently(existing.info.url)
+      return
+    }
+  }
+
+  // Silent Windowless Daemon Launcher (hides Windows CMD window completely!)
+  if (isDaemonLauncher) {
+    mkdirSync(join(REPO_ROOT, '.tmp'), { recursive: true })
+    const logFd = openSync(daemonLogPath, 'a')
+    const selfPath = fileURLToPath(import.meta.url)
+    const childArgs = [selfPath, profileName, '--keep-alive', '--daemon-child']
+    const child = spawn(process.execPath, childArgs, {
+      cwd: REPO_ROOT,
+      env: { ...process.env, DSH_VIDEO_PORT: String(basePort) },
+      detached: true,
+      windowsHide: true,
+      stdio: ['ignore', logFd, logFd],
+    })
+    child.unref()
+    try { closeSync(logFd) } catch {}
+
+    // Poll until background HTTP server is ready (up to 15s)
+    let readyInfo = null
+    for (let attempt = 0; attempt < 50; attempt++) {
+      await new Promise((r) => setTimeout(r, 300))
+      const probed = await probeExisting()
+      if (probed?.info?.ok) {
+        readyInfo = probed.info
+        break
+      }
+    }
+    const finalUrl = readyInfo?.url || `http://127.0.0.1:${basePort}`
+    console.log(`✅ DSH Video Workbench 已转入后台静默运行（无黑窗）: ${finalUrl} (PID ${readyInfo?.pid || child.pid})`)
+    console.log(`   日志路径: ${daemonLogPath}`)
+    console.log('   停止服务: 运行 stop-workbench.cmd 或 `node ./bin/dsh-video-cli.mjs studio --stop`')
+    if (shouldOpenBrowser) openBrowserSilently(finalUrl)
+    return
+  }
+
+  // Last-resort safety net for the long-running studio: log a stray rejection instead of exiting mid-render
+  // (smoke / verify runs keep Node's default so a failure still fails the run).
+  if (!smokeMode) process.on('unhandledRejection', (reason) => console.error('[runner] unhandled rejection:', reason?.stack || reason))
+  let actualPort = basePort
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort}`)
+    if (url.pathname.startsWith('/api/')) {
+      const why = apiRequestRejection(req, actualPort)
+      if (why) {
+        sendJson(res, 403, { ok: false, error: API_FORBIDDEN_MESSAGE, reason: why })
+        return
+      }
+    }
+    if (url.pathname === '/api/video-workbench/runner-info') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-store')
+      res.end(
+        JSON.stringify({
+          ok: true,
+          version: RUNNER_VERSION,
+          pid: process.pid,
+          port: actualPort,
+          url: `http://127.0.0.1:${actualPort}`,
+          repoRoot: REPO_ROOT,
+          daemonMode: isDaemonChild,
+          logPath: daemonLogPath,
+        }),
+      )
+      return
+    }
+    if (url.pathname === '/api/video-workbench/runner-stop' && req.method === 'POST') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8')
+      res.end(JSON.stringify({ ok: true, stopping: true, pid: process.pid }))
+      setTimeout(() => {
+        try { if (!isolatedRun && existsSync(daemonInfoPath)) unlinkSync(daemonInfoPath) } catch {}
+        try { server.close() } catch {}
+        process.exit(0)
+      }, 120)
+      return
+    }
+    if (url.pathname.startsWith('/api/video-workbench/')) {
+      await forwardApiRequest(req, res, url, handleWorkbenchApiRequest)
+      return
+    }
+
+    if (url.pathname === '/client.js') {
+      const clientJsPath = join(REPO_ROOT, 'packages', 'dsh-web-video-workbench', 'lib', 'client.js')
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-store')
+      res.end(readFileSync(clientJsPath, 'utf8'))
+      return
+    }
+
+    // Serve standalone interactive preview shell hosting `dsh-web-video-workbench` (`client.js`)
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
+    res.end(standaloneShellHtml(profileName))
   })
   server.requestTimeout = 660_000
   server.headersTimeout = 660_000
@@ -480,6 +557,7 @@ async function main() {
     console.log('✅ `pnpm dsh video` startup & live verification completed with 0 errors.')
   } else {
     try {
+      if (isolatedRun) throw new Error('isolated run: no daemon-info file')
       mkdirSync(join(REPO_ROOT, '.tmp'), { recursive: true })
       writeFileSync(
         daemonInfoPath,
@@ -495,7 +573,7 @@ async function main() {
       )
     } catch {}
     const cleanupPid = () => {
-      try { if (existsSync(daemonInfoPath)) unlinkSync(daemonInfoPath) } catch {}
+      try { if (!isolatedRun && existsSync(daemonInfoPath)) unlinkSync(daemonInfoPath) } catch {}
       process.exit(0)
     }
     process.once('SIGINT', cleanupPid)

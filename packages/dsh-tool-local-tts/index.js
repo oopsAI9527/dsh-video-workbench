@@ -12,12 +12,14 @@ import {
   resolveEnvPath,
   resolvePackagePath,
   runCommandRedirected,
+  subChunksMatchNarration,
   toTtsText,
   writeScriptJson,
 } from '../shared/index.js'
 import {
   castVoicesWithLlm,
   cloneRecordedVoice,
+  deleteImportedVoice,
   ensureDefaultReferenceVoices,
   findBestAvailableWavVoice,
   getVoiceCatalog,
@@ -26,7 +28,7 @@ import {
   matchVoiceForScene,
   syncVoiceLibraryJson,
 } from './voice-manager.js'
-import { ensureTtsServer, getTtsServerHealth } from './tts-server-manager.js'
+import { ensureTtsServer, getTtsServerHealth, stopTtsServer } from './tts-server-manager.js'
 import {
   getTtsInstallerCatalog,
   installTtsEngine,
@@ -48,6 +50,7 @@ import {
 export {
   castVoicesWithLlm,
   cloneRecordedVoice,
+  deleteImportedVoice,
   ensureDefaultReferenceVoices,
   getVoiceCatalog,
   importVoicePack,
@@ -56,6 +59,7 @@ export {
   syncVoiceLibraryJson,
   ensureTtsServer,
   getTtsServerHealth,
+  stopTtsServer,
   getTtsInstallerCatalog,
   installTtsEngine,
   TTS_INSTALLER_PACKAGES,
@@ -212,7 +216,7 @@ async function synthesizeViaCustomHttpTts(spec, vars, absOutputPath) {
       if (typeof b64Field !== 'string' || !b64Field.trim()) {
         throw new Error(`未在 JSON 返回字段「${spec.responseAudioPath || 'audio'}」找到 base64 音频`)
       }
-      writeFileSync(tmpRawPath, Buffer.from(b64Field.replace(/^data:[^;]+;base64,/, ''), 'base64'))
+      writeFileSync(tmpRawPath, Buffer.from(b64Field.replace(/^data:.*?;base64,/, ''), 'base64'))
     }
   } else {
     writeFileSync(tmpRawPath, rawBuf)
@@ -248,6 +252,105 @@ async function synthesizeViaCustomCliTts(spec, vars, absOutputPath) {
     }
   }
   return { ok: true, provider: `${spec.id}-cli`, outputPath: absOutputPath }
+}
+
+async function synthesizeViaMinimaxCloudTts(spec, text, speed = 1.0, emotion = '平静', absOutputPath = '') {
+  const apiKey = String(spec.apiKey || process.env.MINIMAX_API_KEY || '').trim()
+  if (!apiKey) throw new Error('MiniMax Speech 云端配音未填写 API Key，请在「AI 引擎中心 -> 配音引擎」中配置。')
+  const endpoint = String(spec.endpoint || 'https://api.minimaxi.com/v1/t2a_v2').trim()
+  const model = String(spec.model || 'speech-2.6-hd').trim()
+  const voiceId = String(spec.voiceId || spec.voice || 'male-qn-qingse').trim()
+  const emoMap = { 高兴: 'happy', 激昂: 'happy', 伤心: 'sad', 严肃: 'angry', 悬念低沉: 'fearful', 平静: 'neutral' }
+  const emoVal = emoMap[emotion] || 'neutral'
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      text: String(text || ''),
+      stream: false,
+      voice_setting: {
+        voice_id: voiceId,
+        speed: Math.max(0.5, Math.min(2.0, Number(speed) || 1.0)),
+        vol: 1.0,
+        pitch: 0,
+        ...(emoVal !== 'neutral' ? { emotion: emoVal } : {}),
+      },
+      audio_setting: { sample_rate: 32000, bitrate: 128000, format: 'mp3', channel: 1 },
+    }),
+    signal: AbortSignal.timeout(120_000),
+  })
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok || (json?.base_resp?.status_code && json.base_resp.status_code !== 0)) {
+    throw new Error(`MiniMax Speech 合成失败: ${json?.base_resp?.status_msg || json?.error?.message || `HTTP ${res.status}`}`)
+  }
+  const rawAudio = json?.data?.audio || json?.data?.audio_url || ''
+  if (!rawAudio) throw new Error('MiniMax Speech 返回中未找到 audio 数据')
+  const tmpRaw = `${absOutputPath}.minimax.mp3`
+  if (/^https?:\/\//i.test(rawAudio)) {
+    const dl = await fetch(rawAudio, { signal: AbortSignal.timeout(90_000) })
+    if (!dl.ok) throw new Error(`下载 MiniMax 音频失败 HTTP ${dl.status}`)
+    writeFileSync(tmpRaw, Buffer.from(await dl.arrayBuffer()))
+  } else {
+    writeFileSync(tmpRaw, Buffer.from(String(rawAudio), 'hex'))
+  }
+  try {
+    await normalizeOutputToPcmWav(tmpRaw, absOutputPath)
+  } finally {
+    try { rmSync(tmpRaw, { force: true }) } catch {}
+  }
+  return { ok: true, provider: `minimax-tts (${model})`, outputPath: absOutputPath }
+}
+
+async function synthesizeViaDoubaoCloudTts(spec, text, speed = 1.0, absOutputPath = '') {
+  const appId = String(spec.appId || process.env.DOUBAO_TTS_APPID || '').trim()
+  const token = String(spec.token || process.env.DOUBAO_TTS_TOKEN || '').trim()
+  if (!appId || !token) {
+    throw new Error('火山方舟豆包语音 TTS 未填写 AppID 或 Token，请在「AI 引擎中心 -> 配音引擎」中配置。')
+  }
+  const endpoint = String(spec.endpoint || 'https://openspeech.bytedance.com/api/v1/tts').trim()
+  const cluster = String(spec.cluster || 'volcano_tts').trim()
+  const voiceType = String(spec.voiceType || spec.voice || 'zh_male_m392_conversation_wvae_bigtts').trim()
+  const reqId = `dsh-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer;${token}`,
+    },
+    body: JSON.stringify({
+      app: { appid: appId, token, cluster },
+      user: { uid: 'dsh-video-workbench' },
+      audio: {
+        voice_type: voiceType,
+        encoding: 'mp3',
+        speed_ratio: Math.max(0.8, Math.min(2.0, Number(speed) || 1.0)),
+        volume_ratio: 1.0,
+        pitch_ratio: 1.0,
+      },
+      request: {
+        reqid: reqId,
+        text: String(text || ''),
+        text_type: 'plain',
+        operation: 'query',
+      },
+    }),
+    signal: AbortSignal.timeout(120_000),
+  })
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok || (json?.code !== undefined && Number(json.code) !== 3000 && Number(json.code) !== 0)) {
+    throw new Error(`火山方舟豆包 TTS 合成失败: ${json?.message || json?.error || `code ${json?.code || res.status}`}`)
+  }
+  const b64 = String(json?.data || '').trim()
+  if (!b64) throw new Error('火山方舟豆包 TTS 未返回音频 base64 数据')
+  const tmpRaw = `${absOutputPath}.doubao.mp3`
+  writeFileSync(tmpRaw, Buffer.from(b64, 'base64'))
+  try {
+    await normalizeOutputToPcmWav(tmpRaw, absOutputPath)
+  } finally {
+    try { rmSync(tmpRaw, { force: true }) } catch {}
+  }
+  return { ok: true, provider: `doubao-tts (${voiceType})`, outputPath: absOutputPath }
 }
 
 async function synthesizeViaWindowsSapi(text, speed = 1.0, gender = 'neutral', absOutputPath = '') {
@@ -409,6 +512,10 @@ export async function executeGenerateSpeech(args = {}) {
 
   if (engineSpec.kind === 'windows-sapi') {
     providerInfo = await synthesizeViaWindowsSapi(spokenText, effectiveSpeed, effectiveVoice.gender || 'neutral', absOutputPath)
+  } else if (engineSpec.kind === 'minimax-tts') {
+    providerInfo = await synthesizeViaMinimaxCloudTts(engineSpec, spokenText, effectiveSpeed, emotion, absOutputPath)
+  } else if (engineSpec.kind === 'doubao-tts') {
+    providerInfo = await synthesizeViaDoubaoCloudTts(engineSpec, spokenText, effectiveSpeed, absOutputPath)
   } else if (engineSpec.kind === 'openai-tts' || engineSpec.kind === 'http-json' || engineSpec.kind === 'cli-command') {
     const customVars = {
       text: spokenText,
@@ -560,11 +667,13 @@ export async function executeGenerateSpeech(args = {}) {
           const tailSec = Number.isFinite(Number(scene.tailSec)) ? Number(scene.tailSec) : 0.65
           const sceneDurationSec = Number((leadSec + probe.durationSec + tailSec).toFixed(4))
           const cleanNarration = displayNarration
+          // Chunks cut from an older narration (the user edited the text since the last dub) are stale: re-derive the
+          // subtitle lines from the narration being dubbed, so the new words — not the old ones — reach the screen
           const subs = await alignSubtitlesToSpeechAudio({
             audioPath: absOutputPath,
             narration: cleanNarration,
             subtitleText: scene.subtitleText,
-            subChunks: scene.subChunks,
+            subChunks: subChunksMatchNarration(scene.subChunks, cleanNarration) ? scene.subChunks : null,
             leadSec,
             durationSec: probe.durationSec,
             fps: safeFps,

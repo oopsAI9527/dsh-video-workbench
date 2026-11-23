@@ -1,6 +1,10 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { buildGenreGuidance, detectGenre, resolveGenreSelection } from './genre-router.js'
+import { fileURLToPath } from 'node:url'
+import { buildGenreGuidance, detectGenre, isEpicCombatContext, isHistoricalContent, resolveGenreSelection } from './genre-router.js'
+import { buildVibeToolkitCoderGuide, buildVisualFxPreferenceGuide, getVibeToolkitStatus, selectVibeTools, writeVibeToolkitRemotionLib } from './vibe-toolkit-lib.js'
+import { buildFigureKitCoderGuide, inferFigureStyle, resolveFigureStyleNote } from './figure-kit.js'
+import { planSceneTools } from './scene-tool-plan.js'
 
 /**
  * Distilled Shotcraft Primitives & LLM Skills Prompt Builder
@@ -1284,6 +1288,96 @@ export function computeBeatPulse(absTimeSec: number, beats: any[] = []): { pulse
   return { pulse, strongPulse, isHitFrame }
 }
 
+export interface ActionContact {
+  frame: number
+  kind: string
+  intensity: number
+  killStep: number
+  heavy: boolean
+  pan: number
+  index: number
+}
+
+/**
+ * Visible weapon contacts of this shot. These frames are shared with the steel-clash sound, the screen
+ * flash, the camera shake and the kill counter (all locked to the BGM half-beat grid by the choreographer).
+ */
+export function getActionContacts(scene: any): ActionContact[] {
+  const raw: any[] = Array.isArray(scene?.actionEvents) ? scene.actionEvents : []
+  const out: ActionContact[] = []
+  for (const ev of raw) {
+    const kind = String(ev?.kind || '')
+    if (kind !== 'metal_clash' && kind !== 'metal_clash_hi' && kind !== 'metal_clash_heavy') continue
+    const frame = Number(ev?.frame)
+    if (!Number.isFinite(frame)) continue
+    out.push({
+      frame,
+      kind,
+      intensity: Number(ev?.intensity) || 0.9,
+      killStep: Number(ev?.killStep) || out.length + 1,
+      heavy: kind === 'metal_clash_heavy',
+      pan: Number(ev?.pan) || 0,
+      index: out.length,
+    })
+  }
+  return out.sort((a, b) => a.frame - b.frame)
+}
+
+/**
+ * Strike choreography: a weapon swing that reaches contact EXACTLY on each contact frame.
+ * - swing: 0 → 1 wind-up during the windupFrames before the next contact (1 = the blades meet)
+ * - recoil: 1 on the contact frame, decaying to 0 over recoverFrames
+ * - impact: sharp 1 → 0 envelope after a contact (sparks, glow, hit-stop)
+ * - side: alternates ±1 per contact (swap the strike direction every hit)
+ */
+export function computeStrikeSwing(
+  scene: any,
+  frame: number,
+  opts: { windupFrames?: number; recoverFrames?: number } = {},
+): {
+  swing: number
+  recoil: number
+  impact: number
+  contactIndex: number
+  killStep: number
+  nextContactFrame: number | null
+  lastContactFrame: number | null
+  isContactFrame: boolean
+  side: 1 | -1
+  heavy: boolean
+} {
+  const contacts = getActionContacts(scene)
+  const windup = Math.max(2, Math.round(opts.windupFrames ?? 6))
+  const recover = Math.max(2, Math.round(opts.recoverFrames ?? 8))
+  let last: ActionContact | null = null
+  let next: ActionContact | null = null
+  for (const c of contacts) {
+    if (c.frame <= frame) last = c
+    else {
+      next = c
+      break
+    }
+  }
+  const sinceLast = last ? frame - last.frame : Number.POSITIVE_INFINITY
+  const toNext = next ? next.frame - frame : Number.POSITIVE_INFINITY
+  const swing = sinceLast === 0 ? 1 : next && toNext <= windup ? Math.pow(1 - toNext / windup, 2) : 0
+  const recoil = sinceLast < recover ? Math.exp(-sinceLast * (3 / recover)) : 0
+  const impact = sinceLast < recover ? Math.exp(-sinceLast * 0.55) : 0
+  const contactIndex = last ? last.index : -1
+  return {
+    swing,
+    recoil,
+    impact,
+    contactIndex,
+    killStep: last ? last.killStep : 0,
+    nextContactFrame: next ? next.frame : null,
+    lastContactFrame: last ? last.frame : null,
+    isContactFrame: sinceLast === 0,
+    side: contactIndex % 2 === 0 ? 1 : -1,
+    heavy: Boolean(last && last.heavy && sinceLast < recover),
+  }
+}
+
 const TX_BLOCK_CELLS = Array.from({ length: 24 }, (_, idx) => ({
   col: idx % 6,
   row: Math.floor(idx / 6),
@@ -1297,6 +1391,8 @@ export interface SceneTransitionOverlayProps {
   accentColor?: string
   goldColor?: string
   bgColor?: string
+  /** false: skip the accent wash over the last 5 frames (the composition's photosensitivity budget dropped it) */
+  exitFlash?: boolean
 }
 
 export const SceneTransitionOverlay: React.FC<SceneTransitionOverlayProps> = ({
@@ -1306,6 +1402,7 @@ export const SceneTransitionOverlay: React.FC<SceneTransitionOverlayProps> = ({
   accentColor = '#38BDF8',
   goldColor = '#F59E0B',
   bgColor = '#070B16',
+  exitFlash: allowExitFlash = true,
 }) => {
   const { width, height } = useVideoConfig()
   const safeDur = Math.max(8, dur)
@@ -1315,7 +1412,7 @@ export const SceneTransitionOverlay: React.FC<SceneTransitionOverlayProps> = ({
   if (localFrame > inEnd && localFrame < outStart) return null
 
   const enterT = interpolate(localFrame, [0, inEnd], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp', easing: easeOutFast })
-  const exitFlash = localFrame >= outStart ? interpolate(localFrame, [outStart, safeDur], [0, 0.36], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }) : 0
+  const exitFlash = allowExitFlash && localFrame >= outStart ? interpolate(localFrame, [outStart, safeDur], [0, 0.36], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }) : 0
   const maxDim = Math.max(width, height)
 
   return (
@@ -3287,6 +3384,17 @@ export function writeShotcraftRemotionLib(projectDir) {
   mkdirSync(libDir, { recursive: true })
   const outPath = join(libDir, 'shotcraft.tsx')
   writeFileSync(outPath, SHOTCRAFT_TSX_SOURCE, 'utf8')
+  // the photosensitivity flash budget the composition schedules its full-screen flashes with — the same plain-JS
+  // module the HTML engine uses, copied verbatim (type checks off: it is untyped JavaScript)
+  writeFileSync(
+    join(libDir, 'flash-budget.ts'),
+    `// @ts-nocheck\n${readFileSync(fileURLToPath(new URL('./flash-budget.js', import.meta.url)), 'utf8')}`,
+    'utf8',
+  )
+  // Vibecoding toolkit libs (Tween.js / Anime.js / Ammo.js / TSL Textures) next to shotcraft, only for installed deps
+  try {
+    writeVibeToolkitRemotionLib(absDir)
+  } catch {}
   return outPath
 }
 
@@ -3336,7 +3444,7 @@ export function buildDirectorPromptPackage({
   const beatInfoText = bgmMeta?.analyzed
     ? `实测音乐节奏：BPM=${bgmMeta.bpm}，首拍偏移 phaseSec=${bgmMeta.phaseSec}s，单拍=${bgmMeta.beatSec}s，音乐总长=${bgmMeta.durationSec}s，高潮突降点 drops=${JSON.stringify((bgmMeta.drops || []).slice(0, 10))}。请让分镜数与每镜 beatCount（1/2/4/8 拍）贴合音乐起承转合！`
     : ''
-  const isHistoricalTheme = resolvedGenre === 'history-theater' || /历史|霸王|项羽|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(`${topic || ''} ${userPrompt || ''}`)
+  const isHistoricalTheme = resolvedGenre === 'history-theater' || isHistoricalContent(`${topic || ''} ${userPrompt || ''}`)
   const system = zeroVisualAssets
     ? `你是顶级全题材动态视觉导演兼音画卡点总监 (AI Dynamic Visual & Beat-Sync Director)，兼容代码动画、历史剧场、火柴人角色动画、真人口播包装、数字人、科普图解与任意自创题材。
 ${genreGuide}
@@ -3482,7 +3590,7 @@ export function buildRemotionCoderSkillsPrompt({
      不要受限于固定预设！请针对每个分镜的题旨与 \`motionNotes\` / \`visualBlueprint\`，使用 \`<FreeformThreeStage buildScene={(api) => { ... }} />\` 自由构建贴合主题的定制 3D 场景（利用 \`api.THREE\` 创建球体/地球/行星、柱状矩阵、芯片拆解层、圆环轨道、多面体、圆锥/圆柱机械结构，配合 \`api.addMesh\`、\`api.addLine3D\`、\`api.addParticle3D\`、\`api.addLabel3D\`、\`api.orbitPoint\`、\`api.arc3D\`、\`api.setCamera\`），并在前景手写多层次动态 \`<svg>\`（可配合 \`buildSmoothSvgPath\`、\`describeSvgArc\`、\`computeBeatSpring\` 绘制任意定制图表、K线、公式推导、思维导图、拓扑或矢量插画）！内置预设仅作辅助或兜底。
    还可从 './lib/narrative-diorama'（或 '../lib/narrative-diorama'）导入无素材纯叙事 SVG 动画舞台组件：
    - NarrativeDioramaStage, HeroWarriorFigure, StrategicMapStage, SlashBurstOverlay, CalligraphyColumnPanel, MOOD_PRESETS, computeBeatSignal（当场景没有截图素材 publicAssetFiles 为空或 layout === 'narrative-diorama' 时，优先用自定义内联 &lt;svg&gt; 动画与舞台原语联动演绎，严禁臆造假 staticFile('assets/...') 路径！同时严禁把 Sequence 的 durationInFrames 硬钳到 >=30，必须使用 Math.max(8, Number(s.durationInFrames)) 支持急速踩拍切镜！）。
-7. 合规与数字人叠层铁律：src/VideoComposition.tsx 必须在合成器最外层强制挂载 <AIBadge visible={true} /> 与末尾 <EndNotice />；当 script.json 中存在 avatarClip.path 且 avatarLayout !== 'off' 时，必须渲染 <AvatarOverlay clipPath={scriptData.avatarClip.path} layout={scriptData.avatarLayout || 'pip-br'} />（使用 transparent 透明通道合成）；字幕 <ShotCaption bottomPx={...} /> 必须遵循目标平台安全区留白（竖屏底部至少留白 22%）。
+7. 合规与数字人叠层铁律：src/VideoComposition.tsx 必须在合成器最外层强制挂载 <AIBadge visible={true} /> 与末尾 <EndNotice />；当 script.json 中存在 avatarClip.path 且 avatarLayout !== 'off' 时，必须渲染 <AvatarOverlay clipPath={scriptData.avatarClip.path} layout={scriptData.avatarLayout || 'pip-br'} />（使用 transparent 透明通道合成）；横屏 pip-br / pip-bl 画中画占据右下/左下角约 22% 宽 × 1.125 倍高（距边 42px、距底 96px），字幕条与标题/数据等关键内容必须水平避让该角落（字幕容器在 PiP 一侧留出 PiP 宽度 + 70px 内边距、过长时允许平衡换成 2 行），严禁把文字放到画中画下面；字幕 <ShotCaption bottomPx={...} /> 必须遵循目标平台安全区留白（竖屏底部至少留白 22%）。
 8. 如需使用本地素材图片/视频（如 public/...），必须使用 staticFile('相对路径')（去掉前导 public/），使用 <Img src={staticFile(...)} />。
 9. 音轨对齐铁律：src/VideoComposition.tsx 必须导出命名组件 VideoComposition，并在最外层挂载：
    <Audio src={staticFile('master-audio.wav')} />
@@ -3552,6 +3660,15 @@ export function buildBatchedRemotionScenesPrompt({
   assetCatalog = [],
   narrationMode = 'tts',
   referenceStyle = null,
+  visual3dMode = 'auto',
+  cast = [],
+  toolPlan = null,
+  allScenes = [],
+  figureStyle = '',
+  figureStyleNote = '',
+  // the user's 人物画风 pick in the studio (beats everything when it is not 'auto')
+  figureStyleChoice = '',
+  figureStyleChoiceNote = '',
 }) {
   const isPortrait = width < height
   const pad = String(batchIndex + 1).padStart(2, '0')
@@ -3568,13 +3685,43 @@ export function buildBatchedRemotionScenesPrompt({
   const resolvedGenreLabel = genreInfo.label
   const genreGuide = buildGenreGuidance(resolvedGenre, resolvedGenreLabel)
   const isUiTutorial = resolvedGenre === 'ui-tutorial'
-  const isHistoryOrMv = resolvedGenre === 'history-theater' || resolvedGenre === 'mv-lyric'
+  // battle-epic rules only for history films and history-themed MVs; a modern MV gets its own beat-edit rules
+  const isHistory = isEpicCombatContext({ genre: resolvedGenre, text: `${topic} ${resolvedGenreLabel} ${directorNotes}` })
+  const isMv = resolvedGenre === 'mv-lyric' && !isHistory
   const isPureMusicMv = narrationMode === 'subtitle-mv'
   const refBlueprintText = referenceStyle?.replicationPrompt
     ? `\n【参考视频视觉基因（用户上传参考视频复刻，必须严格对齐同款美学、构图、转场、动效与节奏！）】：\n${String(referenceStyle.replicationPrompt).slice(0, 1200)}`
     : ''
+  const castList = Array.isArray(cast) ? cast : []
+  // the film's character style: the user's pick in the studio, then the user's own words, then the director's choice,
+  // then the genre default (history → silhouette, everything else → 'auto'); 'custom' = the coder designs its own characters
+  const filmFigureStyle = inferFigureStyle({ genre: resolvedGenre, current: figureStyle, chosen: figureStyleChoice, userText: topic, text: `${resolvedGenreLabel} ${directorNotes}` })
+  const filmFigureNote = resolveFigureStyleNote({ style: filmFigureStyle, chosen: figureStyleChoice, chosenNote: figureStyleChoiceNote, note: figureStyleNote, text: `${topic} ${resolvedGenreLabel} ${directorNotes}` })
 
-  const system = `你是全球顶尖的 Opus 5.5 Vibecoding 视频动效创意主程（精通 Remotion v4 + 原生 Three.js 3D 自由编程 + 动态矢量 SVG 创作 + React 交互动效 + 弹簧物理动画）。
+  // Per-shot tool plan (must / suggest): the film-level plan when the caller has one, otherwise plan this batch now
+  let plan = toolPlan
+  if (!plan || !plan.perScene) {
+    try {
+      plan = planSceneTools({ scenes: batchScenes, cast: castList, genre: resolvedGenre, status: getVibeToolkitStatus(), visual3dMode, figureStyle: filmFigureStyle })
+    } catch {
+      plan = { perScene: {} }
+    }
+  }
+  const planOf = (id) => plan?.perScene?.[id] || { must: [], suggest: [], cast: [] }
+  const batchTools = new Set()
+  for (const s of batchScenes || []) for (const t of [...(planOf(s.id).must || []), ...(planOf(s.id).suggest || [])]) batchTools.add(t)
+  let vibeToolkitGuide = ''
+  try {
+    vibeToolkitGuide = buildVibeToolkitCoderGuide(undefined, { selected: [...batchTools].filter((t) => t !== 'figure-kit'), perScene: {}, reasons: {} })
+  } catch {}
+  // weapon timing instructions only where weapons can appear (history / fight content), never in a product or tutorial prompt
+  const batchText = (batchScenes || []).map((s) => `${s.title || ''} ${s.visualBlueprint || ''} ${s.motionNotes || ''}`).join(' ')
+  const combatShots = isHistory || /剑|刀|戟|枪|矛|弓|兵器|武器|打斗|格斗|对决|决斗|sword|blade|spear|weapon|fight/i.test(batchText)
+  const figureGuide = buildFigureKitCoderGuide({ cast: castList, combat: combatShots, figureStyle: filmFigureStyle, figureStyleNote: filmFigureNote })
+  const sceneIndex = new Map((Array.isArray(allScenes) ? allScenes : []).map((s, i) => [s.id, i]))
+  const shotSummary = (s) => (s ? `${s.title || s.id}：${String(s.visualBlueprint || s.motionNotes || '').slice(0, 64)}` : undefined)
+
+  const system = `你是全球顶尖的 Opus 5.5 Vibecoding 视频动效创意主程（精通 Remotion v4 + 原生 Three.js 3D 自由编程 + 动态矢量 SVG 创作 + 风格化角色动画 + React 交互动效 + 弹簧物理动画）。
 你的核心使命：**彻底粉碎模板套壳！禁止多幕共用同一个页面框架/Card/Lesson 组件只换右侧文字！**
 面对本批次的每一幕，你拥有一张 **100% 自由的 React + Three.js 3D + 动态 SVG 编程画布**。请严格围绕题材路由与导演创作指导，为每一幕编写真正差异化、生动有呼吸感、贴合题材灵魂的专属代码！
 
@@ -3592,25 +3739,30 @@ ${isUiTutorial ? `- **【软件实操教程专属视觉规范 —— 零错位�
   3. **真实录屏视频优先 + 动态推镜特写（拒绝静态死图！）**：
      - 若本幕 \`publicAssetFiles\` 含真实操作录屏视频（\`.mp4\` / \`.webm\`）：直接传入 \`<FocusShot src={videoPath} cams={...} marks={...} />\` 全幅清晰播放真实动态交互（真实鼠标移动、抽屉展开、真实打字、开关切换），配合平滑 1.4x–2.0x 镜头推近追踪操作区；**切勿在已有真实光标动作的录屏视频上再叠加第二个假 \`cursors\`！**
      - 若本幕为静态高清截图：使用 \`assetCatalog[].uiAnchors\` 精准坐标执行 1.7x–2.2x 局部推镜 + 精准光标点击涟漪；有前后两张状态截图时使用 \`<UiDrawerSlide beforeSrc={...} afterSrc={...} revealAt={0.38} direction="left|modal" />\` 平滑展开抽屉或弹窗！
-  4. **无重叠安全区**：右上角 \`top: 0~74px, right: 0~240px\` 严格留给合规角标 \`<AIBadge>\`，严禁在右上角放任何章节文字；底部 \`118px\` 留给字幕条！` : isHistoryOrMv ? `- **【历史史诗 / 高燃卡点动画铁律 —— 禁止空洞线条背景！每幕必须有动画人物 + 动效 + 特效！】**：
-  1. **严禁偷懒只画几条山脉线条或一张白纸！**：每幕必须具备**丰富的前景动画人物主体与动作特效**——例如：逆光高大将领/帝王剪影（披风随风狂舞、长枪/佩剑挥砍）、大军冲锋骑兵与飘扬战旗阵、战马奔腾速度线、月牙斩击刀光与绯红爆裂冲击波、红黑疆域攻占发光地图与印章重锤砸落、立体竹简与书法纵排卷轴！
-  2. **强力推荐组合使用已内置的史诗动画原语（从 \`'../lib/narrative-diorama'\` 导入）并在此基础上叠加你的定制 SVG/粒子/字效层**：
-     - 可直接导入 \`NarrativeDioramaStage, HeroWarriorFigure, StrategicMapStage, SlashBurstOverlay, CalligraphyColumnPanel, MOOD_PRESETS, computeBeatSignal, resolveBannerChar\`！
-     - **最佳实践**：若本幕 \`stageSpec\` 完整，可直接以 \`<NarrativeDioramaStage scene={scene} idx={idx} total={total} beats={beats} />\` 作为饱满的人物/大军/地图/竹简/斩击底层舞台，**再在其上方叠加该幕独有的定制动态 SVG 视觉层**（例如：巨大年份数字轰击弹出、定制战役箭雨/烽火狼烟/封狼居胥祭天坛/汉匈攻防路线/兵马冲阵特写/朱砂大字印章/节拍脉冲冲击环），或者用 \`HeroWarriorFigure\` + \`SlashBurstOverlay\` + 自定义多层动态 SVG 亲手构图，让每一幕既有电影级人物剪影细节又有鲜明剧情变化！
-  3. **严禁出现现代赛博科技仪表盘/SaaS 卡片/蓝色网格 HUD**：历史片必须保持炽金朝霞/血红战场/墨夜玄金/青铜大殿等影院级历史质感！
-  4. **节拍驱动的暴力动感**：每幕读取 \`computeBeatSignal((Number(scene.startSec) || 0) + frame / fps, beats)\`，让人物披风/发光描边、刀光爆裂、大字缩放、火星粒子和镜头冲击波随音乐重拍实时弹跳！` : `- **【按题材定制视觉语言 —— 严禁千篇一律用同一套科技风卡片！】**：
-  * **历史剧场 / 纪实传奇 (\`history-theater\`)**：必须使用 \`NarrativeDioramaStage\` / \`HeroWarriorFigure\` / \`SlashBurstOverlay\` / \`StrategicMapStage\` 与定制动态 \`<svg>\` 打造逆光人物剪影、冲锋铁骑、战旗大军、月牙斩击特效、红黑疆域路线、立体竹简与书法印章（\`FONT_SERIF\`）！严禁只画空白山脉线，严禁使用现代 SaaS 科技仪表盘卡片！
-  * **火柴人 / 角色动画 (\`stickman-story\`)**：手写多关节层级 SVG 骨骼动画（头/躯干/大臂/小臂/大腿/小腿用嵌套 \`<g transform="translate(...) rotate(...)">\` 受 \`spring\` 与正弦周期驱动跑跳指点）、手绘对话气泡、拟声字、速度线与道具！
-  * **代码动画 / 科普原理 / 数据故事 (\`code-animation\` / \`science-explainer\` / \`data-story\`)**：用 \`<FreeformThreeStage buildScene={(api) => { ... }} />\` 手写专属 3D 模型（行星轨道、分子球棍、芯片层爆炸拆解、神经网络连线、柱状矩阵），叠加实时生长的 SVG K线/雷达/脑图/代码流/公式推导与 \`computeBeatSpring\`！
-  * **口播 / 数字人 / 自由其他题材 (\`talking-head\` / \`digital-human\` / \`other\`)**：随主题发明最贴切的 React + SVG + Three.js 视听舞台，不设任何题材或构图上限！`}
+  4. **无重叠安全区**：右上角 \`top: 0~74px, right: 0~240px\` 严格留给合规角标 \`<AIBadge>\`，严禁在右上角放任何章节文字；底部 \`118px\` 留给字幕条！` : isHistory ? `- **【历史 / 古代题材画面规范 —— 每幕都要有活的人物、动作与特效！】**：
+  1. **严禁只画几条山脉线条或一张白纸当画面**：每幕都要有前景人物主体与动作——人物、战马、军阵按下方「人物画风」来画${filmFigureStyle === 'custom' ? '（本片画风由你自己设计角色，不用人物库）' : '（人物库 `Figure` / `Horse` / `Troop` 现成可用）'}，按 visualBlueprint 做出挥戟、策马、回首、拱手、跪坐、举杯、行军等真实动作；再组合 \`'../lib/narrative-diorama'\` 的 \`StrategicMapStage\`（疆域攻占地图）、\`SlashBurstOverlay\`（斩击光与冲击波）、\`CalligraphyColumnPanel\`（书法竖排）与你自己的 SVG 特效层（旗帜、烽烟、箭雨、印章、年份大字、节拍冲击环）。\`NarrativeDioramaStage\` 只适合当远景底层舞台，不要用它代替前景人物。
+  2. **严禁现代赛博科技仪表盘/SaaS 卡片/蓝色网格 HUD**（除非镜头内容本身就是现代场景）：保持炽金朝霞/血红战场/墨夜玄金/青铜大殿等影院级质感，但远景、中景、近景的色调与明暗要有变化。
+  3. **音画节拍 0ms 精确锁帧（每一次兵刃接触都已由系统锁在 BGM 拍/半拍上，严禁自造打击帧！）**：每幕 \`scene\` 已注入 \`scene.actionMode\`（\`clash-flurry | single-clash | cavalry | drop-impact | clean\`）与 \`scene.actionEvents\`（\`Array<{ frame, kind, role, intensity, killStep }>\`）；下方每幕 JSON 里的 \`actionMode\` / \`contactFrames\` / \`hoofFrames\` / \`impactFrames\` 供你构思动作节奏，但代码必须运行时读取 \`scene.actionEvents\`（不要把帧号写死）：
+     - \`clash-flurry\` / \`single-clash\`：${filmFigureStyle === 'custom' ? '挥砍的人物（按本片画风自己画）用 `computeStrikeSwing(scene, frame)` 的 swing / recoil 驱动手臂与兵器' : '挥砍的人物用 `<Figure action="swing" strike={computeStrikeSwing(scene, frame)} … />`（刺击用 thrust，格挡用 block；自己画人物时同样用 `computeStrikeSwing(scene, frame)` 的 swing / recoil 驱动手臂与兵器）'}，兵器会恰好在接触帧命中、接触后回弹（\`side\` 每击交替方向）；用 \`getActionContacts(scene)\` 取全部接触帧；火星、刀光、敌兵击飞、受击闪白**只能**出现在接触帧且位于两件兵器真正相交的位置（同一帧系统会自动叠加金属碰撞声、镜头震动与斩数计数，并按光敏安全预算统一安排全屏闪光——任意两次至少间隔 0.5 秒；你不要自己做任何全屏/大面积闪白、频闪或震屏，受击闪白只能是兵器交点附近的小面积局部光斑）；
+     - \`cavalry\`：用 \`<Horse gait="gallop" rider={…} dust />\`，马蹄落地与尘土爆点对齐 \`kind === 'hoof'\`（每拍一次）与 \`'hoof_stomp'\`（重踏）的帧，画面不出现刀剑火星；\`drop-impact\`：唯一一次重击效果对齐 \`heavy_impact\` / \`war_drum\` 的帧；
+     - 若 \`scene.actionMode === 'clean'\`（朝堂、肖像、地图、竹简、数字、封禅、尾声）：保持庄重电影运镜与人物呼吸/风沙动效，**严禁无故画刀光爆闪或乱抖画面**！但安静镜头同样必须**全程有动势**：至少两层元素持续在动（人物说话/转头/行走、远景中景差速平移、浮尘薄雾漂移、旗帜披风衣袂火光摆动、日轮光晕缓慢旋转），任何时刻都不得出现超过 0.5 秒的静止画面。` : isMv ? `- **【音乐卡点 / MV 画面规范】**：画面跟着节拍呼吸——重拍上做镜头推拉、字幕弹出、图形冲击与色块切换（全屏闪光交给主合成器统一安排，你只做局部光效）；歌词金句用动态排版（逐字、错落、放大、描边扫光，可用 Anime.js 交错）；画面里有人物时，人物按下方「人物画风」来画，做出演唱、舞蹈、奔跑、挥手等动作；题材与年代完全跟着歌曲内容走（现代城市、校园、夏日、幻想、复古都可以），不要默认加入古代战争、兵器或战鼓元素，兵刃特效只在歌曲内容真的有打斗时才出现；安静段落也要保持缓慢运镜与元素漂移，不得出现超过 0.5 秒的静止画面。` : `- **【按题材定制视觉语言 —— 严禁千篇一律用同一套科技风卡片！】**：
+  * **火柴人 / 角色动画 (\`stickman-story\`)**：人物按下方「人物画风」来画${filmFigureStyle === 'custom' ? '（本片画风由你自己设计角色）' : '（火柴人可直接用 `<Figure style="stick" />`，卡通、绘本、Q版等画风自己设计角色）'}，做出关节动作与动作序列，叠加手绘对话气泡、拟声字、速度线与道具！
+  * **代码动画 / 科普原理 / 数据故事 (\`code-animation\` / \`science-explainer\` / \`data-story\`)**：用 \`<FreeformThreeStage buildScene={(api) => { ... }} />\` 手写专属 3D 模型（行星轨道、分子球棍、芯片层爆炸拆解、神经网络连线、柱状矩阵），叠加实时生长的 SVG K线/雷达/脑图/代码流/公式推导与 \`computeBeatSpring\`；需要讲解员或角色出镜时按「人物画风」来画（侧身讲解员可用人物库 \`Figure\`，正面对镜头的讲解员自己画）！
+  * **口播 / 数字人 / 品牌故事 / 产品宣发 / 自由其他题材 (\`talking-head\` / \`digital-human\` / \`brand-story\` / \`product-promo\` / \`other\`)**：随主题发明最贴切的 React + SVG + Three.js 视听舞台；出现顾客、员工、学生、家人、路人等人物时按「人物画风」画出真实动作，不设任何题材或构图上限！`}
+${figureGuide}
+- **【工具调用计划（每镜 JSON 里的 toolPlan，导演与系统已按画面内容规划好）】**：\`toolPlan.must\` 里的工具必须在该镜代码里真正调用（交付前系统会逐镜核对代码，漏用的镜头会被要求返工）；\`toolPlan.suggest\` 按画面需要自行判断；工具做不到的部分随时可以用 SVG / Canvas / 数学函数自由编写补充。工具编号：figure-kit = 人物库（见「人物画风」，可选，不强制），threejs = \`FreeformThreeStage\` 三维舞台，animejs / tweenjs / ammojs / tsl-textures 见下方 Vibecoding 工具说明。
 - **【第一画笔：Three.js 3D 自由空间 (\`<FreeformThreeStage buildScene={(api) => { ... }} />\`)】**：
   \`api.THREE\`（BoxGeometry/SphereGeometry/CylinderGeometry/ConeGeometry/TorusGeometry/IcosahedronGeometry/RingGeometry）、\`api.setCamera\`、\`api.addMesh\`、\`api.addLine3D\`、\`api.orbitPoint\`、\`api.arc3D\`、\`api.addParticle3D\`、\`api.addLabel3D\`。
 - **【第二画笔：原生动态 \`<svg>\` + 数学路径与弹簧物理】**：
   \`buildSmoothSvgPath(points)\`、\`describeSvgArc(cx, cy, r, a0, a1)\`、\`computeBeatSpring(frame, fps, beats)\`、\`spring()\`、\`interpolate()\`。
+- **【构图与镜头多样性（任何题材）】**：严格按每镜 visualBlueprint 写明的机位与景别构图（俯/仰/平视、侧面、反打、过肩、特写、远景）；相邻两镜至少在「景别 / 机位角度 / 主体位置」三项里的两项明显不同；每镜 JSON 的 \`prevShot\` / \`nextShot\` 是前后镜头，衔接要顺（承接动作、匹配剪辑）但构图不要雷同；同一批次里同一种背景母题（大日轮、同一条山脊线、同一片天空渐变）最多用 2 次，室内镜头要有室内结构（墙、帐、柱、案、灯），不要所有镜头都是"天空 + 山 + 太阳"。
+- **【整镜持续运动（任何题材）】**：入场动画只占每镜前 15–25% 的帧，之后不能定住——用覆盖整镜的插值（\`interpolate(frame, [0, durationInFrames], …)\`）保持慢速运动：人物呼吸、说话、转头、行走，前景与背景差速漂移（每秒 6–20px），镜头缓推 2–4%，粒子与光影流动；任何一秒都要有看得见的变化（成片质检会逐秒测量画面变化量，几乎不动的秒数会被标出来）。
+- **【亮度与可读性】**：主体（人物、产品、关键文字）任何时候都要清楚可辨：夜景、阴天、室内暗场也要用月光、火光、灯光、轮廓光或逆光把主体从背景里分离出来；不要整屏压暗，暗角/压暗叠层的不透明度不超过 0.35；整幅画面的平均亮度不能低到看不清人物（成片质检会逐镜测亮度，过暗的镜头会被自动提亮并提示）。
 - **【防错位与安全留白规则】**：
   1. **每幕独立写专属视觉结构**：严禁定义单个全局函数套全批分镜仅替换右侧 3 行字；允许复用小型通用工具（如文字/粒子辅助），但主体构图与交互动效必须随本幕台词与视觉蓝图显著变化！
   2. 屏幕底部 \`${isPortrait ? 420 : 158}px\` 区域（Y > ${isPortrait ? Math.round(height - 440) : Math.round(height - 165)}）留给主合成器字幕条，右上角 \`top: 16~68px, right: 20~200px\` 预留给合规角标 \`<AIBadge>\`，切勿把角标文字放到右上角与它重叠！若是软件教程/产品演示分镜，如需顶部步骤标题条，请使用 \`display:'flex', flexDirection:'column'\` 在 \`<FocusShot>\` 上方独立留出 \`48~56px\` 顶栏（并保留右侧 \`200px\` 给 \`<AIBadge>\`），切勿用 \`position:'absolute'\` 浮标压住软件自身的左上角导航栏！主要画面主体放在 Y = 50 ~ ${isPortrait ? 1400 : 880} 清晰区域内；严禁自行渲染底部大字幕或 Audio！
   3. 屏幕文字（title/highlights/标签/标注）必须全部使用**阿拉伯数字**（如 \`206年\`、\`3000人\`、\`8 GB\`），不要强行改写为中文数字，也不要带无意义双引号或“本视频要求…”字样！
+  4. **光敏安全（WCAG 每秒闪烁 ≤3 次，成片质检会逐帧检测）**：严禁整屏或大面积（超过画面约 1/4）的亮度骤变——闪白、频闪、明暗快速交替、整屏颜色爆闪；整屏闪光一律由主合成器按「任意两次间隔 ≥0.5 秒」统一安排，你只做局部小面积光效（${combatShots ? '刀光、火星、光晕、描边扫光' : '高光、光斑、光晕、描边扫光'}）。
 
 === 工程合规铁律（触犯即被沙箱打回！） ===
 1. 输出严格 JSON（禁止包裹解释文本）：{ "files": { "${filePath}": "<完整 TypeScript JSX 代码>" } }
@@ -3624,10 +3776,13 @@ ${isUiTutorial ? `- **【软件实操教程专属视觉规范 —— 零错位�
 3. **绝对禁止 \`Math.random(\`、\`@keyframes\`、CSS \`animation:\`、以及英文单词 \`transition\` 后紧跟 \`:\`（注释与类型接口里也绝对不要出现 \`transition:\`！）**。
 4. 严禁 Node 模块、\`eval\`、\`new Function\`、外网 URL、受限商用字体（微软雅黑/宋体/黑体）；只用 \`FONT_SANS\` / \`FONT_SERIF\` / \`FONT_MONO\`；\`<defs>\` 渐变/clipPath ID 必须拼接 \`\${idx}\` 唯一后缀！
 5. TypeScript strict 零错误（所有回调与字典加类型注解，\`publicAssetFiles\` 里的相对路径如 'assets/...' 只能给原生 \`<Img src={staticFile(p)} />\` 用；传给 \`<FocusShot src={p} />\`, \`<UiDrawerSlide beforeSrc={p} afterSrc={q} />\`, \`<AppWindow brandMark={p} />\` 时直接传原始相对字符串，**切勿再用 staticFile() 包一层**！\`cams\` 和 \`cursors\` 的时间戳 \`t\` 统一用 \`0..1\` 归一化进度）；
-   可用导入（严格以此为准）：
+   可以直接导入的现成模块（都已安装；列表外的 npm 包不要导入——本机没装会编译失败。现成模块满足不了的效果，直接在本文件里用 React + SVG / Canvas2D / 原生 WebGL / THREE / 数学函数自由编写）：
    - \`from 'remotion'\`: \`AbsoluteFill, Easing, Img, OffthreadVideo, interpolate, random, spring, staticFile, useCurrentFrame, useVideoConfig\`
-   - \`from '../lib/shotcraft'\`: \`FreeformThreeStage, FreeformThreeApi, ThreeCyberStage, THREE, ThreeCanvas, THREE_STAGE_PRESETS, buildSmoothSvgPath, describeSvgArc, SvgArchitectureDiagram, HudDataDashboard, HudTelemetryOverlay, BeatSpringPhysicsRig, computeBeatSpring, CameraRig, AnimatedRoutePath, ParallaxHorizon, AppWindow, FocusShot, InteractiveCursor, UiDrawerSlide, UiTypingOverlay, BeforeAfterWipe, MetricPanel, DigitRoll, ClipCard, PageCam, computeBeatPulse, FONT_SANS, FONT_MONO, FONT_SERIF\`
-   - \`from '../lib/narrative-diorama'\`: \`NarrativeDioramaStage, HeroWarriorFigure, StrategicMapStage, SlashBurstOverlay, CalligraphyColumnPanel, MOOD_PRESETS, computeBeatSignal, resolveBannerChar\``
+   - \`from '../lib/figure-kit'\`: \`Figure, Horse, Troop, castLook, figureStride, mixColor, FIGURE_ACTIONS, FigureLook, FigureStyle, FigureAction\`
+   - \`from '../lib/shotcraft'\`: \`FreeformThreeStage, FreeformThreeApi, ThreeCyberStage, THREE, ThreeCanvas, THREE_STAGE_PRESETS, buildSmoothSvgPath, describeSvgArc, SvgArchitectureDiagram, HudDataDashboard, HudTelemetryOverlay, BeatSpringPhysicsRig, computeBeatSpring, CameraRig, AnimatedRoutePath, ParallaxHorizon, AppWindow, FocusShot, InteractiveCursor, UiDrawerSlide, UiTypingOverlay, BeforeAfterWipe, MetricPanel, DigitRoll, ClipCard, PageCam, computeBeatPulse, getActionContacts, computeStrikeSwing, FONT_SANS, FONT_MONO, FONT_SERIF\`
+   - \`from '../lib/narrative-diorama'\`: \`NarrativeDioramaStage, StrategicMapStage, SlashBurstOverlay, CalligraphyColumnPanel, MOOD_PRESETS, computeBeatSignal, resolveBannerChar\`
+${vibeToolkitGuide}
+${buildVisualFxPreferenceGuide(visual3dMode)}`
 
   const user = JSON.stringify(
     {
@@ -3639,40 +3794,56 @@ ${isUiTutorial ? `- **【软件实操教程专属视觉规范 —— 零错位�
       style,
       canvas: { width, height, fps, aspectRatio },
       themePalette: theme,
+      figureStyle: filmFigureStyle,
+      figureStyleNote: filmFigureNote || undefined,
+      cast: castList.length ? castList.map((c) => ({ id: c.id, name: c.name, role: c.role, look: c.look, figure: c.figure || c.rig })) : undefined,
       bgmSummary: bgmMeta?.analyzed
         ? { bpm: bgmMeta.bpm, beatSec: bgmMeta.beatSec, drops: (bgmMeta.drops || []).slice(0, 8) }
         : undefined,
       assetCatalog: Array.isArray(assetCatalog) && assetCatalog.length > 0 ? assetCatalog : undefined,
-      scenes: batchScenes.map((s) => ({
-        id: s.id,
-        index: s.index,
-        title: s.title,
-        headline: s.headline || s.title,
-        narration: s.narration,
-        accentWords: s.accentWords || [],
-        highlights: s.highlights || [],
-        visualBlueprint: s.visualBlueprint || s.motionNotes || s.visualPrompt || s.title,
-        txKind: s.transition || 'cut',
-        durationSec: s.durationSec,
-        durationInFrames: s.durationInFrames,
-        startSec: s.startSec,
-        stageSpec: s.stageSpec || undefined,
-        metrics: s.metrics?.length ? s.metrics : undefined,
-        cams: s.cams?.length ? s.cams : undefined,
-        marks: s.marks?.length ? s.marks : undefined,
-        cursors: s.cursors?.length ? s.cursors : undefined,
-        publicAssetFiles: Array.isArray(s.media) && s.media.length > 0
-          ? s.media.map((m) => String(m?.path || '').replace(/^\/+/, '').replace(/\\/g, '/')).filter(Boolean)
-          : Array.isArray(s.assetPaths)
-            ? s.assetPaths.map((p) => String(p || '').replace(/^\/+/, '').replace(/\\/g, '/')).filter(Boolean)
-            : [],
-      })),
+      scenes: batchScenes.map((s) => {
+        const p = planOf(s.id)
+        const gi = sceneIndex.has(s.id) ? sceneIndex.get(s.id) : -1
+        return {
+          id: s.id,
+          index: s.index,
+          title: s.title,
+          headline: s.headline || s.title,
+          narration: s.narration,
+          accentWords: s.accentWords || [],
+          highlights: s.highlights || [],
+          visualBlueprint: s.visualBlueprint || s.motionNotes || s.visualPrompt || s.title,
+          txKind: s.transition || 'cut',
+          durationSec: s.durationSec,
+          durationInFrames: s.durationInFrames,
+          startSec: s.startSec,
+          stageSpec: s.stageSpec || undefined,
+          toolPlan: { must: p.must || [], suggest: p.suggest || [] },
+          cast: Array.isArray(p.cast) && p.cast.length ? p.cast : undefined,
+          atmosphere: s.atmosphere && s.atmosphere !== 'none' ? s.atmosphere : undefined,
+          prevShot: gi > 0 ? shotSummary(allScenes[gi - 1]) : undefined,
+          nextShot: gi >= 0 && gi + 1 < allScenes.length ? shotSummary(allScenes[gi + 1]) : undefined,
+          actionMode: s.actionMode || undefined,
+          contactFrames: Array.isArray(s.actionEvents) && s.actionEvents.some((ev) => /^metal_clash/.test(String(ev?.kind || ""))) ? s.actionEvents.filter((ev) => /^metal_clash/.test(String(ev?.kind || ""))).map((ev) => ev.frame) : undefined,
+          hoofFrames: Array.isArray(s.actionEvents) && s.actionEvents.some((ev) => ev?.kind === "hoof" || ev?.kind === "hoof_stomp") ? s.actionEvents.filter((ev) => ev?.kind === "hoof" || ev?.kind === "hoof_stomp").map((ev) => ev.frame) : undefined,
+          impactFrames: Array.isArray(s.actionEvents) && s.actionEvents.some((ev) => ev?.kind === "heavy_impact" || ev?.kind === "war_drum") ? s.actionEvents.filter((ev) => ev?.kind === "heavy_impact" || ev?.kind === "war_drum").map((ev) => ev.frame) : undefined,
+          metrics: s.metrics?.length ? s.metrics : undefined,
+          cams: s.cams?.length ? s.cams : undefined,
+          marks: s.marks?.length ? s.marks : undefined,
+          cursors: s.cursors?.length ? s.cursors : undefined,
+          publicAssetFiles: Array.isArray(s.media) && s.media.length > 0
+            ? s.media.map((m) => String(m?.path || '').replace(/^\/+/, '').replace(/\\/g, '/')).filter(Boolean)
+            : Array.isArray(s.assetPaths)
+              ? s.assetPaths.map((p2) => String(p2 || '').replace(/^\/+/, '').replace(/\\/g, '/')).filter(Boolean)
+              : [],
+        }
+      }),
     },
     null,
     2,
   )
 
-  return { system, user, filePath, exportName }
+  return { system, user, filePath, exportName, toolPlan: plan }
 }
 
 export function buildHtmlCoderSkillsPrompt({
@@ -3694,10 +3865,12 @@ export function buildHtmlCoderSkillsPrompt({
   const resolvedGenreLabel = genreInfo.label
   const genreGuide = buildGenreGuidance(resolvedGenre, resolvedGenreLabel)
   const directorNotes = plan?.directorNotes || timingContract?.directorNotes || ''
+  const fxPreference = buildVisualFxPreferenceGuide(plan?.visual3dMode || timingContract?.visual3dMode || 'auto')
   const system = `你是精通 HyperFrames HTML5/Canvas 2D+3D 透视矩阵与动态 SVG 创意编程专家（Opus 5.5 Vibecoding 水准）。
 你需要生成一个完全自包含、纯离线零外链、支持 Chromium CDP 逐帧精确 seek 的单个 HTML 文件，**彻底解除模板束缚，按题材自由手写 Canvas + SVG + 3D 透视画面**！
 
 ${genreGuide}
+${fxPreference}
 ${directorNotes ? `\n【导演备注（仅供视觉写码参考，严禁把指令文本写入屏幕文字/字幕！）】：\n${String(directorNotes).slice(0, 700)}` : ''}
 
 === HYPERFRAMES 自由造景与确定性逐帧铁律 (违背会被拒绝重修!) ===
@@ -3710,7 +3883,7 @@ ${directorNotes ? `\n【导演备注（仅供视觉写码参考，严禁把指�
    - 按题材定制视觉：历史题材手写水墨 SVG 疆域与行军箭头/火星粒子；火柴人题材用 Canvas/SVG 骨骼关节关键帧；实操教程用高对比亮色画布 + **1.8x–2.5x 局部镜头推近放大** + SVG 鼠标指针滑动与点击波纹；代码/科普用实时数学图表/树图/代码流 + 欠阻尼弹簧函数 \`springVal = 1 - Math.exp(-7 * x) * Math.cos(8.5 * x)\`；
    - 右下/底部保留简洁字幕安全区（${isPortrait ? '竖屏底部 ≥ 22% 高度' : '横屏底部 ≥ 13% 高度'}），数字用阿拉伯数字（206年、3000人），字幕无双引号。
 6. 必须内嵌 <script id="dsh-script-data" type="application/json">PLACEHOLDER</script>（保留该 script 标签占位符或完整嵌入数据，系统会自动写回最新脚本）。
-7. 必须保留合成器级强制合规叠层：右上/左上 #ai-badge（「AI 辅助创作」）及片尾最后 2 秒展示 #end-notice，且字幕条 bottom 必须避让目标平台安全区；若 script.json 包含 avatarClip.path，需保留 <video id="avatar-overlay-video" muted playsinline> 透明通道画中画/全屏叠层并在 window.__seekToFrame 内按 frame / fps 精确同步 currentTime。
+7. 必须保留合成器级强制合规叠层：右上/左上 #ai-badge（「AI 辅助创作」）及片尾最后 2 秒展示 #end-notice，且字幕条 bottom 必须避让目标平台安全区；若 script.json 包含 avatarClip.path，需保留 <video id="avatar-overlay-video" muted playsinline> 透明通道画中画/全屏叠层（横屏角落画中画时，字幕条与关键文字必须水平避让 PiP 所在角落，不得被遮挡）并在 window.__seekToFrame 内按 frame / fps 精确同步 currentTime。
 8. 必须向全局暴露确定性 seek 接口：
    window.__totalFrames = <totalDurationInFrames>;
    window.__seekToFrame = function(frameIndex) { ... };

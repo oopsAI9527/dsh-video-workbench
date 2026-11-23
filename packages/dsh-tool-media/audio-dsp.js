@@ -416,7 +416,270 @@ export function synthSfxStereo(type = 'whoosh', opts = {}) {
     return { L: cr, R: new Float32Array(cr) }
   }
 
-  if (kind === 'whoosh' || kind === 'swoosh' || kind === 'swipe' || kind === 'card' || kind === 'slash') {
+  if (
+    kind === 'metal_clash' ||
+    kind === 'metal_clash_hi' ||
+    kind === 'metal_clash_heavy' ||
+    kind === 'sword_clash' ||
+    kind === 'weapon_clash' ||
+    kind === 'blade_clash'
+  ) {
+    // Cold-weapon collision modelled on real blade/spear hits: the energy is a BROADBAND transient that is
+    // over within ~60-90 ms ("锵 / 铿"). The previous long-ringing sine partials (0.3-0.5 s) sounded like a
+    // door-bell "叮". Partials now decay in 14-40 ms, the body is a filtered noise crack, and every call gets a
+    // seeded random detune so rapid flurries never repeat the identical sample (no machine-gun effect).
+    const isHi = kind === 'metal_clash_hi'
+    const isHeavy = kind === 'metal_clash_heavy'
+    const dur = isHeavy ? 0.46 : isHi ? 0.24 : 0.3
+    const n = Math.floor(dur * DSP_SR)
+    const detune = 0.93 + rand() * 0.14
+    const f0 = (isHeavy ? 1650 : isHi ? 2650 : 2150) * detune
+    const ratios = [1, 1.37, 1.94, 2.53, 3.21, 3.92, 4.71]
+    const modes = ratios.map((r, k) => ({
+      f: f0 * r * (0.985 + rand() * 0.03),
+      a: (0.55 - k * 0.055) * (0.75 + rand() * 0.5),
+      tau: (isHeavy ? 0.04 : isHi ? 0.022 : 0.03) * (1 - k * 0.07) * (0.8 + rand() * 0.4),
+      pan: (rand() - 0.5) * 0.5,
+      ph: rand() * Math.PI * 2,
+    }))
+    const noise = new Float32Array(n)
+    for (let i = 0; i < n; i++) noise[i] = rand() * 2 - 1
+    // The attack click is band-limited to ~12 kHz: the audible "锵" bite lives in 2-10 kHz, while full-band
+    // white-noise clicks are what make AAC/MP3 encoders overshoot (+3 dB inter-sample peaks after encoding).
+    const clickNoise = biquadFilter(biquadFilter(noise, 'lp', 12000, 0.7), 'lp', 12000, 0.7)
+    const crackLo = biquadFilter(noise, 'bp', (isHeavy ? 2300 : 3100) * detune, 0.75)
+    const crackHi = biquadFilter(noise, 'bp', (isHeavy ? 5200 : 6800) * detune, 0.9)
+    const ringBand = biquadFilter(noise, 'bp', f0 * 1.94, 7.5)
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    const crackTau = isHeavy ? 0.016 : isHi ? 0.009 : 0.012
+    const bodyF = (isHeavy ? 190 : 260) * detune
+    for (let i = 0; i < n; i++) {
+      const t = i / DSP_SR
+      const atk = Math.min(1, t / 0.0003)
+      const click = t < 0.003 ? clickNoise[i] * Math.exp(-t / 0.0006) * 1.7 : 0
+      const crack = (crackLo[i] * 1.15 + crackHi[i] * 0.95) * Math.exp(-t / crackTau) * atk
+      const ring = ringBand[i] * Math.exp(-t / (isHeavy ? 0.075 : 0.05)) * 0.55
+      const body = Math.sin(2 * Math.PI * bodyF * t) * Math.exp(-t / (isHeavy ? 0.03 : 0.018)) * (isHeavy ? 0.55 : 0.32)
+      const sub = isHeavy ? Math.sin(2 * Math.PI * (48 + 40 * Math.exp(-t * 30)) * t) * Math.exp(-t / 0.07) * 0.6 : 0
+      let mL = 0
+      let mR = 0
+      for (let k = 0; k < modes.length; k++) {
+        const md = modes[k]
+        const v = Math.sin(2 * Math.PI * md.f * t + md.ph) * md.a * Math.exp(-t / md.tau) * atk
+        mL += v * (1 - md.pan)
+        mR += v * (1 + md.pan)
+      }
+      const core = click + crack + ring + body + sub
+      L[i] = Math.tanh((core + mL * 0.62) * 1.35)
+      R[i] = Math.tanh((core * 0.97 + mR * 0.62) * 1.35)
+    }
+    // high-pass the rumble, and roll off the tanh saturation harmonics above ~16 kHz (codec-safe transient)
+    const Lh = biquadFilter(biquadFilter(L, 'hp', isHeavy ? 45 : 140, 0.7), 'lp', 16000, 0.7)
+    const Rh = biquadFilter(biquadFilter(R, 'hp', isHeavy ? 45 : 140, 0.7), 'lp', 16000, 0.7)
+    let pk = 1e-4
+    for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(Lh[i]), Math.abs(Rh[i]))
+    const norm = 0.95 / pk
+    const fadeN = Math.floor(0.012 * DSP_SR)
+    for (let i = 0; i < n; i++) {
+      const fo = i > n - fadeN ? (n - i) / fadeN : 1
+      Lh[i] *= norm * fo
+      Rh[i] *= norm * fo
+    }
+    return { L: Lh, R: Rh }
+  }
+
+  if (kind === 'blade_whoosh' || kind === 'sword_draw' || kind === 'slash') {
+    // Short blade swish that rises, peaks ~30 ms before the end and is silent for the last ~16 ms. A cue placed
+    // one whoosh-length before a strike makes the swing "arrive" on the contact frame while leaving a short
+    // breath, so the steel transient that follows reads as a crisp 锵 instead of being smeared by air noise.
+    const dur = kind === 'sword_draw' ? 0.32 : 0.16
+    const n = Math.floor(dur * DSP_SR)
+    const raw = new Float32Array(n)
+    for (let i = 0; i < n; i++) raw[i] = rand() * 2 - 1
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    const lo = biquadFilter(raw, 'bp', 1800, 1.0)
+    const hi = biquadFilter(raw, 'bp', 5200, 1.3)
+    const PEAK_U = 0.78
+    for (let i = 0; i < n; i++) {
+      const u = i / n
+      const rise = Math.pow(Math.min(1, u / PEAK_U), 1.8)
+      const fall = u <= PEAK_U ? 1 : Math.max(0, 1 - (u - PEAK_U) / 0.12)
+      const env = rise * fall * fall
+      const s2 = Math.tanh((lo[i] * (1 - u) * 0.8 + hi[i] * (0.4 + 0.6 * Math.min(1, u / PEAK_U))) * env * 2.2) * 0.85
+      L[i] = s2 * (1 - u * 0.5)
+      R[i] = s2 * (0.5 + u * 0.5)
+    }
+    return { L, R }
+  }
+
+  if (kind === 'war_drum' || kind === 'taiko_hit') {
+    const dur = 1.25
+    const n = Math.floor(dur * DSP_SR)
+    const raw = new Float32Array(n)
+    for (let i = 0; i < n; i++) raw[i] = (rand() * 2 - 1) * Math.exp(-(i / DSP_SR) * 48)
+    const skinBp = biquadFilter(raw, 'bp', 920, 1.1)
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    let ph = 0
+    let phO = 0
+    for (let i = 0; i < n; i++) {
+      const t = i / DSP_SR
+      const f = 92 * Math.exp(-t * 14) + 41
+      ph += (2 * Math.PI * f) / DSP_SR
+      phO += (2 * Math.PI * f * 1.58) / DSP_SR
+      const boom = (Math.sin(ph) * 0.85 + Math.sin(phO) * 0.24) * Math.exp(-t * 3.8)
+      const slap = skinBp[i] * 0.72
+      const s = Math.tanh((boom + slap) * 1.35) * 0.86
+      L[i] = s
+      R[i] = s * 0.985
+    }
+    return { L, R }
+  }
+
+  if (kind === 'heavy_impact' || kind === 'sub_boom') {
+    // Punchy cinematic hit for drops / big reveals: sub thump + broadband crack (~0.55 s, no long boom mud).
+    const dur = 0.55
+    const n = Math.floor(dur * DSP_SR)
+    const raw = new Float32Array(n)
+    for (let i = 0; i < n; i++) raw[i] = rand() * 2 - 1
+    const crack = biquadFilter(raw, 'bp', 1800, 0.6)
+    const air = biquadFilter(raw, 'hp', 4200, 0.7)
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    let ph = 0
+    for (let i = 0; i < n; i++) {
+      const t = i / DSP_SR
+      const f = 46 + 92 * Math.exp(-t * 26)
+      ph += (2 * Math.PI * f) / DSP_SR
+      const sub = Math.sin(ph) * Math.exp(-t / 0.11)
+      const c = crack[i] * Math.exp(-t / 0.022) * 1.3 + air[i] * Math.exp(-t / 0.035) * 0.45
+      const s2 = Math.tanh((sub * 1.05 + c) * 1.5) * 0.92
+      L[i] = s2
+      R[i] = s2 * 0.98
+    }
+    return { L, R }
+  }
+
+  if (kind === 'horse_gallop' || kind === 'hoof_stomp') {
+    // One hoof fall: low thump with pitch drop + gritty sand/earth crunch
+    const hoofSample = (heavy = false) => {
+      const len = Math.floor((heavy ? 0.26 : 0.14) * DSP_SR)
+      const mono = new Float32Array(len)
+      const grit = new Float32Array(len)
+      for (let i = 0; i < len; i++) grit[i] = rand() * 2 - 1
+      const gritBp = biquadFilter(grit, 'bp', heavy ? 1400 : 1900, 0.8)
+      const f0 = (heavy ? 95 : 120) * (0.92 + rand() * 0.16)
+      for (let i = 0; i < len; i++) {
+        const t = i / DSP_SR
+        const thump = Math.sin(2 * Math.PI * (f0 * Math.exp(-t * (heavy ? 22 : 32)) + (heavy ? 44 : 52)) * t) * Math.exp(-t * (heavy ? 15 : 26))
+        const dirt = gritBp[i] * Math.exp(-t * (heavy ? 30 : 44)) * (heavy ? 0.85 : 0.6)
+        mono[i] = Math.tanh((thump * (heavy ? 1.0 : 0.78) + dirt) * 1.35) * (heavy ? 0.9 : 0.72)
+      }
+      return mono
+    }
+    if (kind === 'hoof_stomp') {
+      const n = Math.floor(0.3 * DSP_SR)
+      const L = new Float32Array(n)
+      const R = new Float32Array(n)
+      addMonoPanned(L, R, hoofSample(true), 0, 1.0, 0)
+      return { L, R }
+    }
+    const step = Number(opts.d)
+    if (step > 0.2 && step < 1.6) {
+      // Tempo-locked gallop: per beat "da-da-DUM" (two light falls on the 16ths before the beat, the accent
+      // exactly ON the beat). The cue's leadSec = step/4, so stride accents land on the measured beats.
+      const total = clamp(Number(opts.durationMs) > 0 ? Number(opts.durationMs) / 1000 : step * 4, step * 0.6, 16)
+      const strides = Math.max(1, Math.round((total - 0.05) / step))
+      const lead = step * 0.25
+      const n = Math.floor((lead + strides * step + 0.3) * DSP_SR)
+      const L = new Float32Array(n)
+      const R = new Float32Array(n)
+      for (let s = 0; s < strides; s++) {
+        const beatT = lead + s * step
+        const pan = s % 2 === 0 ? -0.22 : 0.22
+        addMonoPanned(L, R, hoofSample(false), beatT - step * 0.25, 0.5 + rand() * 0.12, pan)
+        addMonoPanned(L, R, hoofSample(false), beatT - step * 0.125, 0.62 + rand() * 0.12, -pan * 0.6)
+        addMonoPanned(L, R, hoofSample(s % 4 === 0), beatT, 0.95 + rand() * 0.08, pan * 0.4)
+      }
+      return { L, R }
+    }
+    const dur = 0.88
+    const n = Math.floor(dur * DSP_SR)
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    const hoofTimes = [0.0, 0.14, 0.27, 0.48, 0.62, 0.74]
+    hoofTimes.forEach((ht, hi) => {
+      addMonoPanned(L, R, hoofSample(false), ht, hi % 3 === 0 ? 1.0 : 0.78, hi % 2 === 0 ? -0.24 : 0.24)
+    })
+    return { L, R }
+  }
+
+  if (kind === 'slash_sweep') {
+    // Beat-locked transition sweep for slash-wipe cuts: filtered air rising for 0.2 s into a bright blade
+    // "唰" crack exactly on the cut (cue.leadSec = 0.2), then a short airy tail panning left → right with
+    // the on-screen sweep.
+    const lead = 0.2
+    const dur = 0.52
+    const n = Math.floor(dur * DSP_SR)
+    const raw = new Float32Array(n)
+    for (let i = 0; i < n; i++) raw[i] = rand() * 2 - 1
+    const lo = biquadFilter(raw, 'bp', 900, 0.9)
+    const mid = biquadFilter(raw, 'bp', 2600, 1.1)
+    const hi = biquadFilter(raw, 'bp', 6400, 1.3)
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    const leadN = Math.floor(lead * DSP_SR)
+    for (let i = 0; i < n; i++) {
+      const t = i / DSP_SR
+      let s
+      if (i < leadN) {
+        const u = i / leadN
+        const env = Math.pow(u, 2.2)
+        s = (lo[i] * (1 - u) * 0.5 + mid[i] * (0.4 + u * 0.6) + hi[i] * u * 0.7) * env * 1.6
+      } else {
+        const tt = t - lead
+        const crack = (hi[i] * 1.4 + mid[i] * 0.8) * Math.exp(-tt / 0.018)
+        const tail = (mid[i] * 0.55 + hi[i] * 0.35) * Math.exp(-tt / 0.11)
+        s = crack + tail
+      }
+      const v = Math.tanh(s * 1.25) * 0.82
+      const u = i / n
+      L[i] = v * Math.cos(u * Math.PI * 0.5)
+      R[i] = v * Math.sin(u * Math.PI * 0.5 + 0.12)
+    }
+    const fadeN = Math.floor(0.015 * DSP_SR)
+    for (let i = n - fadeN; i < n; i++) {
+      const g = (n - i) / fadeN
+      L[i] *= g
+      R[i] *= g
+    }
+    return { L, R }
+  }
+
+  if (kind === 'arrow_zip') {
+    const dur = 0.28
+    const n = Math.floor(dur * DSP_SR)
+    const raw = new Float32Array(n)
+    for (let i = 0; i < n; i++) raw[i] = rand() * 2 - 1
+    const bp = biquadFilter(raw, 'bp', 3200, 2.4)
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    let ph = 0
+    for (let i = 0; i < n; i++) {
+      const u = i / n
+      const f = 2600 * Math.pow(0.28, u)
+      ph += (2 * Math.PI * f) / DSP_SR
+      const env = Math.sin(u * Math.PI)
+      const s = (Math.sin(ph) * 0.34 + bp[i] * 0.68) * env * 0.84
+      L[i] = s * (1 - u)
+      R[i] = s * u
+    }
+    return { L, R }
+  }
+
+  if (kind === 'whoosh' || kind === 'swoosh' || kind === 'swipe' || kind === 'card') {
     const dur = kind === 'swipe' || kind === 'slash' ? 0.24 : kind === 'card' ? 0.3 : 0.44
     const bright = kind === 'slash' ? 6800 : kind === 'swoosh' || kind === 'swipe' ? 4600 : 2800
     const mono = synthSweptNoise(rand, dur, bright, kind === 'card' ? 0.55 : 0.8)
@@ -864,19 +1127,45 @@ export function renderBgmWavBuffer({ durationSec = 20, mood = 'tech', bpm, audio
   return encodeStereoWav(L, R, DSP_SR)
 }
 
+const SFX_REVERB_SEND = {
+  metal_clash: 0.05,
+  metal_clash_hi: 0.05,
+  metal_clash_heavy: 0.07,
+  blade_clash: 0.05,
+  sword_clash: 0.05,
+  weapon_clash: 0.05,
+  blade_whoosh: 0.06,
+  slash: 0.06,
+  heavy_impact: 0.1,
+  war_drum: 0.16,
+  horse_gallop: 0.08,
+  hoof_stomp: 0.06,
+  slash_sweep: 0.14,
+  arrow_zip: 0.06,
+  chime: 0.3,
+  sparkle: 0.3,
+  shine: 0.3,
+  bell_warm: 0.3,
+  shimmer_swell: 0.32,
+}
+
 export function renderSfxMasterBuffer({ durationSec, cues = [] }) {
   const dur = Math.max(1, Number(durationSec) || 10)
   const n = Math.floor(dur * DSP_SR)
   const L = new Float32Array(n)
   const R = new Float32Array(n)
+  const sendL = new Float32Array(n)
+  const sendR = new Float32Array(n)
 
   for (let idx = 0; idx < cues.length; idx++) {
     const cue = cues[idx]
     const at = Number(cue.atSec ?? 0)
-    if (!Number.isFinite(at) || at < 0 || at >= dur) continue
+    // at < 0 is allowed: a pre-roll (whoosh / hooves / sweep) may start before 0 s and is trimmed
+    if (!Number.isFinite(at) || at >= dur || at < -2) continue
     const vol = Number.isFinite(Number(cue.volume)) ? Number(cue.volume) : 0.55
     const pan = Number.isFinite(Number(cue.pan)) ? Number(cue.pan) : 0
-    const sample = synthSfxStereo(cue.type, {
+    const type = String(cue.type || 'whoosh').toLowerCase()
+    const sample = synthSfxStereo(type, {
       d: cue.d,
       freqStart: cue.freqStart,
       freqEnd: cue.freqEnd,
@@ -885,21 +1174,34 @@ export function renderSfxMasterBuffer({ durationSec, cues = [] }) {
       wave: cue.wave,
       noiseMix: cue.noiseMix,
       decay: cue.decay,
-      seed: idx + 31,
+      seed: (Number(cue.seed) || 0) + idx * 7 + 31,
     })
+    // Sample-accurate placement: the SFX onset lands on the exact audio sample of its locked video frame
     const startIdx = Math.round(at * DSP_SR)
     const p = clamp(pan, -1, 1)
     const gL = vol * Math.sqrt((1 - p) * 0.5) * 1.414
     const gR = vol * Math.sqrt((1 + p) * 0.5) * 1.414
+    const send = SFX_REVERB_SEND[type] ?? 0.12
     const limit = Math.min(sample.L.length, n - startIdx)
-    for (let i = 0; i < limit; i++) {
+    for (let i = startIdx < 0 ? -startIdx : 0; i < limit; i++) {
       const dst = startIdx + i
-      L[dst] += sample.L[i] * gL
-      R[dst] += sample.R[i] * gR
+      const l = sample.L[i] * gL
+      const r = sample.R[i] * gR
+      L[dst] += l
+      R[dst] += r
+      sendL[dst] += l * send
+      sendR[dst] += r * send
     }
   }
 
-  // Glue all SFX in a shared cinema stereo room reverb (tails bleed smoothly across cuts!)
-  applyStereoReverb(L, R, 0.14, 0.85)
+  // Short room on the send bus only (wet), so combat transients stay dry, crisp and in front of the BGM
+  const wetL = new Float32Array(sendL)
+  const wetR = new Float32Array(sendR)
+  applyStereoReverb(wetL, wetR, 1.0, 0.62)
+  for (let i = 0; i < n; i++) {
+    // applyStereoReverb(mix=1) returns dry*0.55 + wet; remove the dry part to keep a pure wet return
+    L[i] += wetL[i] - sendL[i] * 0.55
+    R[i] += wetR[i] - sendR[i] * 0.55
+  }
   return encodeStereoWav(L, R, DSP_SR)
 }

@@ -4,7 +4,7 @@
  * featuring 6 .motion-grade layouts, choreographed transitions, layered Canvas VFX,
  * 6-8 stereo-panned SFX cues per scene, BPM-matched BGM, and real TTS voice matching.
  */
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import {
   cleanSubtitleChunk,
@@ -12,8 +12,8 @@ import {
   formatDirectorBrief,
   normalizeContentOutline,
   normalizeNumeralsForDisplay,
-  normalizeVideoStyle,
   readScriptJson,
+  resolveStyleKey,
   resolveVideoDimensions,
   splitDirectorBrief,
   stripMetaInstructions,
@@ -21,12 +21,15 @@ import {
   VIDEO_STYLES,
   writeScriptJson,
 } from '../shared/index.js'
-import { resolveGenreSelection } from './genre-router.js'
+import { isHistoricalContent, resolveGenreSelection } from './genre-router.js'
 import { matchAllScenesInScript } from '../dsh-tool-local-tts/index.js'
 import { importAssets, readAssets } from './asset-manager.js'
-import { buildRichHtmlVideo, resolvePalette } from './html-generator.js'
+import { buildRichHtmlVideo } from './html-generator.js'
 import { writeRemotionProjectFiles } from './remotion-generator.js'
 import { buildBeatGrid, ensureProjectAudioAssets } from './audio-synth.js'
+import { reassertLockedScenes, reconcileUserEdits } from './scene-locks.js'
+import { applyLockedHtmlStore, syncLockedHtmlStore } from './region-refine.js'
+import { applyStyleDecision, resolveStyleRequest, styleMoodKey } from './style-presets.js'
 
 const TRANSITIONS = ['iris-circle', 'block-wipe', 'glitch-cut', 'zoom-punch', 'light-wipe']
 const MOTIONS = ['zoom-in', 'pan-left', 'zoom-out', 'pan-right']
@@ -137,6 +140,17 @@ function buildSceneSubChunks(narration, subtitleText, specSubChunks = null, maxL
 
 export function buildSceneSfxCues({ idx, total, layout, dur, sfxPick, cursors = [], visualBlueprint = '', genre = '' }) {
   const cues = []
+  const gLow = String(genre || '').toLowerCase()
+  // Historical / epic beat-sync genres are strictly choreographed on the real BGM beat grid
+  // via `choreographBeatSfxCues()` — never inject off-beat UI chimes/pops/glitches here!
+  if (gLow === 'history-theater' || gLow === 'mv-lyric') {
+    if (idx === 0) {
+      // war drum only for history; a modern MV opens on a clean hit
+      const kind = gLow === 'history-theater' ? 'war_drum' : 'hit'
+      cues.push({ type: kind, path: sfxPick(kind), offsetSec: 0, volume: 0.85, pan: 0 })
+    }
+    return cues
+  }
   if (idx === 0) {
     cues.push({ type: 'hit', path: sfxPick('hit'), offsetSec: 0, volume: 0.62, pan: 0 })
     cues.push({ type: 'shimmer_swell', path: sfxPick('shimmer_swell'), offsetSec: 0.04, volume: 0.45, pan: 0 })
@@ -273,6 +287,13 @@ export async function planVideoFromAssets(options = {}) {
       existing = readScriptJson(absDir).data
     } catch {}
   }
+  // HTML engine: capture locked scenes' <template> blocks before index.html is regenerated below (first capture wins)
+  let lockedHtmlBlocks = {}
+  if ((existing.engine || engine) !== 'remotion') {
+    try {
+      lockedHtmlBlocks = syncLockedHtmlStore(absDir, existing)
+    } catch {}
+  }
 
   const assets = readAssets(absDir)
   const allVisuals = (assets.items || []).filter((it) => it.type === 'image' || it.type === 'video')
@@ -282,8 +303,8 @@ export async function planVideoFromAssets(options = {}) {
   const importedSfx = (assets.items || []).filter((it) => it.role === 'sfx')
   const notesText = (assets.notes || []).map((n) => n.text).join('\n').trim()
 
-  const normalizedStyle = normalizeVideoStyle(style)
-  const st = STYLE_CONFIG[normalizedStyle] || STYLE_CONFIG.tech
+  // 视觉风格: 'auto' (AI 自由匹配) | preset id | 'user:<id>' (我的风格预设). The genre router only needs the base preset.
+  const prelimStyle = resolveStyleKey(style, existing)
   // Production briefs are director notes ONLY — never a title / narration / on-screen text
   const briefSplit = splitDirectorBrief({
     topic,
@@ -304,13 +325,31 @@ export async function planVideoFromAssets(options = {}) {
     text: {
       topic: coreTopic,
       goal: `${briefSplit.directorNotes || ''} ${goal || ''}`,
-      style: normalizedStyle,
+      style: prelimStyle,
       hasMedia: visuals.length > 0,
     },
     hasScreenshots: visuals.length > 0,
   })
   const resolvedGenre = genreInfo.id
   const resolvedGenreLabel = genreInfo.label
+  // The local planner never calls a model: 'auto' picks a preset with keyword rules (an AI run refines it later in the
+  // plan LLM call); a plain preset equal to the project's base keeps an auto / user project as it is (the pipeline
+  // passes its already resolved base); a deleted 「我的预设」 keeps the project's current style. Never an error.
+  const styleOpts = {
+    text: `${coreTopic} ${briefSplit.directorNotes || ''} ${options.userPrompt || options.polishedTopic || ''} ${notesText.slice(0, 600)}`,
+    genre: resolvedGenre,
+    genreLabel: resolvedGenreLabel,
+    reResolve: true,
+    keepModeIfBase: true,
+  }
+  let styleDecision
+  try {
+    styleDecision = resolveStyleRequest(existing, style ?? (existing.style ? undefined : 'auto'), styleOpts)
+  } catch {
+    styleDecision = resolveStyleRequest(existing, undefined, styleOpts)
+  }
+  const normalizedStyle = styleDecision.style
+  const st = STYLE_CONFIG[normalizedStyle] || STYLE_CONFIG.tech
 
   const noteChunks = notesText
     ? notesText
@@ -377,7 +416,7 @@ export async function planVideoFromAssets(options = {}) {
     'multi-window-trio',
     'mosaic-pulse-wall',
   ]
-  const isHistoricalTopic = /历史|霸王|项羽|秦|汉|楚|三国|唐|宋|明|古风|武侠|战役|将军|帝王|演义/i.test(`${coreTopic || ''} ${notesText || ''}`)
+  const isHistoricalTopic = isHistoricalContent(`${coreTopic || ''} ${notesText || ''}`)
   const zeroAssetNarrative = contentVisuals.length === 0 && isHistoricalTopic
   const middleLayoutsTextOnly = zeroAssetNarrative
     ? ['narrative-diorama']
@@ -648,6 +687,7 @@ export async function planVideoFromAssets(options = {}) {
     height: requestedHeight,
     topic: coreTopic,
     assets: visuals,
+    targetPlatform: options.targetPlatform || existing.targetPlatform || '',
   })
 
   const requestedBrandAsset = options.brandMark ? findVisualByRef(visuals, options.brandMark) : null
@@ -678,6 +718,7 @@ export async function planVideoFromAssets(options = {}) {
       topic: coreTopic,
     }) || goal
 
+  const styleFields = applyStyleDecision({}, styleDecision)
   const nextScript = {
     ...existing,
     authoringMode: 'local-draft',
@@ -714,14 +755,18 @@ export async function planVideoFromAssets(options = {}) {
     defaultVoiceId: voiceId || 'auto',
     narrationMode: options.narrationMode || existing.narrationMode || 'tts',
     subtitleStyle: zeroAssetNarrative || options.narrationMode === 'subtitle-mv' ? 'cinematic' : existing.subtitleStyle || 'pill',
+    // styleMode / styleProfile / styleAuto (undefined drops a stale value) + the preset's or the custom profile's palette
+    styleMode: styleFields.styleMode,
+    styleProfile: styleFields.styleProfile,
+    styleAuto: styleFields.styleAuto,
     theme: {
-      ...resolvePalette({ style: normalizedStyle }),
+      ...styleFields.theme,
       ...(resolvedBrandMark ? { brandMark: resolvedBrandMark } : {}),
     },
     bgm: {
       ...(existing?.bgm || {}),
       enabled: true,
-      mood: st.mood,
+      mood: styleDecision.profile ? styleMoodKey(styleDecision.profile) : st.mood,
       bpm: Number(existing?.bgm?.analyzed ? existing.bgm.bpm : 0) || st.bpm,
       volume: Number.isFinite(Number(existing?.bgm?.volume)) ? Number(existing.bgm.volume) : 0.24,
       path: importedMusic[0]?.path || existing?.bgm?.path || '',
@@ -731,13 +776,25 @@ export async function planVideoFromAssets(options = {}) {
     scenes,
   }
 
-  const saved = writeScriptJson(absDir, nextScript)
+  // Human edit protection: locked scenes keep content + timing, user overrides are re-applied (user wins)
+  const editMerge = reconcileUserEdits({ projectDir: absDir, prevScript: existing, nextScript, stage: 'local-director' })
+  const saved = writeScriptJson(absDir, editMerge.script)
   ensureBeatGridOnScript(saved.data)
   writeScriptJson(absDir, saved.data)
   await ensureProjectAudioAssets(absDir, saved.data, assets)
   matchAllScenesInScript(absDir, { voiceId: voiceId || 'auto', forceAuto: voiceId === 'auto' })
+  if (editMerge.report) reassertLockedScenes(absDir, editMerge.script)
   const reloaded = readScriptJson(absDir).data
   syncProjectCodeFromScript(absDir, reloaded, { forceOverwrite: true })
+  if (Object.keys(lockedHtmlBlocks).length > 0) {
+    // Locked scenes keep the HyperFrames HTML implementation they had when they were locked
+    try {
+      const htmlPath = join(absDir, 'index.html')
+      const cur = readFileSync(htmlPath, 'utf8')
+      const kept = applyLockedHtmlStore(cur, lockedHtmlBlocks)
+      if (kept.html !== cur) writeFileSync(htmlPath, kept.html, 'utf8')
+    } catch {}
+  }
 
   return {
     ok: true,
@@ -749,6 +806,7 @@ export async function planVideoFromAssets(options = {}) {
     importedMusic: importedMusic.length,
     importedSfx: importedSfx.length,
     sfxCount: (reloaded.scenes || []).reduce((n, s) => n + (Array.isArray(s.sfxCues) ? s.sfxCues.length : 0), 0),
+    ...(editMerge.report ? { editMerge: editMerge.report } : {}),
     script: reloaded,
   }
 }
